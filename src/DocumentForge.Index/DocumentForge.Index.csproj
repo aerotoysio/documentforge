@@ -1,0 +1,8 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>DocumentForge.Index</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\DocumentForge.Document\DocumentForge.Document.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,29 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+*.cache
+*.dll
+*.exe
+*.pdb
+
+## IDE
+.vs/
+.idea/
+*.swp
+*~
+
+## Build
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+publish/
+
+## Database files
+*.dfdb
+*.dfdb.wal
+
+## OS
+Thumbs.db
+.DS_Store
