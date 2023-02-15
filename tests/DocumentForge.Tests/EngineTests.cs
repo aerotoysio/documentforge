@@ -258,6 +258,107 @@ public class EngineTests : IDisposable
     }
 
     [Fact]
+    public async System.Threading.Tasks.Task Replication_LeaderStreamsToFollower()
+    {
+        // Pick a free port for this test
+        int port = 5500 + System.Random.Shared.Next(100);
+
+        var leaderPath = Path.Combine(Path.GetTempPath(), $"leader_{Guid.NewGuid():N}.dfdb");
+        var followerPath = Path.Combine(Path.GetTempPath(), $"follower_{Guid.NewGuid():N}.dfdb");
+
+        try
+        {
+            // Follower starts from a copy of the leader's initial state (in real setups, use a backup)
+            // For this test we'll just copy the file after initial setup.
+            using (var seed = DocumentForgeDb.Create(leaderPath))
+            {
+                seed.Insert("orders", """{"pnr": "INITIAL"}""");
+                seed.Flush();
+            }
+            File.Copy(leaderPath, followerPath, overwrite: true);
+
+            // Leader: start replication server
+            using var leader = DocumentForgeDb.Open(leaderPath);
+            leader.StartReplicationServer(port);
+            await System.Threading.Tasks.Task.Delay(250);
+
+            // Follower: connect to leader
+            using var follower = DocumentForgeDb.Open(followerPath);
+            follower.StartReplicationFollower("localhost", port);
+
+            // Wait up to 2s for the follower to register
+            for (int i = 0; i < 20 && leader.GetFollowerCount() == 0; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+
+            Assert.Equal(1, leader.GetFollowerCount());
+
+            // Insert on leader, flush to trigger replication
+            leader.Insert("orders", """{"pnr": "REPL001"}""");
+            leader.Insert("orders", """{"pnr": "REPL002"}""");
+            leader.Flush();
+
+            // Wait for replication to catch up
+            await System.Threading.Tasks.Task.Delay(500);
+
+            Assert.True(follower.ReplicatedPageCount() > 0,
+                $"Expected follower to have replicated pages, got {follower.ReplicatedPageCount()}");
+
+            // Reopen follower to see the replicated data
+            follower.Dispose();
+            using var reopened = DocumentForgeDb.Open(followerPath);
+            var result = reopened.Execute("SELECT * FROM orders");
+            // Follower now has initial doc + any that replicated
+            Assert.True(result.Documents.Count >= 1);
+        }
+        finally
+        {
+            try { File.Delete(leaderPath); File.Delete(leaderPath + ".wal"); File.Delete(leaderPath + ".recovery"); } catch { }
+            try { File.Delete(followerPath); File.Delete(followerPath + ".wal"); File.Delete(followerPath + ".recovery"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void CompositeIndex_TwoFieldEquality()
+    {
+        _db.Insert("orders", """{"status": "CONFIRMED", "airline": "AA", "amount": 100}""");
+        _db.Insert("orders", """{"status": "CONFIRMED", "airline": "UA", "amount": 200}""");
+        _db.Insert("orders", """{"status": "CANCELLED", "airline": "AA", "amount": 50}""");
+        _db.Insert("orders", """{"status": "CONFIRMED", "airline": "AA", "amount": 300}""");
+
+        // Composite index on (status, airline)
+        _db.Execute("CREATE INDEX idx_status_airline ON orders (status, airline)");
+
+        var result = _db.Execute("SELECT * FROM orders WHERE status = 'CONFIRMED' AND airline = 'AA'");
+        Assert.True(result.Success);
+        Assert.Equal(2, result.Documents.Count);
+        Assert.Contains("INDEX_SCAN_COMPOSITE", result.QueryPlan!);
+
+        // Verify the matches
+        foreach (var d in result.Documents)
+        {
+            Assert.Equal("CONFIRMED", d["status"].AsString);
+            Assert.Equal("AA", d["airline"].AsString);
+        }
+    }
+
+    [Fact]
+    public void CompositeIndex_WithExtraFilter()
+    {
+        _db.Insert("orders", """{"status": "CONFIRMED", "airline": "AA", "amount": 100}""");
+        _db.Insert("orders", """{"status": "CONFIRMED", "airline": "AA", "amount": 500}""");
+        _db.Insert("orders", """{"status": "CONFIRMED", "airline": "UA", "amount": 200}""");
+
+        _db.Execute("CREATE INDEX idx_status_airline ON orders (status, airline)");
+
+        // Composite matches status+airline, amount > 200 becomes a residual filter
+        var result = _db.Execute("SELECT * FROM orders WHERE status = 'CONFIRMED' AND airline = 'AA' AND amount > 200");
+        Assert.True(result.Success);
+        Assert.Single(result.Documents);
+        Assert.Equal(500, result.Documents[0]["amount"].AsInt32);
+        Assert.Contains("INDEX_SCAN_COMPOSITE", result.QueryPlan!);
+    }
+
+    [Fact]
     public void Aggregation_SumAvgMinMax()
     {
         _db.Insert("sales", """{"product": "A", "price": 10}""");

@@ -141,7 +141,33 @@ public sealed class QueryExecutor
     private (List<BsonDocument> docs, string plan)? TryIndexScan(
         string collectionName, Expression? where, Collection collection, int? effectiveLimit = null)
     {
-        // Extract the indexable comparison from the WHERE clause
+        if (where is null) return null;
+
+        // Gather all top-level AND comparisons
+        var comparisons = CollectAndComparisons(where);
+
+        // Try composite index match first: need all leading paths of some composite index covered by equality
+        var compositeHit = TryCompositeIndexMatch(collectionName, comparisons);
+        if (compositeHit is not null)
+        {
+            var (compIndex, compKey, residuals) = compositeHit.Value;
+            collection.BuildLocationMap();
+            var compResults = new List<BsonDocument>();
+            var residualFilter = BuildResidualFilter(residuals);
+            foreach (var docId in compIndex.Search(compKey))
+            {
+                var doc = collection.FindById(docId);
+                if (doc is null) continue;
+                if (residualFilter is null || ExpressionEvaluator.Evaluate(residualFilter, doc))
+                {
+                    compResults.Add(doc);
+                    if (effectiveLimit.HasValue && compResults.Count >= effectiveLimit.Value) break;
+                }
+            }
+            return (compResults, $"INDEX_SCAN_COMPOSITE({compIndex.Definition.Name})");
+        }
+
+        // Extract the indexable comparison from the WHERE clause (single-field path)
         ComparisonExpression? comp = null;
         Expression? remainingFilter = null;
 
@@ -151,7 +177,6 @@ public sealed class QueryExecutor
         }
         else if (where is LogicalExpression logical && logical.Operator == TokenType.And)
         {
-            // Try left side first, then right
             if (logical.Left is ComparisonExpression leftComp)
             {
                 comp = leftComp;
@@ -166,14 +191,13 @@ public sealed class QueryExecutor
 
         if (comp is null) return null;
 
-        // Only these operators can use an index
         if (comp.Operator is not (TokenType.Equals
             or TokenType.GreaterThan or TokenType.LessThan
             or TokenType.GreaterThanOrEqual or TokenType.LessThanOrEqual))
             return null;
 
         var index = _indexManager.FindIndexForPath(collectionName, comp.JsonPath);
-        if (index is null) return null;
+        if (index is null || index.Definition.IsComposite) return null; // composite match was tried above
 
         // Ensure location map is built for O(1) lookups
         collection.BuildLocationMap();
@@ -226,6 +250,85 @@ public sealed class QueryExecutor
         }
 
         return (results, $"{scanType}({index.Definition.Name})");
+    }
+
+    /// <summary>
+    /// Walk down a top-level AND tree and collect all leaf comparisons.
+    /// OR/NOT stop the collection (we can't use indexes through them in this simple form).
+    /// </summary>
+    private static List<ComparisonExpression> CollectAndComparisons(Expression expr)
+    {
+        var list = new List<ComparisonExpression>();
+        void Visit(Expression e)
+        {
+            if (e is ComparisonExpression c) list.Add(c);
+            else if (e is LogicalExpression l && l.Operator == TokenType.And)
+            {
+                Visit(l.Left);
+                Visit(l.Right);
+            }
+            // OR/NOT -> do not descend; we can't use indexes through them
+        }
+        Visit(expr);
+        return list;
+    }
+
+    /// <summary>
+    /// Find a composite index whose path list is entirely covered by equality comparisons
+    /// in the WHERE clause. Returns the index, composite key, and leftover comparisons.
+    /// </summary>
+    private (BTreeIndex Index, IndexKey Key, List<ComparisonExpression> Residuals)?
+        TryCompositeIndexMatch(string collectionName, List<ComparisonExpression> comparisons)
+    {
+        var indexes = _indexManager.GetIndexes(collectionName);
+        foreach (var idx in indexes)
+        {
+            if (!idx.Definition.IsComposite) continue;
+
+            var components = new BsonValue[idx.Definition.Paths.Count];
+            var matched = new bool[comparisons.Count];
+            bool allFound = true;
+
+            for (int i = 0; i < idx.Definition.Paths.Count; i++)
+            {
+                var path = idx.Definition.Paths[i];
+                int found = -1;
+                for (int j = 0; j < comparisons.Count; j++)
+                {
+                    if (matched[j]) continue;
+                    var c = comparisons[j];
+                    if (c.Operator == TokenType.Equals && c.JsonPath == path)
+                    {
+                        found = j;
+                        break;
+                    }
+                }
+                if (found < 0) { allFound = false; break; }
+                matched[found] = true;
+                components[i] = ConvertToSearchValue(comparisons[found].Value, comparisons[found].ValueType);
+            }
+
+            if (!allFound) continue;
+
+            // Collect residual comparisons (not consumed by the index)
+            var residuals = new List<ComparisonExpression>();
+            for (int j = 0; j < comparisons.Count; j++)
+                if (!matched[j]) residuals.Add(comparisons[j]);
+
+            return (idx, new IndexKey(components), residuals);
+        }
+        return null;
+    }
+
+    private static Expression? BuildResidualFilter(List<ComparisonExpression> residuals)
+    {
+        if (residuals.Count == 0) return null;
+        Expression expr = residuals[0];
+        for (int i = 1; i < residuals.Count; i++)
+        {
+            expr = new LogicalExpression { Left = expr, Operator = TokenType.And, Right = residuals[i] };
+        }
+        return expr;
     }
 
     /// <summary>

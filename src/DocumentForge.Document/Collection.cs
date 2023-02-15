@@ -101,19 +101,40 @@ public sealed class Collection
     {
         doc.EnsureId();
         var id = doc.GetId();
-        var bytes = BsonSerializer.Serialize(doc);
 
-        // For large documents, write the real data to overflow pages and store a stub instead.
-        byte[] slotData;
-        if (bytes.Length > MaxSingleDocSize)
+        // Use pooled buffer to avoid GC pressure in the hot insert path
+        var (pooledBuffer, length) = BsonSerializer.SerializeToPooled(doc);
+        try
         {
-            var firstOverflow = WriteOverflowChain(bytes);
-            slotData = BuildOverflowStub(bytes.Length, firstOverflow);
+            byte[] slotData;
+            if (length > MaxSingleDocSize)
+            {
+                // Large doc: copy to a temp array only for overflow chain write
+                var bytes = new byte[length];
+                pooledBuffer.AsSpan(0, length).CopyTo(bytes);
+                var firstOverflow = WriteOverflowChain(bytes);
+                slotData = BuildOverflowStub(length, firstOverflow);
+            }
+            else
+            {
+                // Small doc: the slot data is just the first `length` bytes of pooledBuffer.
+                // We need a byte[] because DataPage.Insert takes ReadOnlySpan but we reuse below.
+                // Copy only the used portion (most docs are << page size).
+                slotData = new byte[length];
+                pooledBuffer.AsSpan(0, length).CopyTo(slotData);
+            }
+        // Hoisting the rest of the insert outside the try - but we still need pooledBuffer in scope
+        // for the return at the end. Restructure:
+        return InsertSlotData(id, slotData);
         }
-        else
+        finally
         {
-            slotData = bytes;
+            System.Buffers.ArrayPool<byte>.Shared.Return(pooledBuffer);
         }
+    }
+
+    private DocumentId InsertSlotData(DocumentId id, byte[] slotData)
+    {
 
         if (!_firstDataPage.IsValid)
         {

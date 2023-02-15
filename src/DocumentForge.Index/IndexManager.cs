@@ -139,6 +139,27 @@ public sealed class IndexManager
             return;
 
         foreach (var index in indexes)
+            InsertDocIntoIndex(index, doc, docId);
+    }
+
+    public void OnDocumentDeleted(string collectionName, DocumentId docId, BsonDocument doc)
+    {
+        var key = new CollectionName(collectionName).Value;
+        if (!_indexesByCollection.TryGetValue(key, out var indexes))
+            return;
+
+        foreach (var index in indexes)
+            DeleteDocFromIndex(index, doc, docId);
+    }
+
+    private static void InsertDocIntoIndex(BTreeIndex index, BsonDocument doc, DocumentId docId)
+    {
+        if (index.Definition.IsComposite)
+        {
+            var indexKey = BuildCompositeKey(doc, index.Definition.Paths);
+            if (indexKey is not null) index.Insert(indexKey, docId);
+        }
+        else
         {
             var values = JsonPathExtractor.ExtractAll(doc, index.Definition.JsonPath);
             foreach (var val in values)
@@ -149,13 +170,14 @@ public sealed class IndexManager
         }
     }
 
-    public void OnDocumentDeleted(string collectionName, DocumentId docId, BsonDocument doc)
+    private static void DeleteDocFromIndex(BTreeIndex index, BsonDocument doc, DocumentId docId)
     {
-        var key = new CollectionName(collectionName).Value;
-        if (!_indexesByCollection.TryGetValue(key, out var indexes))
-            return;
-
-        foreach (var index in indexes)
+        if (index.Definition.IsComposite)
+        {
+            var indexKey = BuildCompositeKey(doc, index.Definition.Paths);
+            if (indexKey is not null) index.Delete(indexKey, docId);
+        }
+        else
         {
             var values = JsonPathExtractor.ExtractAll(doc, index.Definition.JsonPath);
             foreach (var val in values)
@@ -164,6 +186,22 @@ public sealed class IndexManager
                     index.Delete(new IndexKey(val), docId);
             }
         }
+    }
+
+    /// <summary>
+    /// Build a composite IndexKey by extracting each path from the document.
+    /// Returns null if any component is null (we don't index partial composite keys).
+    /// </summary>
+    private static IndexKey? BuildCompositeKey(BsonDocument doc, IReadOnlyList<string> paths)
+    {
+        var components = new BsonValue[paths.Count];
+        for (int i = 0; i < paths.Count; i++)
+        {
+            var v = JsonPathExtractor.Extract(doc, paths[i]);
+            if (v.IsNull) return null;
+            components[i] = v;
+        }
+        return new IndexKey(components);
     }
 
     public void OnDocumentUpdated(string collectionName, DocumentId docId,
@@ -179,12 +217,7 @@ public sealed class IndexManager
         foreach (var (doc, _, _) in collection.IterateDocuments())
         {
             var docId = doc.GetId();
-            var values = JsonPathExtractor.ExtractAll(doc, index.Definition.JsonPath);
-            foreach (var val in values)
-            {
-                if (!val.IsNull)
-                    index.Insert(new IndexKey(val), docId);
-            }
+            InsertDocIntoIndex(index, doc, docId);
         }
     }
 }

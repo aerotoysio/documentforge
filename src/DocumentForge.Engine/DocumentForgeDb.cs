@@ -19,6 +19,9 @@ public sealed class DocumentForgeDb : IDisposable
     private readonly TransactionManager _transactionManager;
     private readonly WalWriter? _walWriter;
     private readonly RecoveryLog? _recoveryLog;
+    private ReplicationServer? _replicationServer;
+    private ReplicationFollower? _replicationFollower;
+    private CombinedPreFlushHook? _combinedHook;
     private bool _disposed;
 
     public string FilePath { get; }
@@ -44,7 +47,8 @@ public sealed class DocumentForgeDb : IDisposable
             // Recovery log: logs page writes before they hit the data file
             var recoveryPath = filePath + ".recovery";
             _recoveryLog = new RecoveryLog(recoveryPath);
-            _pageCache.SetPreFlushHook(new RecoveryLogHook(_recoveryLog));
+            _combinedHook = new CombinedPreFlushHook(new RecoveryLogHook(_recoveryLog));
+            _pageCache.SetPreFlushHook(_combinedHook);
         }
 
         _transactionManager = new TransactionManager(_walWriter);
@@ -60,6 +64,37 @@ public sealed class DocumentForgeDb : IDisposable
         public RecoveryLogHook(RecoveryLog log) => _log = log;
         public void OnBeforeFlush(PageId pageId, byte[] pageData) => _log.LogPageWrite(pageId, pageData);
         public void OnAfterFlushComplete() { _log.Flush(); _log.Truncate(); }
+    }
+
+    /// <summary>
+    /// A PreFlushHook that forwards to multiple sub-hooks. Used so a single cache can
+    /// feed both the recovery log and the replication broadcaster.
+    /// </summary>
+    private sealed class CombinedPreFlushHook : IPreFlushHook
+    {
+        private readonly List<IPreFlushHook> _hooks = new();
+        public CombinedPreFlushHook(params IPreFlushHook[] initial) => _hooks.AddRange(initial);
+        public void Add(IPreFlushHook hook) => _hooks.Add(hook);
+        public void Remove(IPreFlushHook hook) => _hooks.Remove(hook);
+        public void OnBeforeFlush(PageId pageId, byte[] pageData)
+        {
+            foreach (var h in _hooks) h.OnBeforeFlush(pageId, pageData);
+        }
+        public void OnAfterFlushComplete()
+        {
+            foreach (var h in _hooks) h.OnAfterFlushComplete();
+        }
+    }
+
+    /// <summary>
+    /// Forwards page writes to a ReplicationServer for broadcast to followers.
+    /// </summary>
+    private sealed class ReplicationHook : IPreFlushHook
+    {
+        private readonly ReplicationServer _server;
+        public ReplicationHook(ReplicationServer server) => _server = server;
+        public void OnBeforeFlush(PageId pageId, byte[] pageData) => _server.BroadcastPageWrite(pageId, pageData);
+        public void OnAfterFlushComplete() { }
     }
 
     public static DocumentForgeDb Create(string filePath, DatabaseOptions? options = null)
@@ -414,6 +449,46 @@ public sealed class DocumentForgeDb : IDisposable
         return _transactionManager.BeginTransaction();
     }
 
+    // --- Replication API ---
+
+    /// <summary>
+    /// Start this DB as a replication leader - streams page writes to connected followers.
+    /// </summary>
+    public void StartReplicationServer(int port)
+    {
+        if (_replicationServer is not null)
+            throw new DocumentForgeException("Replication server already running.");
+        if (_combinedHook is null)
+            throw new DocumentForgeException("Replication requires WAL to be enabled.");
+
+        _replicationServer = new ReplicationServer(port);
+        _replicationServer.Start();
+        _combinedHook.Add(new ReplicationHook(_replicationServer));
+    }
+
+    public int GetFollowerCount() => _replicationServer?.FollowerCount ?? 0;
+
+    /// <summary>
+    /// Start this DB as a replication follower - connects to a leader and applies streamed writes.
+    /// The local data file is updated directly; call Reopen() to see changes in the engine.
+    /// </summary>
+    public void StartReplicationFollower(string host, int port)
+    {
+        if (_replicationFollower is not null)
+            throw new DocumentForgeException("Replication follower already running.");
+
+        // When a page arrives from the leader, write it through the data file
+        // and evict from our cache so the next read picks up the new version.
+        _replicationFollower = new ReplicationFollower(host, port, (pageId, pageData) =>
+        {
+            _dataFile.WritePage(pageId, pageData);
+            _pageCache.Evict(pageId);
+        });
+        _replicationFollower.Start();
+    }
+
+    public long ReplicatedPageCount() => _replicationFollower?.PagesApplied ?? 0;
+
     // --- Database management ---
 
     public DatabaseStatistics GetStatistics()
@@ -475,11 +550,12 @@ public sealed class DocumentForgeDb : IDisposable
     {
         if (!_disposed)
         {
+            _replicationServer?.Dispose();
+            _replicationFollower?.Dispose();
             _pageCache.FlushAll(); // this also truncates the recovery log
             _walWriter?.Dispose();
             _recoveryLog?.Dispose();
             _dataFile.Dispose();
-            // Clean shutdown - remove the recovery file (it's been fully flushed)
             var recoveryPath = FilePath + ".recovery";
             try { if (File.Exists(recoveryPath) && new FileInfo(recoveryPath).Length == 0) File.Delete(recoveryPath); } catch { }
             _disposed = true;
