@@ -198,8 +198,23 @@ public sealed class DocumentForgeDb : IDisposable
 
     // --- Document API (convenience methods) ---
 
+    /// <summary>When true, all write operations are rejected. Set via EnterReadOnlyMode().</summary>
+    public bool IsReadOnly { get; private set; }
+
+    /// <summary>Put this DB into read-only mode. Used during planned leader handoff.</summary>
+    public void EnterReadOnlyMode() => IsReadOnly = true;
+
+    /// <summary>Exit read-only mode. Normally called when promoting a follower to leader.</summary>
+    public void ExitReadOnlyMode() => IsReadOnly = false;
+
+    private void ThrowIfReadOnly()
+    {
+        if (IsReadOnly) throw new DocumentForgeException("Database is in read-only mode (planned handover in progress).");
+    }
+
     public DocumentId Insert(string collectionName, BsonDocument doc)
     {
+        ThrowIfReadOnly();
         _transactionManager.AcquireWriteLock();
         try
         {
@@ -234,6 +249,7 @@ public sealed class DocumentForgeDb : IDisposable
     /// </summary>
     public long BulkInsert(string collectionName, IEnumerable<BsonDocument> documents)
     {
+        ThrowIfReadOnly();
         _transactionManager.AcquireWriteLock();
         try
         {
@@ -405,6 +421,7 @@ public sealed class DocumentForgeDb : IDisposable
 
         if (isWrite)
         {
+            ThrowIfReadOnly();
             _transactionManager.AcquireWriteLock();
             try { return _queryExecutor.Execute(query); }
             finally { _transactionManager.ReleaseWriteLock(); }
@@ -572,6 +589,63 @@ public sealed class DocumentForgeDb : IDisposable
     }
 
     public long LogicallyReplicatedOps() => _logicalFollower?.OpsApplied ?? 0;
+
+    /// <summary>
+    /// Promote this follower to a leader. Disconnects from the previous leader, starts a
+    /// replication server on the given port, and exits read-only mode (if set).
+    /// Use this in a planned-handover flow after the old leader has gone read-only and
+    /// this follower has caught up to the old leader's final seq.
+    /// </summary>
+    public void PromoteToLeader(int serverPort, int opLogCapacity = 10_000)
+    {
+        // Stop being a follower
+        _logicalFollower?.Dispose();
+        _logicalFollower = null;
+
+        // Start a replication server of our own
+        _logicalServer = new LogicalReplicationServer(serverPort, opLogCapacity);
+        _logicalServer.Start();
+
+        // Accept writes
+        ExitReadOnlyMode();
+
+        Console.WriteLine($"[Handover] Promoted to leader on port {serverPort}");
+    }
+
+    /// <summary>
+    /// Orchestrate a planned handover to a new leader.
+    /// Steps: enter read-only mode, wait for the new leader (currently a follower) to catch up,
+    /// return the final seq. After this returns, you can promote the follower to leader.
+    /// Throws if catchup doesn't complete within the timeout.
+    /// </summary>
+    public ulong BeginPlannedHandover(Func<ulong> followerLastSeqProbe, TimeSpan timeout)
+    {
+        if (_logicalServer is null)
+            throw new DocumentForgeException("Not a leader - nothing to hand over from.");
+
+        // Step 1: stop accepting writes on this DB
+        EnterReadOnlyMode();
+        var finalSeq = _logicalServer.CurrentSeq;
+        Console.WriteLine($"[Handover] Read-only mode entered. Final seq = {finalSeq}");
+
+        // Step 2: wait for the follower to catch up
+        var deadline = DateTime.UtcNow + timeout;
+        while (DateTime.UtcNow < deadline)
+        {
+            var followerSeq = followerLastSeqProbe();
+            if (followerSeq >= finalSeq)
+            {
+                Console.WriteLine($"[Handover] Follower caught up to seq {followerSeq} - handover can proceed.");
+                return finalSeq;
+            }
+            Thread.Sleep(50);
+        }
+
+        // Timeout - abort, re-enable writes
+        ExitReadOnlyMode();
+        throw new DocumentForgeException(
+            $"Handover timed out waiting for follower to catch up. Leader seq={finalSeq}, last-seen follower seq too old.");
+    }
     public long GapsDetected => _logicalFollower?.GapsDetected ?? 0;
     public ulong FollowerLastSeq => _logicalFollower?.LastAppliedSeq ?? 0;
     public ulong LeaderCurrentSeq => _logicalServer?.CurrentSeq ?? 0;

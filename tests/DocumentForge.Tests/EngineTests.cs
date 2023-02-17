@@ -258,6 +258,78 @@ public class EngineTests : IDisposable
     }
 
     [Fact]
+    public async System.Threading.Tasks.Task PlannedHandover_ZeroDataLoss()
+    {
+        // Simulate a datacenter move: old_leader (DC1) hands off to new_leader (DC2)
+        // Clients should see no data loss.
+        int oldPort = 5900 + System.Random.Shared.Next(50);
+        int newPort = oldPort + 1;
+
+        var oldPath = Path.Combine(Path.GetTempPath(), $"old_{Guid.NewGuid():N}.dfdb");
+        var newPath = Path.Combine(Path.GetTempPath(), $"new_{Guid.NewGuid():N}.dfdb");
+
+        try
+        {
+            using var oldLeader = DocumentForgeDb.Create(oldPath);
+            oldLeader.StartLogicalReplicationServer(oldPort);
+            await System.Threading.Tasks.Task.Delay(200);
+
+            // newLeader starts as a follower of oldLeader
+            using var newLeader = DocumentForgeDb.Create(newPath);
+            newLeader.StartLogicalReplicationFollower("localhost", oldPort);
+
+            // Wait for connection + handshake to complete
+            for (int i = 0; i < 50 && oldLeader.GetLogicalFollowerCount() == 0; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+            Assert.Equal(1, oldLeader.GetLogicalFollowerCount());
+
+            // Simulate production traffic - writes on old leader replicate to new leader
+            for (int i = 0; i < 50; i++)
+                oldLeader.Insert("orders", $$"""{"pnr": "PRE_{{i}}"}""");
+
+            // Wait for initial replication
+            for (int i = 0; i < 30 && newLeader.FollowerLastSeq < oldLeader.LeaderCurrentSeq; i++)
+                await System.Threading.Tasks.Task.Delay(50);
+
+            // ===== THE HANDOVER =====
+            // Step 1: oldLeader goes read-only and waits for newLeader to reach final seq
+            var finalSeq = oldLeader.BeginPlannedHandover(
+                followerLastSeqProbe: () => newLeader.FollowerLastSeq,
+                timeout: TimeSpan.FromSeconds(5));
+
+            // Verify oldLeader rejects writes
+            Assert.Throws<DocumentForge.Core.DocumentForgeException>(() =>
+                oldLeader.Insert("orders", """{"pnr": "REJECTED"}"""));
+
+            // Step 2: newLeader promotes itself
+            newLeader.PromoteToLeader(newPort);
+            await System.Threading.Tasks.Task.Delay(200);
+
+            // ===== CLIENTS NOW USE NEW LEADER =====
+            // Writes succeed on newLeader
+            newLeader.Insert("orders", """{"pnr": "POST_1"}""");
+            newLeader.Insert("orders", """{"pnr": "POST_2"}""");
+
+            // Verify: all 52 docs are on the new leader (50 pre + 2 post)
+            var allDocs = newLeader.Execute("SELECT * FROM orders");
+            Assert.Equal(52, allDocs.Documents.Count);
+
+            // Verify the final seq is correct and newLeader is now a leader
+            Assert.True(newLeader.LeaderCurrentSeq >= 2); // 2 post-handover writes
+            Assert.False(newLeader.IsReadOnly);
+            Assert.True(oldLeader.IsReadOnly);
+        }
+        finally
+        {
+            try { File.Delete(oldPath); File.Delete(oldPath + ".wal"); File.Delete(oldPath + ".recovery"); } catch { }
+            try {
+                File.Delete(newPath); File.Delete(newPath + ".wal");
+                File.Delete(newPath + ".recovery"); File.Delete(newPath + ".followerseq");
+            } catch { }
+        }
+    }
+
+    [Fact]
     public async System.Threading.Tasks.Task LogicalReplication_CatchupAfterReconnect()
     {
         int port = 5800 + System.Random.Shared.Next(100);
