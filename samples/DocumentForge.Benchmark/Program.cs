@@ -3,9 +3,9 @@ using DocumentForge.Document;
 using DocumentForge.Engine;
 using DocumentForge.Index;
 
-const int TARGET_DOCS = 250_000;
-const int BATCH_SIZE = 5_000;
-const int QUERY_DURATION_SECONDS = 60; // 1 minute per query type
+const int TARGET_DOCS = 10_000_000;
+const int BATCH_SIZE = 25_000;
+const int QUERY_DURATION_SECONDS = 30; // 30s per query type to keep total runtime sane
 
 Console.WriteLine("╔═══════════════════════════════════════════════════════════════╗");
 Console.WriteLine("║     DocumentForge - STRESS TEST BENCHMARK                    ║");
@@ -19,8 +19,9 @@ var dbPath = Path.Combine(Path.GetTempPath(), "benchmark_10m.dfdb");
 if (File.Exists(dbPath)) File.Delete(dbPath);
 if (File.Exists(dbPath + ".wal")) File.Delete(dbPath + ".wal");
 
-// Large cache for bulk operations: 10,000 pages = 80MB
-var options = new DatabaseOptions { CacheSizeInPages = 10_000, EnableWal = false };
+// Large cache for 10M doc workload: 200,000 pages = 1.6GB
+// (ensures the tail of the collection stays hot during bulk insert)
+var options = new DatabaseOptions { CacheSizeInPages = 200_000, EnableWal = false };
 using var db = DocumentForgeDb.Create(dbPath, options);
 
 var rng = new Random(42);
@@ -58,14 +59,20 @@ while (totalInserted < TARGET_DOCS)
     var rate = totalInserted / elapsed.TotalSeconds;
     var eta = TimeSpan.FromSeconds((TARGET_DOCS - totalInserted) / rate);
 
-    Console.WriteLine($"  {totalInserted:N0} / {TARGET_DOCS:N0} " +
-                  $"({totalInserted * 100.0 / TARGET_DOCS:F1}%) " +
-                  $"| {rate:N0} docs/sec " +
-                  $"| Batch: {batchSw.Elapsed.TotalSeconds:F1}s " +
-                  $"| ETA: {eta:mm\\:ss}");
+    // Only print every 250K docs (or on the final one) to keep cmd readable
+    bool isFinal = totalInserted == TARGET_DOCS;
+    if (totalInserted % 250_000 == 0 || isFinal)
+    {
+        var mem = GC.GetTotalMemory(false) / 1024.0 / 1024.0;
+        Console.WriteLine($"  {totalInserted:N0} / {TARGET_DOCS:N0} " +
+                      $"({totalInserted * 100.0 / TARGET_DOCS:F1}%) " +
+                      $"| {rate:N0} docs/sec " +
+                      $"| RAM: {mem:F0}MB " +
+                      $"| ETA: {eta:mm\\:ss}");
+    }
 
-    // Save some PNRs for later queries
-    if (totalInserted <= BATCH_SIZE)
+    // Save some PNRs from the first batch for later point-lookup queries
+    if (knownPnrs.Count < 500)
     {
         foreach (var doc in batch.Take(100))
         {

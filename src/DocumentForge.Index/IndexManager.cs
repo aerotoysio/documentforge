@@ -214,10 +214,20 @@ public sealed class IndexManager
     public void RebuildIndex(BTreeIndex index, Collection collection)
     {
         index.Clear();
-        foreach (var (doc, _, _) in collection.IterateDocuments())
+        // Bulk mode skips per-entry disk writes; we write everything at once at the end.
+        // This is the difference between 50M small I/Os and one sequential pass.
+        index.BeginBulkLoad();
+        try
         {
-            var docId = doc.GetId();
-            InsertDocIntoIndex(index, doc, docId);
+            foreach (var (doc, _, _) in collection.IterateDocuments())
+            {
+                var docId = doc.GetId();
+                InsertDocIntoIndex(index, doc, docId);
+            }
+        }
+        finally
+        {
+            index.EndBulkLoad();
         }
     }
 }

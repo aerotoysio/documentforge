@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Getting Started — DocumentForge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="index.html" class="brand"><span class="brand-dot"></span>DocumentForge</a>
+    <div class="nav-links">
+      <a href="getting-started.html" class="active">Getting Started</a>
+      <a href="query-language.html">Query Language</a>
+      <a href="data-modeling.html">Data Modeling</a>
+      <a href="replication.html">Replication</a>
+      <a href="deployment.html">Deployment</a>
+      <a href="performance.html">Performance</a>
+    </div>
+  </div>
+</nav>
+
+<section class="page-title">
+  <div class="container">
+    <div class="eyebrow">Chapter 01</div>
+    <h1>Getting Started</h1>
+    <p>From zero to your first query in five minutes. No server setup, no connection strings, no schema migrations.</p>
+  </div>
+</section>
+
+<div class="doc-layout">
+  <aside class="toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#install">Install</a></li>
+      <li><a href="#first-db">Your first database</a></li>
+      <li><a href="#insert">Insert documents</a></li>
+      <li><a href="#query">Query</a></li>
+      <li><a href="#indexes">Create indexes</a></li>
+      <li><a href="#repl">Interactive REPL</a></li>
+      <li><a href="#api">REST API</a></li>
+      <li><a href="#next">Next steps</a></li>
+    </ul>
+  </aside>
+
+  <article>
+    <h2 id="install">Install</h2>
+    <p>DocumentForge is a .NET 9 library with zero external dependencies. Add it to your solution by cloning the repository and referencing the <code>DocumentForge.Engine</code> project, or install the NuGet package once published.</p>
+
+    <h4>From source</h4>
+    <pre>git clone https://github.com/yourname/documentforge.git
+cd documentforge
+dotnet build
+
+<span class="hl-com"># Add a reference from your project</span>
+dotnet add reference path/to/src/DocumentForge.Engine</pre>
+
+    <h4>Requirements</h4>
+    <ul>
+      <li>.NET 9 SDK or later</li>
+      <li>Windows, macOS, or Linux</li>
+      <li>Write access to the directory where your <code>.dfdb</code> file lives</li>
+    </ul>
+
+    <h2 id="first-db">Your first database</h2>
+    <p>A DocumentForge database is a single file on disk. Opening one is a constructor call.</p>
+
+    <pre><span class="hl-kw">using</span> DocumentForge.Engine;
+
+<span class="hl-kw">using var</span> db = DocumentForgeDb.OpenOrCreate(<span class="hl-str">"airline.dfdb"</span>);</pre>
+
+    <p>That's it. If <code>airline.dfdb</code> exists, it's opened; if not, it's created. The <code>using</code> ensures the file is closed and flushed on dispose.</p>
+
+    <div class="callout">
+      <strong>Files created alongside your database:</strong> <code>airline.dfdb</code> (data), <code>airline.dfdb.wal</code> (write-ahead log), <code>airline.dfdb.recovery</code> (crash recovery log). Keep them together when moving or backing up.
+    </div>
+
+    <h2 id="insert">Insert documents</h2>
+    <p>Documents are JSON. You can pass a JSON string, a <code>BsonDocument</code>, or an anonymous C# object (via <code>BsonDocument.FromJson(JsonSerializer.Serialize(obj))</code>).</p>
+
+    <pre><span class="hl-com">// JSON string (simplest)</span>
+db.Insert(<span class="hl-str">"orders"</span>, <span class="hl-str">@"{
+    ""pnr"": ""ABC123"",
+    ""status"": ""CONFIRMED"",
+    ""passenger"": {
+        ""firstName"": ""John"",
+        ""lastName"": ""Smith""
+    },
+    ""flights"": [
+        { ""flightNumber"": ""AA100"", ""departureAirport"": ""JFK"" }
+    ]
+}"</span>);</pre>
+
+    <p>Collections are created automatically on first insert. The document's <code>_id</code> field is auto-generated (sequential, time-ordered) if you don't supply one.</p>
+
+    <h4>Bulk insert</h4>
+    <p>For loading large datasets, <code>BulkInsert</code> acquires the write lock once and defers index updates until the batch completes. Expect 50,000–70,000 docs/sec on a modern laptop.</p>
+
+    <pre><span class="hl-kw">var</span> batch = <span class="hl-kw">new</span> List&lt;BsonDocument&gt;();
+<span class="hl-kw">for</span> (<span class="hl-kw">int</span> i = <span class="hl-num">0</span>; i &lt; <span class="hl-num">10_000</span>; i++)
+{
+    batch.Add(BsonDocument.FromJson(<span class="hl-kw">$@"</span>{{ <span class="hl-str">""pnr""</span>: <span class="hl-str">""ORD{i:D6}""</span> }}"));
+}
+db.BulkInsert(<span class="hl-str">"orders"</span>, batch);</pre>
+
+    <h2 id="query">Query</h2>
+    <p>SQL-like queries hit a single <code>Execute</code> method. Dot notation navigates nested objects. Bracket notation indexes arrays.</p>
+
+    <pre><span class="hl-com">// Point lookup</span>
+<span class="hl-kw">var</span> r1 = db.Execute(<span class="hl-str">"SELECT * FROM orders WHERE pnr = 'ABC123'"</span>);
+
+<span class="hl-com">// Nested field</span>
+<span class="hl-kw">var</span> r2 = db.Execute(<span class="hl-str">"SELECT * FROM orders WHERE passenger.lastName = 'Smith'"</span>);
+
+<span class="hl-com">// Array element</span>
+<span class="hl-kw">var</span> r3 = db.Execute(<span class="hl-str">"SELECT * FROM orders WHERE flights[0].departureAirport = 'JFK'"</span>);
+
+<span class="hl-com">// Range, ordering, limit</span>
+<span class="hl-kw">var</span> r4 = db.Execute(<span class="hl-str">@"
+    SELECT pnr, passenger.lastName
+    FROM orders
+    WHERE flights[0].fareAmount &gt; 500
+    ORDER BY flights[0].fareAmount DESC
+    LIMIT 10
+"</span>);
+
+<span class="hl-com">// Iterate results</span>
+<span class="hl-kw">foreach</span> (<span class="hl-kw">var</span> doc <span class="hl-kw">in</span> r4.Documents)
+    Console.WriteLine(doc.ToJson());</pre>
+
+    <p>Every query returns a <code>QueryResult</code> containing the documents, the plan used (<code>INDEX_SCAN</code>, <code>COLLECTION_SCAN</code>, etc.), and the execution time in milliseconds.</p>
+
+    <h2 id="indexes">Create indexes</h2>
+    <p>Indexes are the difference between a 1ms lookup and a 1-second scan. Create one for any JSON path you query frequently.</p>
+
+    <pre><span class="hl-com">// Single-field index</span>
+db.CreateIndex(<span class="hl-str">"orders"</span>, <span class="hl-str">"pnr"</span>, <span class="hl-str">"idx_pnr"</span>, unique: <span class="hl-kw">true</span>);
+
+<span class="hl-com">// Nested path</span>
+db.CreateIndex(<span class="hl-str">"orders"</span>, <span class="hl-str">"passenger.lastName"</span>, <span class="hl-str">"idx_lastname"</span>);
+
+<span class="hl-com">// Composite - good for multi-field WHERE clauses</span>
+db.Execute(<span class="hl-str">"CREATE INDEX idx_status_date ON orders (status, createdAt)"</span>);</pre>
+
+    <p>Indexes are <strong>persistent</strong> — they survive database restart without being rebuilt. They're also <strong>incrementally maintained</strong> on every insert, update, and delete, so queries always see fresh results.</p>
+
+    <h2 id="repl">Interactive REPL</h2>
+    <p>Included in the repo is an interactive console for experimenting with SQL queries against your database.</p>
+
+    <pre>dotnet run --project samples/DocumentForge.Repl
+
+dfdb&gt; seed 1000
+dfdb&gt; SELECT * FROM orders WHERE pnr = 'ABC123'
+dfdb&gt; SELECT status, COUNT(*) FROM orders GROUP BY status
+dfdb&gt; stats</pre>
+
+    <h2 id="api">REST API</h2>
+    <p>For testing from Postman or wiring into other services, there's a minimal REST API sample.</p>
+
+    <pre>dotnet run --project samples/DocumentForge.Api
+
+<span class="hl-com"># Then from another terminal</span>
+curl -X POST http://localhost:5000/query \
+     -H "Content-Type: application/json" \
+     -d '{"sql": "SELECT * FROM orders LIMIT 5"}'</pre>
+
+    <h2 id="next">Next steps</h2>
+    <ul>
+      <li><a href="query-language.html">Query Language reference</a> — all the SQL features we support</li>
+      <li><a href="data-modeling.html">Data Modeling guide</a> — when to embed, when to reference</li>
+      <li><a href="replication.html">Replication</a> — read scaling and zero-downtime handover</li>
+      <li><a href="deployment.html">Deployment</a> — running across multiple machines and datacenters</li>
+    </ul>
+  </article>
+</div>
+
+<footer>
+  <div class="container">
+    <p><strong>DocumentForge</strong> — built with care, zero dependencies.</p>
+    <p class="meta">MIT License · Open Source · Version 0.1.0</p>
+  </div>
+</footer>
+
+</body>
+</html>

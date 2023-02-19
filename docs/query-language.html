@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Query Language — DocumentForge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="index.html" class="brand"><span class="brand-dot"></span>DocumentForge</a>
+    <div class="nav-links">
+      <a href="getting-started.html">Getting Started</a>
+      <a href="query-language.html" class="active">Query Language</a>
+      <a href="data-modeling.html">Data Modeling</a>
+      <a href="replication.html">Replication</a>
+      <a href="deployment.html">Deployment</a>
+      <a href="performance.html">Performance</a>
+    </div>
+  </div>
+</nav>
+
+<section class="page-title">
+  <div class="container">
+    <div class="eyebrow">Chapter 02</div>
+    <h1>Query Language</h1>
+    <p>SQL syntax extended with JSON paths. Familiar on the left, flexible on the right.</p>
+  </div>
+</section>
+
+<div class="doc-layout">
+  <aside class="toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#select">SELECT</a></li>
+      <li><a href="#paths">JSON paths</a></li>
+      <li><a href="#where">WHERE clauses</a></li>
+      <li><a href="#order-limit">ORDER BY · LIMIT</a></li>
+      <li><a href="#joins">JOIN</a></li>
+      <li><a href="#agg">Aggregations</a></li>
+      <li><a href="#groupby">GROUP BY</a></li>
+      <li><a href="#insert">INSERT</a></li>
+      <li><a href="#update">UPDATE</a></li>
+      <li><a href="#delete">DELETE</a></li>
+      <li><a href="#index">CREATE / DROP INDEX</a></li>
+      <li><a href="#plans">Query plans</a></li>
+    </ul>
+  </aside>
+
+  <article>
+    <h2 id="select">SELECT</h2>
+    <pre>SELECT * FROM orders
+SELECT pnr, passenger.lastName FROM orders
+SELECT * FROM orders WHERE pnr = 'ABC123'
+SELECT * FROM orders ORDER BY createdAt DESC LIMIT 100 OFFSET 50</pre>
+
+    <p>Returns matching documents. The <code>*</code> selector returns the full document, including all nested fields. A comma-separated list projects specific fields.</p>
+
+    <h2 id="paths">JSON paths</h2>
+    <p>Any place you can reference a field, you can use a JSON path. Dots navigate into objects; brackets index arrays.</p>
+
+    <table>
+      <thead><tr><th>Path</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>pnr</code></td><td>Top-level field</td></tr>
+        <tr><td><code>passenger.lastName</code></td><td>Nested object field</td></tr>
+        <tr><td><code>flights[0].flightNumber</code></td><td>First array element's field</td></tr>
+        <tr><td><code>flights[2].fare.total</code></td><td>Nested inside array</td></tr>
+        <tr><td><code>flights[*].flightNumber</code></td><td>Any array element (index-only)</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <strong>Tip:</strong> <code>[*]</code> wildcard is supported when creating indexes (index every element's value) but in WHERE clauses you need a specific index. Use arrays with known positions for WHERE predicates, or combine with aggregations to filter-by-contents.
+    </div>
+
+    <h2 id="where">WHERE clauses</h2>
+    <p>Supported operators: <code>=</code>, <code>!=</code>, <code>&gt;</code>, <code>&lt;</code>, <code>&gt;=</code>, <code>&lt;=</code>, <code>LIKE</code>, <code>IS NULL</code>, <code>IS NOT NULL</code>. Combine with <code>AND</code> / <code>OR</code> / <code>NOT</code> and parentheses.</p>
+
+    <pre>SELECT * FROM orders WHERE status = 'CONFIRMED' AND passenger.age &gt;= 18
+SELECT * FROM users  WHERE email LIKE '%@example.com'
+SELECT * FROM orders WHERE cancelledAt IS NULL
+SELECT * FROM orders WHERE (status = 'CONFIRMED' OR status = 'TICKETED') AND total &gt; 1000</pre>
+
+    <h4>Equality uses indexes</h4>
+    <p>A <code>=</code> predicate on an indexed path uses <code>INDEX_SCAN</code>. Range predicates (<code>&gt;</code>, <code>&lt;</code>, <code>&gt;=</code>, <code>&lt;=</code>) use <code>INDEX_RANGE_SCAN</code> when an index exists.</p>
+
+    <h4>Composite indexes</h4>
+    <p>An index on <code>(status, createdAt)</code> fires when both columns appear with equality in an AND clause. See <a href="#index">CREATE INDEX</a>.</p>
+
+    <h2 id="order-limit">ORDER BY · LIMIT · OFFSET</h2>
+    <pre>SELECT * FROM orders ORDER BY createdAt DESC LIMIT 50 OFFSET 100</pre>
+
+    <p><code>LIMIT</code> without <code>ORDER BY</code> is pushed down into the scan, meaning only N documents are materialized. With <code>ORDER BY</code>, the full matching set is materialized before sorting.</p>
+
+    <h2 id="joins">JOIN</h2>
+    <p>A hash join between two collections on an equality predicate. Useful when you've referenced a shared entity (like a flight) rather than embedding it.</p>
+
+    <pre>SELECT * FROM orders
+JOIN flights ON orders.bookedFlights[0].flightRef = flights.flightId
+WHERE orders.pnr = 'ABC123'</pre>
+
+    <p>The result document has both collections nested under their name:</p>
+
+    <pre>{
+  "orders":  { "pnr": "ABC123", "bookedFlights": [...] },
+  "flights": { "flightId": "AA100_2024-06-15", "status": "DELAYED" }
+}</pre>
+
+    <p>In WHERE and SELECT, prefix paths with the collection name: <code>orders.pnr</code>, <code>flights.status</code>.</p>
+
+    <h2 id="agg">Aggregations</h2>
+    <p>Five aggregate functions: <code>COUNT</code>, <code>SUM</code>, <code>AVG</code>, <code>MIN</code>, <code>MAX</code>. Combine freely in the SELECT list.</p>
+
+    <pre>SELECT COUNT(*) FROM orders
+SELECT SUM(tickets[0].fare.total) FROM orders WHERE status = 'CONFIRMED'
+SELECT MIN(fare.total), MAX(fare.total), AVG(fare.total) FROM tickets</pre>
+
+    <p>The result key in the output document matches the aggregate expression: <code>COUNT(*)</code>, <code>SUM(tickets[0].fare.total)</code>, etc.</p>
+
+    <h2 id="groupby">GROUP BY</h2>
+    <p>Bucket documents by one or more fields; aggregates run per bucket.</p>
+
+    <pre>SELECT status, COUNT(*), SUM(fare.total)
+FROM orders
+GROUP BY status
+
+SELECT airline, cabin, COUNT(*), AVG(fare.total)
+FROM orders
+GROUP BY airline, cabin</pre>
+
+    <p>Each result row includes the grouping columns plus all aggregates.</p>
+
+    <h2 id="insert">INSERT</h2>
+    <pre>INSERT INTO orders VALUES { "pnr": "XYZ789", "status": "PENDING" }</pre>
+
+    <p>The document is parsed as JSON. Missing <code>_id</code> fields are filled with a sequential time-ordered ID.</p>
+
+    <h2 id="update">UPDATE</h2>
+    <pre>UPDATE orders SET status = 'CANCELLED' WHERE pnr = 'ABC123'
+UPDATE orders SET passenger.vip = true WHERE passenger.lastName = 'Smith'</pre>
+
+    <p>Paths in SET can be nested. All matching documents are updated; affected-count is returned.</p>
+
+    <h2 id="delete">DELETE</h2>
+    <pre>DELETE FROM orders WHERE status = 'CANCELLED' AND createdAt &lt; '2020-01-01'</pre>
+
+    <p>Deletes all matching documents. A DELETE without WHERE is supported but should be used with care.</p>
+
+    <h2 id="index">CREATE / DROP INDEX</h2>
+    <pre>CREATE INDEX idx_pnr ON orders (pnr)
+CREATE UNIQUE INDEX idx_pnr ON orders (pnr)
+CREATE INDEX idx_status_created ON orders (status, createdAt)
+DROP INDEX idx_pnr ON orders</pre>
+
+    <p>Indexes are built from existing data synchronously, then incrementally maintained. Unique indexes reject duplicates on insert.</p>
+
+    <h2 id="plans">Query plans</h2>
+    <p>Every <code>QueryResult</code> returns a <code>QueryPlan</code> string describing how the query was executed.</p>
+
+    <table>
+      <thead><tr><th>Plan</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>INDEX_SCAN(name)</code></td><td>Equality lookup via single-field index</td></tr>
+        <tr><td><code>INDEX_RANGE_SCAN(name)</code></td><td>Range lookup via B-tree walk</td></tr>
+        <tr><td><code>INDEX_SCAN_COMPOSITE(name)</code></td><td>Multi-field equality via composite index</td></tr>
+        <tr><td><code>COLLECTION_SCAN</code></td><td>Full scan, no matching index</td></tr>
+        <tr><td><code>... + HASH_JOIN(coll)</code></td><td>Hash join was applied to the result</td></tr>
+        <tr><td><code>... + AGGREGATE</code></td><td>Aggregation / GROUP BY was applied</td></tr>
+      </tbody>
+    </table>
+
+    <p>Check the plan during development — if you see <code>COLLECTION_SCAN</code> on a query you run often, add an index.</p>
+  </article>
+</div>
+
+<footer>
+  <div class="container">
+    <p><strong>DocumentForge</strong> — built with care, zero dependencies.</p>
+    <p class="meta">MIT License · Open Source · Version 0.1.0</p>
+  </div>
+</footer>
+
+</body>
+</html>

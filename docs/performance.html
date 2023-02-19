@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Performance — DocumentForge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="index.html" class="brand"><span class="brand-dot"></span>DocumentForge</a>
+    <div class="nav-links">
+      <a href="getting-started.html">Getting Started</a>
+      <a href="query-language.html">Query Language</a>
+      <a href="data-modeling.html">Data Modeling</a>
+      <a href="replication.html">Replication</a>
+      <a href="deployment.html">Deployment</a>
+      <a href="performance.html" class="active">Performance</a>
+    </div>
+  </div>
+</nav>
+
+<section class="page-title">
+  <div class="container">
+    <div class="eyebrow">Chapter 06</div>
+    <h1>Performance</h1>
+    <p>Real numbers from a benchmark you can run yourself. Limits, bottlenecks, and the fix for each.</p>
+  </div>
+</section>
+
+<div class="doc-layout">
+  <aside class="toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#numbers">Real numbers</a></li>
+      <li><a href="#scale">Scale projection</a></li>
+      <li><a href="#bottlenecks">Bottlenecks</a></li>
+      <li><a href="#tuning">Tuning</a></li>
+      <li><a href="#how">How it gets this fast</a></li>
+      <li><a href="#run">Run it yourself</a></li>
+    </ul>
+  </aside>
+
+  <article>
+    <h2 id="numbers">Real numbers (250,000 documents, modern laptop)</h2>
+    <p>From the included benchmark suite. Workload: airline order documents (~500 bytes each) with 5 indexes.</p>
+
+    <table>
+      <thead><tr><th>Operation</th><th>Throughput / Latency</th></tr></thead>
+      <tbody>
+        <tr><td>Bulk insert</td><td>~70,000 docs/sec sustained</td></tr>
+        <tr><td>Point lookup (unique indexed PNR)</td><td><strong>~210,000 QPS, avg &lt;1ms</strong></td></tr>
+        <tr><td>Status = 'CONFIRMED' LIMIT 100</td><td>~3,300 QPS, avg 0.3ms</td></tr>
+        <tr><td>Departure airport LIMIT 50</td><td>~6,400 QPS, avg 0.15ms</td></tr>
+        <tr><td>Range query (fare &gt; 1500) LIMIT 100</td><td>~144 QPS, avg 7ms</td></tr>
+        <tr><td>First name scan (no index) LIMIT 10</td><td>~830 QPS, avg 1.2ms</td></tr>
+        <tr><td>Collection scan (no LIMIT, ~8K results)</td><td>~3 QPS, avg 360ms</td></tr>
+      </tbody>
+    </table>
+
+    <p><strong>2.6 million queries executed in 5 minutes</strong> during the query benchmark. On one laptop. In C#.</p>
+
+    <h2 id="scale">Scale projection</h2>
+    <p>Based on the 250K benchmark, here's what to expect as your dataset grows:</p>
+
+    <table>
+      <thead><tr><th>Scale</th><th>File size</th><th>RAM usage</th><th>Insert rate</th><th>Indexed lookup</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td>1M docs</td><td>~500 MB</td><td>~500 MB</td><td>60–70K/sec</td><td>200K+ QPS</td><td>🚀 Trivial</td></tr>
+        <tr><td>10M docs</td><td>~5 GB</td><td>~2–3 GB</td><td>40–60K/sec</td><td>150–200K QPS</td><td>💪 Comfortable</td></tr>
+        <tr><td>50M docs</td><td>~25 GB</td><td>~12 GB</td><td>20–30K/sec</td><td>80–120K QPS</td><td>⚡ Sweet spot ends</td></tr>
+        <tr><td>100M docs</td><td>~50 GB</td><td>~25 GB</td><td>10–20K/sec</td><td>50–80K QPS</td><td>⚠️ Needs 32GB+</td></tr>
+        <tr><td>500M docs</td><td>~250 GB</td><td>&gt;100 GB</td><td>limited</td><td>cache-bound</td><td>❌ Needs redesign</td></tr>
+      </tbody>
+    </table>
+
+    <p>The cliff at ~100M is the in-memory index. Once your indexes don't fit in RAM, performance tanks. See <a href="#bottlenecks">Bottlenecks</a> below.</p>
+
+    <h2 id="bottlenecks">Bottlenecks</h2>
+    <p>Each bottleneck has a known fix. Some are already implemented, some are roadmap.</p>
+
+    <table>
+      <thead><tr><th>Limit</th><th>Hits at</th><th>Fix</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td>BSON allocation overhead</td><td>Bulk insert ceiling</td><td>ArrayPool + stackalloc</td><td>✓ Partial</td></tr>
+        <tr><td>Page cache churn</td><td>Data &gt; cache size</td><td>Increase <code>CacheSizeInPages</code></td><td>✓ Configurable</td></tr>
+        <tr><td>Location map in RAM</td><td>~50M docs</td><td>Move to persistent structure</td><td>🗺️ Roadmap</td></tr>
+        <tr><td>In-memory B-tree</td><td>~50M docs</td><td>True on-disk B-tree (SQLite style)</td><td>🗺️ Roadmap</td></tr>
+        <tr><td>Single global write lock</td><td>Hundreds of concurrent writers</td><td>Page-level locking / MVCC</td><td>🗺️ Roadmap</td></tr>
+        <tr><td>Single-file per node</td><td>&gt;10TB scale</td><td>Sharding across nodes</td><td>🗺️ Possible</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="tuning">Tuning</h2>
+
+    <h4>Cache size</h4>
+    <p>The single most impactful knob. Set <code>CacheSizeInPages</code> so that ~20% of your data fits in cache. Each page is 8KB.</p>
+
+    <pre><span class="hl-kw">new</span> DatabaseOptions { CacheSizeInPages = <span class="hl-num">100_000</span> } <span class="hl-com">// 800MB cache</span></pre>
+
+    <h4>Indexes</h4>
+    <p>Add indexes for every field you filter on. Remove indexes you don't use — they slow down inserts. Check query plans during development.</p>
+
+    <h4>LIMIT early</h4>
+    <p>A <code>LIMIT</code> without an <code>ORDER BY</code> is pushed into the scan — we stop as soon as we've found enough. Adding <code>LIMIT 100</code> can turn a 3-second query into a 0.3ms one.</p>
+
+    <h4>Disable WAL for bulk load</h4>
+    <p>If you're doing a one-time bulk import and can restart from the beginning on failure, disabling the WAL during that load doubles throughput:</p>
+
+    <pre><span class="hl-kw">new</span> DatabaseOptions { EnableWal = <span class="hl-kw">false</span> } <span class="hl-com">// NO crash safety during load</span></pre>
+
+    <h2 id="how">How it gets this fast</h2>
+    <p>A few specific decisions do most of the heavy lifting.</p>
+
+    <h4>Direct addressing via location map</h4>
+    <p>Indexes store <code>DocumentId → (PageId, SlotIndex)</code>. Once the index finds your document's ID, we jump straight to the exact page and slot. No scan. This is the same trick the 1960s-era mainframe reservation systems (TPF, Sabre) used — and it's still unbeatable.</p>
+
+    <h4>Page-based storage</h4>
+    <p>Data lives in 8KB pages. A slotted layout lets us insert, update, and delete within a page without rewriting the whole file. Fixed sizes mean the OS page cache and our own LRU cache play nicely together.</p>
+
+    <h4>Persistent indexes</h4>
+    <p>Indexes are stored as append-only page chains on disk. On startup, we stream them back into memory without rebuilding from scratch. What used to take 7 seconds for 250K docs now takes a few hundred milliseconds.</p>
+
+    <h4>LIMIT pushdown</h4>
+    <p>The executor stops as soon as it's collected <code>LIMIT + OFFSET</code> matching documents. This turns queries that would fetch millions of rows into queries that fetch exactly what you asked for.</p>
+
+    <h4>Hash joins</h4>
+    <p>JOINs build a hash map of the smaller collection, then stream the larger one through it. O(n + m) instead of O(n × m).</p>
+
+    <h2 id="run">Run it yourself</h2>
+    <p>The repository includes a full benchmark. It creates a fresh database, inserts 250K documents with 5 indexes, runs 5 different query types for a minute each, then tests the reopen-with-persistent-indexes flow.</p>
+
+    <pre>dotnet run --project samples/DocumentForge.Benchmark --configuration Release</pre>
+
+    <p>Expect total runtime of about 5–7 minutes. The output shows insert rate, query throughput per pattern, and reopen performance.</p>
+
+    <div class="callout">
+      <strong>Your numbers will vary.</strong> CPU, disk, RAM, and OS all matter. A fast NVMe SSD and 32GB of RAM will produce materially better results than a 5-year-old laptop with an HDD. The relative ordering (PNR &gt; airport &gt; status &gt; range &gt; scan) will be the same.
+    </div>
+  </article>
+</div>
+
+<footer>
+  <div class="container">
+    <p><strong>DocumentForge</strong> — built with care, zero dependencies.</p>
+    <p class="meta">MIT License · Open Source · Version 0.1.0</p>
+  </div>
+</footer>
+
+</body>
+</html>

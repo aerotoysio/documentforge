@@ -649,6 +649,73 @@ public sealed class DocumentForgeDb : IDisposable
     public long GapsDetected => _logicalFollower?.GapsDetected ?? 0;
     public ulong FollowerLastSeq => _logicalFollower?.LastAppliedSeq ?? 0;
     public ulong LeaderCurrentSeq => _logicalServer?.CurrentSeq ?? 0;
+    public DateTimeOffset? LastLeaderMessage =>
+        _logicalFollower?.LastMessageAt == DateTimeOffset.MinValue ? null : _logicalFollower?.LastMessageAt;
+
+    // --- Auto-failover ---
+
+    private CancellationTokenSource? _autoFailoverCts;
+    private bool _autoFailoverPromoted;
+
+    /// <summary>
+    /// Enable automatic promotion to leader if the leader goes silent.
+    /// Watches the follower's last-message timestamp. If no heartbeat or op arrives
+    /// within <paramref name="silenceTimeout"/>, disconnects from the leader and
+    /// promotes this node to leader on <paramref name="newLeaderPort"/>.
+    /// </summary>
+    public void EnableAutoFailover(int newLeaderPort, TimeSpan silenceTimeout, Action<int>? onPromoted = null)
+    {
+        if (_logicalFollower is null)
+            throw new DocumentForgeException("Auto-failover requires the node to be a logical replication follower.");
+        if (_autoFailoverCts is not null)
+            throw new DocumentForgeException("Auto-failover already enabled.");
+
+        _autoFailoverCts = new CancellationTokenSource();
+        var ct = _autoFailoverCts.Token;
+
+        _ = Task.Run(async () =>
+        {
+            // Grace period: let the initial connection settle
+            try { await Task.Delay(TimeSpan.FromSeconds(3), ct); } catch { return; }
+
+            while (!ct.IsCancellationRequested && !_autoFailoverPromoted)
+            {
+                try { await Task.Delay(TimeSpan.FromMilliseconds(500), ct); }
+                catch { break; }
+
+                var lastMsg = _logicalFollower?.LastMessageAt ?? DateTimeOffset.MinValue;
+                if (lastMsg == DateTimeOffset.MinValue) continue; // no messages yet
+
+                var silent = DateTimeOffset.UtcNow - lastMsg;
+                if (silent > silenceTimeout)
+                {
+                    Console.WriteLine($"[AutoFailover] Leader silent for {silent.TotalSeconds:F1}s (threshold: {silenceTimeout.TotalSeconds:F1}s) - promoting.");
+                    _autoFailoverPromoted = true;
+                    try
+                    {
+                        PromoteToLeader(newLeaderPort);
+                        onPromoted?.Invoke(newLeaderPort);
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[AutoFailover] Promotion failed: {ex.Message}");
+                    }
+                    break;
+                }
+            }
+        }, ct);
+    }
+
+    /// <summary>Stop watching for leader silence. Safe to call even if never enabled.</summary>
+    public void DisableAutoFailover()
+    {
+        _autoFailoverCts?.Cancel();
+        _autoFailoverCts?.Dispose();
+        _autoFailoverCts = null;
+    }
+
+    /// <summary>True if this node was auto-promoted via the failover mechanism.</summary>
+    public bool WasAutoFailoverPromoted => _autoFailoverPromoted;
 
     private void InsertOnFollower(string collectionName, BsonDocument doc)
     {
@@ -739,6 +806,7 @@ public sealed class DocumentForgeDb : IDisposable
     {
         if (!_disposed)
         {
+            DisableAutoFailover();
             _replicationServer?.Dispose();
             _replicationFollower?.Dispose();
             _logicalServer?.Dispose();
