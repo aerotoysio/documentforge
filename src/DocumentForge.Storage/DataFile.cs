@@ -65,6 +65,12 @@ public sealed class DataFile : IDataFile
         return new DataFile(stream, 2);
     }
 
+    /// <summary>
+    /// Count of pages read where the stored checksum didn't match the computed one.
+    /// Non-zero indicates disk or transport corruption - alert on this in production.
+    /// </summary>
+    public long ChecksumMismatches { get; private set; }
+
     public byte[] ReadPage(PageId pageId)
     {
         var buffer = new byte[Constants.PageSize];
@@ -79,6 +85,14 @@ public sealed class DataFile : IDataFile
                 totalRead += read;
             }
         }
+
+        // Verify checksum (skipped for legacy pages with Checksum=0)
+        if (!PageChecksum.Verify(buffer))
+        {
+            lock (_lock) ChecksumMismatches++;
+            Console.WriteLine($"[DocumentForge] WARNING: page {pageId} checksum mismatch - possible corruption");
+        }
+
         return buffer;
     }
 
@@ -86,6 +100,9 @@ public sealed class DataFile : IDataFile
     {
         if (data.Length != Constants.PageSize)
             throw new ArgumentException($"Page data must be {Constants.PageSize} bytes.");
+
+        // Stamp a fresh checksum before writing. Readers will verify on next load.
+        PageChecksum.Stamp(data);
 
         lock (_lock)
         {
