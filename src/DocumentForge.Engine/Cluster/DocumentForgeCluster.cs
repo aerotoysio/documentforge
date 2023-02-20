@@ -17,16 +17,64 @@ namespace DocumentForge.Engine.Cluster;
 public sealed class DocumentForgeCluster : IDisposable
 {
     private readonly List<IShardTransport> _shards = new();
+    private readonly List<string> _shardNames = new();
     private readonly Dictionary<string, CollectionShardingPolicy> _policies = new(StringComparer.OrdinalIgnoreCase);
+    private ConsistentHashRing? _ring;
+    private int _virtualNodesPerShard = 150;
     private bool _disposed;
 
     public int ShardCount => _shards.Count;
     public IReadOnlyList<IShardTransport> Shards => _shards;
 
-    /// <summary>Add a shard to the cluster. Shards are identified by their position (0..N-1).</summary>
+    /// <summary>
+    /// Build a cluster from a persisted ClusterConfig. The caller supplies a factory
+    /// that knows how to create an IShardTransport from a ShardDescriptor (useful for
+    /// choosing between in-process, HTTP, TCP transports).
+    /// </summary>
+    public static DocumentForgeCluster FromConfig(
+        ClusterConfig config,
+        Func<ShardDescriptor, IShardTransport> transportFactory)
+    {
+        var cluster = new DocumentForgeCluster();
+        cluster._virtualNodesPerShard = config.VirtualNodesPerShard;
+        foreach (var s in config.Shards)
+            cluster.AddShard(transportFactory(s));
+        foreach (var (name, policy) in config.Collections)
+        {
+            if (policy.Strategy == ShardingStrategy.Replicated)
+                cluster.ReplicateCollection(name);
+            else if (policy.Strategy == ShardingStrategy.Hash && policy.ShardKeyPath is not null)
+                cluster.ShardCollection(name, policy.ShardKeyPath);
+        }
+        return cluster;
+    }
+
+    /// <summary>Export the current cluster config so it can be persisted and distributed to all nodes.</summary>
+    public ClusterConfig ToConfig(Func<IShardTransport, string>? endpointResolver = null)
+    {
+        var cfg = new ClusterConfig { VirtualNodesPerShard = _virtualNodesPerShard };
+        for (int i = 0; i < _shards.Count; i++)
+            cfg.Shards.Add(new ShardDescriptor
+            {
+                Name = _shardNames[i],
+                Endpoint = endpointResolver?.Invoke(_shards[i]) ?? ""
+            });
+        foreach (var (name, pol) in _policies)
+            cfg.Collections[name] = new CollectionPolicyDescriptor
+            {
+                Strategy = pol.Strategy,
+                ShardKeyPath = pol.ShardKeyPath
+            };
+        return cfg;
+    }
+
+    /// <summary>Add a shard to the cluster. The shard's <c>ShardName</c> is used as its stable
+    /// identity on the consistent hash ring - changing it would re-route data.</summary>
     public DocumentForgeCluster AddShard(IShardTransport transport)
     {
         _shards.Add(transport);
+        _shardNames.Add(transport.ShardName);
+        _ring = new ConsistentHashRing(_shardNames, _virtualNodesPerShard);
         return this;
     }
 
@@ -72,21 +120,16 @@ public sealed class DocumentForgeCluster : IDisposable
     }
 
     /// <summary>
-    /// Pick a shard for a given shard-key value. Uses a stable hash so the same value
-    /// always lands on the same shard.
+    /// Pick a shard for a given shard-key value via the consistent hash ring.
+    /// Adding or removing a shard only re-routes ~1/N of the keys (the ones nearest
+    /// the new/removed shard's ring positions), not all of them.
     /// </summary>
     private int PickShard(BsonValue keyValue)
     {
-        if (_shards.Count == 0)
+        if (_ring is null || _shards.Count == 0)
             throw new DocumentForgeException("Cluster has no shards configured.");
-        // Stable string hash so any BsonValue type works and is deterministic.
         var s = keyValue.ToString() ?? "";
-        unchecked
-        {
-            uint h = 2166136261;
-            foreach (var c in s) h = (h ^ c) * 16777619;
-            return (int)(h % (uint)_shards.Count);
-        }
+        return _ring.PickShardIndex(s);
     }
 
     // --- Insert ---
