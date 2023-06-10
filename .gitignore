@@ -33,3 +33,7 @@ artifacts/
 Thumbs.db
 .DS_Store
 .claude/
+
+## Local test artifacts
+cluster.json
+*.test.json
