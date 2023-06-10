@@ -1,0 +1,11 @@
+{
+  "Version": 2,
+  "Shards": [
+    {
+      "Name": "dubai",
+      "Endpoint": "localhost:5000"
+    }
+  ],
+  "Collections": {},
+  "VirtualNodesPerShard": 150
+}

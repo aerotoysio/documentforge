@@ -14,4 +14,6 @@ public interface IShardTransport : IDisposable
     QueryResult Execute(string sql);
     DocumentId Insert(string collectionName, BsonDocument doc);
     DatabaseStatistics GetStatistics();
+    /// <summary>Direct delete by DocumentId. Bypasses SQL so ObjectId comparison is exact.</summary>
+    bool DeleteById(string collectionName, DocumentId id);
 }

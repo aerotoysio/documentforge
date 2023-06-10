@@ -383,6 +383,176 @@ public class EngineTests : IDisposable
     }
 
     [Fact]
+    public void Cluster_Rebalance_ScaleUp_2To4_RedistributesData()
+    {
+        // 2-shard cluster
+        var pathsBefore = Enumerable.Range(0, 2).Select(i =>
+            Path.Combine(Path.GetTempPath(), $"rb_before_{i}_{Guid.NewGuid():N}.dfdb")).ToArray();
+        var pathsAfter = Enumerable.Range(0, 4).Select(i =>
+            Path.Combine(Path.GetTempPath(), $"rb_after_{i}_{Guid.NewGuid():N}.dfdb")).ToArray();
+        var allPaths = pathsBefore.Concat(pathsAfter).ToList();
+
+        try
+        {
+            // Build the "before" state: 2 shards with data
+            var dbsBefore = pathsBefore.Select(p => DocumentForgeDb.Create(p)).ToList();
+            var names2 = new[] { "A", "B" };
+
+            var oldConfig = new DocumentForge.Engine.Cluster.ClusterConfig
+            {
+                Shards = names2.Zip(pathsBefore, (n, p) => new DocumentForge.Engine.Cluster.ShardDescriptor { Name = n, Endpoint = p }).ToList(),
+                Collections = { ["orders"] = new() { Strategy = DocumentForge.Engine.Cluster.ShardingStrategy.Hash, ShardKeyPath = "pnr" } }
+            };
+
+            using (var cluster2 = new DocumentForge.Engine.Cluster.DocumentForgeCluster())
+            {
+                for (int i = 0; i < 2; i++)
+                    cluster2.AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport(names2[i], dbsBefore[i]));
+                cluster2.ShardCollection("orders", "pnr");
+
+                for (int i = 0; i < 200; i++)
+                    cluster2.Insert("orders", $$"""{"pnr": "ORD{{i:D4}}", "amount": {{i * 10}}}""");
+            }
+
+            // Dispose cluster (but we still own the DBs)
+            foreach (var db in dbsBefore) db.Flush();
+            foreach (var db in dbsBefore) db.Dispose();
+
+            // Snapshot "before" counts per shard
+            long totalBefore = 0;
+            var beforeCounts = new long[2];
+            for (int i = 0; i < 2; i++)
+            {
+                using var d = DocumentForgeDb.Open(pathsBefore[i]);
+                beforeCounts[i] = d.Execute("SELECT COUNT(*) FROM orders").Documents[0]["count"].AsInt64;
+                totalBefore += beforeCounts[i];
+            }
+            Assert.Equal(200, totalBefore);
+
+            // Now define the target topology: 4 shards (A, B stay; C, D added)
+            var dbsAfter = new List<DocumentForgeDb>();
+            dbsAfter.Add(DocumentForgeDb.Open(pathsBefore[0]));  // shard A
+            dbsAfter.Add(DocumentForgeDb.Open(pathsBefore[1]));  // shard B
+            dbsAfter.Add(DocumentForgeDb.Create(pathsAfter[2])); // shard C (new, path reused for map)
+            dbsAfter.Add(DocumentForgeDb.Create(pathsAfter[3])); // shard D (new)
+
+            var names4 = new[] { "A", "B", "C", "D" };
+            var allPathsArr = new[] { pathsBefore[0], pathsBefore[1], pathsAfter[2], pathsAfter[3] };
+            var newConfig = new DocumentForge.Engine.Cluster.ClusterConfig
+            {
+                Shards = names4.Zip(allPathsArr, (n, p) => new DocumentForge.Engine.Cluster.ShardDescriptor { Name = n, Endpoint = p }).ToList(),
+                Collections = { ["orders"] = new() { Strategy = DocumentForge.Engine.Cluster.ShardingStrategy.Hash, ShardKeyPath = "pnr" } }
+            };
+
+            // Transport factory returns the matching in-process DB (the test hack is that
+            // Endpoint = the file path, so we just match on path)
+            DocumentForge.Engine.Cluster.IShardTransport MakeTransport(DocumentForge.Engine.Cluster.ShardDescriptor d)
+            {
+                int idx = Array.IndexOf(allPathsArr, d.Endpoint);
+                if (idx >= 0 && idx < dbsAfter.Count)
+                    return new DocumentForge.Engine.Cluster.InProcessShardTransport(d.Name, dbsAfter[idx]);
+                throw new InvalidOperationException($"No db for endpoint {d.Endpoint}");
+            }
+
+            // Plan + execute migration
+            var plan = DocumentForge.Engine.Cluster.ClusterRebalancer.Plan(oldConfig, newConfig, MakeTransport);
+            Assert.True(plan.TotalDocumentsToMove > 0, "Some docs should need to move");
+            Assert.True(plan.TotalDocumentsToMove < 200, "Consistent hashing should keep most docs put");
+
+            DocumentForge.Engine.Cluster.ClusterRebalancer.Execute(plan, MakeTransport);
+
+            // Verify: every doc still exists exactly once across all 4 shards
+            long totalAfter = 0;
+            var afterCounts = new long[4];
+            for (int i = 0; i < 4; i++)
+            {
+                afterCounts[i] = dbsAfter[i].Execute("SELECT COUNT(*) FROM orders").Documents[0]["count"].AsInt64;
+                totalAfter += afterCounts[i];
+            }
+            Assert.Equal(200, totalAfter);
+            // C and D should have received some docs from the rebalance
+            Assert.True(afterCounts[2] > 0 || afterCounts[3] > 0, "New shards should have received some docs");
+
+            foreach (var db in dbsAfter) db.Dispose();
+        }
+        finally
+        {
+            foreach (var p in allPaths)
+            {
+                try { File.Delete(p); File.Delete(p + ".wal"); File.Delete(p + ".recovery"); } catch { }
+            }
+        }
+    }
+
+    [Fact]
+    public void Cluster_Rebalance_ScaleDown_DropsShard()
+    {
+        var paths = Enumerable.Range(0, 3).Select(i =>
+            Path.Combine(Path.GetTempPath(), $"rbd_{i}_{Guid.NewGuid():N}.dfdb")).ToArray();
+
+        try
+        {
+            var dbs = paths.Select(p => DocumentForgeDb.Create(p)).ToList();
+            var names3 = new[] { "A", "B", "C" };
+
+            var oldConfig = new DocumentForge.Engine.Cluster.ClusterConfig
+            {
+                Shards = names3.Zip(paths, (n, p) => new DocumentForge.Engine.Cluster.ShardDescriptor { Name = n, Endpoint = p }).ToList(),
+                Collections = { ["orders"] = new() { Strategy = DocumentForge.Engine.Cluster.ShardingStrategy.Hash, ShardKeyPath = "pnr" } }
+            };
+
+            using (var cluster3 = new DocumentForge.Engine.Cluster.DocumentForgeCluster())
+            {
+                for (int i = 0; i < 3; i++)
+                    cluster3.AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport(names3[i], dbs[i]));
+                cluster3.ShardCollection("orders", "pnr");
+
+                for (int i = 0; i < 150; i++)
+                    cluster3.Insert("orders", $$"""{"pnr": "DROP{{i:D3}}"}""");
+            }
+
+            // Scale DOWN: drop shard C
+            var newConfig = new DocumentForge.Engine.Cluster.ClusterConfig
+            {
+                Shards = new()
+                {
+                    oldConfig.Shards[0],  // A stays
+                    oldConfig.Shards[1],  // B stays
+                    // C removed
+                },
+                Collections = { ["orders"] = new() { Strategy = DocumentForge.Engine.Cluster.ShardingStrategy.Hash, ShardKeyPath = "pnr" } }
+            };
+
+            DocumentForge.Engine.Cluster.IShardTransport MakeTransport(DocumentForge.Engine.Cluster.ShardDescriptor d)
+            {
+                int idx = Array.IndexOf(paths, d.Endpoint);
+                return new DocumentForge.Engine.Cluster.InProcessShardTransport(d.Name, dbs[idx]);
+            }
+
+            var plan = DocumentForge.Engine.Cluster.ClusterRebalancer.Plan(oldConfig, newConfig, MakeTransport);
+            DocumentForge.Engine.Cluster.ClusterRebalancer.Execute(plan, MakeTransport);
+
+            // Shard C should now be empty (all its docs migrated to A or B)
+            long cC = dbs[2].Execute("SELECT COUNT(*) FROM orders").Documents[0]["count"].AsInt64;
+            Assert.Equal(0, cC);
+
+            // Total count across A + B should still be 150
+            long total = dbs[0].Execute("SELECT COUNT(*) FROM orders").Documents[0]["count"].AsInt64
+                       + dbs[1].Execute("SELECT COUNT(*) FROM orders").Documents[0]["count"].AsInt64;
+            Assert.Equal(150, total);
+
+            foreach (var db in dbs) db.Dispose();
+        }
+        finally
+        {
+            foreach (var p in paths)
+            {
+                try { File.Delete(p); File.Delete(p + ".wal"); File.Delete(p + ".recovery"); } catch { }
+            }
+        }
+    }
+
+    [Fact]
     public void Cluster_ConfigRoundTrip_JsonPersistence()
     {
         var configPath = Path.Combine(Path.GetTempPath(), $"cfg_{Guid.NewGuid():N}.json");
