@@ -21,10 +21,16 @@ public sealed class DocumentForgeCluster : IDisposable
     private readonly Dictionary<string, CollectionShardingPolicy> _policies = new(StringComparer.OrdinalIgnoreCase);
     private ConsistentHashRing? _ring;
     private int _virtualNodesPerShard = 150;
+
+    // During an online rebalance, the previous ring is still valid for READ fallback.
+    // Set via EnableMigrationMode, cleared via DisableMigrationMode.
+    private ConsistentHashRing? _previousRing;
+    private List<IShardTransport>? _previousShards;
     private bool _disposed;
 
     public int ShardCount => _shards.Count;
     public IReadOnlyList<IShardTransport> Shards => _shards;
+    public bool IsMigrating => _previousRing is not null;
 
     /// <summary>
     /// Build a cluster from a persisted ClusterConfig. The caller supplies a factory
@@ -76,6 +82,26 @@ public sealed class DocumentForgeCluster : IDisposable
         _shardNames.Add(transport.ShardName);
         _ring = new ConsistentHashRing(_shardNames, _virtualNodesPerShard);
         return this;
+    }
+
+    /// <summary>
+    /// Enable online-migration mode. While active, read queries check the primary ring
+    /// first and fall back to the previous ring when a keyed lookup returns zero rows.
+    /// Writes still route to the primary ring only - callers should also ensure the
+    /// rebalancer cleans up stale copies on the previous shards.
+    /// </summary>
+    public void EnableMigrationMode(List<IShardTransport> previousShards)
+    {
+        _previousShards = previousShards;
+        _previousRing = new ConsistentHashRing(
+            previousShards.Select(s => s.ShardName).ToList(),
+            _virtualNodesPerShard);
+    }
+
+    public void DisableMigrationMode()
+    {
+        _previousRing = null;
+        _previousShards = null;
     }
 
     /// <summary>
@@ -142,17 +168,32 @@ public sealed class DocumentForgeCluster : IDisposable
         if (policy.Strategy == ShardingStrategy.Replicated)
         {
             // Write to every shard
-            DocumentId id = doc.GetId();
+            DocumentId replicatedId = doc.GetId();
             foreach (var shard in _shards) shard.Insert(collectionName, doc);
-            return id;
+            return replicatedId;
         }
 
         // Hash sharding - pick one shard
         var keyValue = JsonPathExtractor.Extract(doc, policy.ShardKeyPath!);
         if (keyValue.IsNull)
             throw new DocumentForgeException($"Document missing shard key '{policy.ShardKeyPath}' for collection '{collectionName}'.");
+
         int shardIdx = PickShard(keyValue);
-        return _shards[shardIdx].Insert(collectionName, doc);
+        var insertedId = _shards[shardIdx].Insert(collectionName, doc);
+
+        // Migration cleanup: if a previous ring is active and the key maps to a DIFFERENT
+        // shard on the old ring, best-effort delete any stale copy there. This prevents
+        // duplicates surfacing via dual-read fallback.
+        if (_previousRing is not null && _previousShards is not null)
+        {
+            int prevIdx = _previousRing.PickShardIndex(keyValue.ToString() ?? "");
+            var prevShardName = _previousShards[prevIdx].ShardName;
+            if (!string.Equals(prevShardName, _shards[shardIdx].ShardName, StringComparison.OrdinalIgnoreCase))
+            {
+                try { _previousShards[prevIdx].DeleteById(collectionName, doc.GetId()); } catch { /* best effort */ }
+            }
+        }
+        return insertedId;
     }
 
     public DocumentId Insert(string collectionName, string json) =>
@@ -199,11 +240,75 @@ public sealed class DocumentForgeCluster : IDisposable
         if (targetShard.HasValue)
         {
             var r = _shards[targetShard.Value].Execute(sql);
+            // During online migration, if the primary shard misses, fall back to the
+            // previous ring location - the doc may not have been migrated yet.
+            if (r.Documents.Count == 0 && _previousRing is not null && _previousShards is not null && policy.ShardKeyPath is not null)
+            {
+                var keyVal = GetShardKeyFromWhere(policy, stmt.Where);
+                if (keyVal is not null)
+                {
+                    int prevIdx = _previousRing.PickShardIndex(keyVal);
+                    var fallback = _previousShards[prevIdx].Execute(sql);
+                    if (fallback.Documents.Count > 0)
+                        return fallback with { QueryPlan = $"SINGLE_SHARD_FALLBACK({_previousShards[prevIdx].ShardName}) + {fallback.QueryPlan}" };
+                }
+            }
             return r with { QueryPlan = $"SINGLE_SHARD({_shards[targetShard.Value].ShardName}) + {r.QueryPlan}" };
         }
 
-        // Scatter-gather: run on every shard and merge
+        // Scatter-gather: run on every shard and merge. During migration we also query
+        // the previous shards to catch docs not yet migrated.
+        if (_previousShards is not null)
+            return ScatterGatherWithFallback(stmt, sql);
         return ScatterGather(stmt, sql);
+    }
+
+    private string? GetShardKeyFromWhere(CollectionShardingPolicy policy, Expression? where)
+    {
+        if (where is null || policy.ShardKeyPath is null) return null;
+        var found = FindEqualityOnPath(where, policy.ShardKeyPath);
+        return found?.ToString();
+    }
+
+    private QueryResult ScatterGatherWithFallback(SelectStatement stmt, string sql)
+    {
+        // Union scatter across CURRENT and PREVIOUS shards, dedup by _id.
+        // This is the read path during a live migration.
+        var seen = new HashSet<string>();
+        var merged = new List<BsonDocument>();
+
+        void AddFromShards(List<IShardTransport> shards)
+        {
+            foreach (var shard in shards)
+            {
+                var r = shard.Execute(sql);
+                foreach (var doc in r.Documents)
+                {
+                    var id = doc["_id"].ToString();
+                    if (seen.Add(id)) merged.Add(doc);
+                }
+            }
+        }
+
+        AddFromShards(_shards);
+        if (_previousShards is not null) AddFromShards(_previousShards);
+
+        // Apply ORDER BY / LIMIT / OFFSET globally (same logic as ScatterGather)
+        if (stmt.OrderByPath is not null)
+        {
+            merged.Sort((a, b) =>
+            {
+                var va = JsonPathExtractor.Extract(a, stmt.OrderByPath);
+                var vb = JsonPathExtractor.Extract(b, stmt.OrderByPath);
+                var cmp = va.CompareTo(vb);
+                return stmt.OrderDescending ? -cmp : cmp;
+            });
+        }
+        if (stmt.Offset.HasValue) merged = merged.Skip(stmt.Offset.Value).ToList();
+        if (stmt.Limit.HasValue) merged = merged.Take(stmt.Limit.Value).ToList();
+
+        var totalShards = _shards.Count + (_previousShards?.Count ?? 0);
+        return QueryResult.Ok(merged, $"SCATTER_GATHER_DUAL({totalShards} shards, dedup)");
     }
 
     private int? TryRouteByShardKey(CollectionShardingPolicy policy, Expression? where)
