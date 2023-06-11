@@ -98,6 +98,7 @@ samples/
   DocumentForge.Benchmark    250K / 10M document stress test
   DocumentForge.Ctl          `dfctl` management CLI
 
+admin-ui/                    Next.js 15 admin web UI (separate app)
 docs/                        Swiss-style documentation website
 ```
 

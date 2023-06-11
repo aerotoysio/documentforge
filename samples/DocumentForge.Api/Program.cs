@@ -4,7 +4,10 @@ using DocumentForge.Document;
 using DocumentForge.Index;
 
 var builder = WebApplication.CreateBuilder(args);
+builder.Services.AddCors(opts => opts.AddDefaultPolicy(p =>
+    p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
 var app = builder.Build();
+app.UseCors();
 
 // Create/open the database
 var dbPath = Path.Combine(Directory.GetCurrentDirectory(), "api_database.dfdb");
@@ -95,6 +98,35 @@ app.MapGet("/collections/{name}", (string name, int? limit) =>
         collection = name,
         count = docs.Count,
         documents = docs
+    });
+});
+
+// ---- DELETE /collections/{name}/{id} ----
+// Direct delete by DocumentId (used by rebalancer)
+app.MapDelete("/collections/{name}/{id}", (string name, string id) =>
+{
+    var coll = db.GetCollection(name);
+    if (coll is null) return Results.NotFound();
+    var docId = new DocumentForge.Core.DocumentId(Guid.Parse(id));
+    var doc = coll.FindById(docId);
+    if (doc is null) return Results.NotFound();
+    if (coll.Delete(docId)) db.NotifyDocDeleted(name, docId, doc);
+    return Results.Ok(new { success = true });
+});
+
+// ---- GET /indexes/{collection} ----
+app.MapGet("/indexes/{collection}", (string collection) =>
+{
+    var indexes = db.GetIndexes(collection);
+    return Results.Ok(new
+    {
+        collection,
+        indexes = indexes.Select(i => new
+        {
+            name = i.Name,
+            path = i.JsonPath,
+            unique = i.IsUnique
+        })
     });
 });
 
