@@ -16,6 +16,7 @@ var db = DocumentForgeDb.OpenOrCreate(dbPath);
 Console.WriteLine("=============================================================");
 Console.WriteLine("  DocumentForge REST API");
 Console.WriteLine($"  Database: {dbPath}");
+Console.WriteLine($"  Listening on: http://localhost:5000   (change via --urls or ASPNETCORE_URLS)");
 Console.WriteLine("  Endpoints:");
 Console.WriteLine("    POST   /query              - Execute SQL query");
 Console.WriteLine("    GET    /collections         - List collections");
@@ -24,6 +25,10 @@ Console.WriteLine("    GET    /collections/{name}  - Get all docs (with ?limit=N
 Console.WriteLine("    GET    /stats               - Database statistics");
 Console.WriteLine("    POST   /seed                - Seed sample airline data");
 Console.WriteLine("    POST   /index               - Create an index");
+Console.WriteLine("    DELETE /collections/{name}/{id} - Delete by ID");
+Console.WriteLine("    GET    /indexes/{collection} - List indexes");
+Console.WriteLine();
+Console.WriteLine("  Admin UI:  http://localhost:3000  (run: cd admin-ui && npm run dev)");
 Console.WriteLine("=============================================================");
 
 // ---- POST /query ----
