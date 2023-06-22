@@ -1,0 +1,5 @@
+{
+  "nodeName": "shard-a",
+  "port": 5001,
+  "dataDir": "./scripts/sample-cluster/data/shard-a"
+}

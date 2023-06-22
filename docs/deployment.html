@@ -19,6 +19,7 @@
       <a href="query-language.html">Query Language</a>
       <a href="data-modeling.html">Data Modeling</a>
       <a href="replication.html">Replication</a>
+      <a href="sharding.html">Sharding</a>
       <a href="deployment.html" class="active">Deployment</a>
       <a href="performance.html">Performance</a>
     </div>
@@ -72,15 +73,39 @@
     <p>No network, no auth, no config. The file moves with your app. One process holds the write lock; other processes see a <em>FileShare.Read</em> lock and should either open their own file or connect via a network API layer.</p>
 
     <h2 id="api">API tier</h2>
-    <p>When multiple application servers need to share data, run a single API process that owns the database file. Other services talk to it over HTTP (or your protocol of choice).</p>
+    <p>When multiple application servers need to share data, run a <code>DocumentForge.Api</code> process in front of the database. Each node reads a small <code>node.json</code>:</p>
 
-    <pre><span class="hl-com">// One DocumentForge.Api process owns the file</span>
-dotnet run --project samples/DocumentForge.Api --urls "http://0.0.0.0:5000"
+    <pre>{
+  <span class="hl-str">"nodeName"</span>: <span class="hl-str">"prod-1"</span>,
+  <span class="hl-str">"port"</span>: <span class="hl-num">5000</span>,
+  <span class="hl-str">"dataDir"</span>: <span class="hl-str">"/var/lib/documentforge"</span>
+}</pre>
 
-<span class="hl-com">// App servers send queries over HTTP</span>
-POST /query  {"sql": "SELECT * FROM orders WHERE pnr = 'ABC123'"}</pre>
+    <pre>dotnet run --project samples/DocumentForge.Api -- --config node.json
 
-    <p>This is the classic "dedicated DB process" pattern, except the process is just a small .NET API in front of the embedded DB. A single machine with a decent CPU handles tens of thousands of QPS comfortably.</p>
+<span class="hl-com"># or with CLI flags</span>
+dotnet run --project samples/DocumentForge.Api -- \
+    --node-name prod-1 --port 5000 --data-dir /var/lib/documentforge
+
+<span class="hl-com"># or with env vars</span>
+DFDB_NODE_NAME=prod-1 DFDB_PORT=5000 DFDB_DATA_DIR=/var/lib/documentforge \
+    dotnet run --project samples/DocumentForge.Api</pre>
+
+    <p>App servers send queries over HTTP:</p>
+    <pre>POST /query  {"sql": "SELECT * FROM orders WHERE pnr = 'ABC123'"}</pre>
+
+    <p>A single machine with a decent CPU handles tens of thousands of QPS comfortably.</p>
+
+    <h4>Local multi-node dev cluster</h4>
+    <p>To experiment with sharding on one box, the repo ships with launch scripts that start three nodes on ports 5001&ndash;5003 with separate data folders:</p>
+    <pre><span class="hl-com"># Windows</span>
+.\scripts\start-cluster.ps1
+
+<span class="hl-com"># macOS / Linux</span>
+./scripts/start-cluster.sh
+
+<span class="hl-com"># Check health</span>
+dotnet run --project samples/DocumentForge.Ctl -- health scripts/sample-cluster/cluster.json</pre>
 
     <h2 id="leader-follower">Leader + Follower(s)</h2>
     <p>For read scaling and standby capability, run one leader and N followers. Writes go to the leader; reads can go to any node.</p>

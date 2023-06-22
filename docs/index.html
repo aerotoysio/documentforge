@@ -52,15 +52,15 @@
   <div class="container">
     <div class="stats-grid">
       <div class="stat">
-        <div class="num">70K</div>
-        <div class="label">Docs / sec bulk insert</div>
+        <div class="num">10M</div>
+        <div class="label">Documents proven on a laptop</div>
       </div>
       <div class="stat">
         <div class="num">210K</div>
         <div class="label">Point lookups / sec</div>
       </div>
       <div class="stat">
-        <div class="num">32</div>
+        <div class="num">47</div>
         <div class="label">Tests, all green</div>
       </div>
       <div class="stat">
@@ -80,32 +80,32 @@
       <div class="feature">
         <div class="num">01</div>
         <h4>JSON-native, SQL-fluent</h4>
-        <p>Write <code>SELECT * FROM orders WHERE passenger.lastName = 'Smith'</code>. Query nested fields, arrays, and joins with the syntax every developer already knows.</p>
+        <p>Write <code>SELECT * FROM orders WHERE passenger.lastName = 'Smith'</code>. JOINs, GROUP BY, aggregations, composite indexes — the syntax every developer already knows.</p>
       </div>
       <div class="feature">
         <div class="num">02</div>
         <h4>Sub-millisecond lookups</h4>
-        <p>Direct-address location map means every document has a known physical address. 210,000 QPS for indexed point lookups on a single laptop.</p>
+        <p>Direct-address location map means every document has a known physical address. 210,000 QPS for indexed point lookups on a single laptop, even at 10M docs.</p>
       </div>
       <div class="feature">
         <div class="num">03</div>
-        <h4>Persistent B-tree indexes</h4>
-        <p>Indexes survive restart without rebuilding. Composite indexes for multi-field queries. Range queries use the B-tree for logarithmic lookups.</p>
+        <h4>LINQ API for C# devs</h4>
+        <p><code>db.Collection&lt;Order&gt;("orders").Where(o =&gt; o.Pnr == "ABC").FirstOrDefault()</code>. Strongly typed, captured variables work, no SQL strings required.</p>
       </div>
       <div class="feature">
         <div class="num">04</div>
         <h4>Crash safety built in</h4>
-        <p>Write-ahead recovery log with CRC32 per record. On every restart we replay uncommitted writes so you never lose an acknowledged insert.</p>
+        <p>Write-ahead recovery log with CRC32 per record. Per-page checksums detect silent corruption. Crash recovery on every restart.</p>
       </div>
       <div class="feature">
         <div class="num">05</div>
-        <h4>Read-scaling replication</h4>
-        <p>Logical replication with monotonic sequence numbers. Followers maintain their own indexes coherently. Reconnect and catch up automatically.</p>
+        <h4>Replication &amp; auto-failover</h4>
+        <p>Logical replication with sequence numbers and catchup. Follower auto-promotes on leader silence. Planned handover for zero-data-loss datacenter moves.</p>
       </div>
       <div class="feature">
         <div class="num">06</div>
-        <h4>Zero-downtime handover</h4>
-        <p>Move a production database between datacenters without losing an ack'd write. A read-only mode flip plus a sequence-number confirm.</p>
+        <h4>Consistent-hash sharding</h4>
+        <p>Scale horizontally across N nodes. Online rebalance with zero downtime — clients read and write throughout the migration. Add or drop shards safely.</p>
       </div>
     </div>
   </div>
@@ -144,12 +144,36 @@ Console.WriteLine(result.Documents[<span class="hl-num">0</span>].ToJson());
   <div class="container">
     <h2>Built for the realistic middle</h2>
     <div class="narrow">
-      <p>A laptop comfortably holds <strong>10 million documents</strong> with five indexes, sustaining 70,000 inserts per second and well over 100,000 indexed reads per second. Sharding gets you to a billion. Planned handover gets you across oceans without dropping a write.</p>
+      <p>A laptop comfortably holds <strong>10 million documents</strong> with five indexes, sustaining 40,000+ inserts per second and 160,000+ indexed reads per second — <em>verified</em> in the included benchmark. Sharding extends this linearly across commodity nodes. Online rebalance moves data between shards while clients keep reading and writing.</p>
       <p>DocumentForge isn't trying to be the biggest database. It's trying to be the one you reach for when you want JSON flexibility, SQL familiarity, and an operational footprint that fits in your head.</p>
     </div>
 
-    <div class="callout">
-      <strong>Status:</strong> DocumentForge is a learning-focused open-source project demonstrating how a modern document database can be built from the ground up in ~4,500 lines of C#. It runs real workloads, passes a comprehensive test suite, and has the architectural pieces (WAL, replication, indexes, joins, aggregations) you'd expect from a production system. Use it for embedded scenarios, prototypes, and understanding how databases work.
+    <h3 style="margin-top: 48px">Ecosystem</h3>
+    <div class="feature-grid" style="margin-top: 24px">
+      <div class="feature">
+        <div class="num">LIB</div>
+        <h4>DocumentForge NuGet</h4>
+        <p>Add to any .NET 9 project. Open a file, start querying. No external dependencies.</p>
+      </div>
+      <div class="feature">
+        <div class="num">API</div>
+        <h4>REST server</h4>
+        <p>Stand up a node per shard with one command. JSON-in/JSON-out. Each node reads a small <code>node.json</code> config.</p>
+      </div>
+      <div class="feature">
+        <div class="num">CLI</div>
+        <h4>dfctl</h4>
+        <p>Inspect a file, run queries, edit cluster configs, check health, plan and execute rebalances from the terminal.</p>
+      </div>
+      <div class="feature">
+        <div class="num">UI</div>
+        <h4>Admin web UI</h4>
+        <p>Separate Next.js app. Dashboard, query console, collections browser, cluster topology builder — no command line required.</p>
+      </div>
+    </div>
+
+    <div class="callout" style="margin-top: 48px">
+      <strong>Status:</strong> DocumentForge is a learning-focused open-source project demonstrating how a modern document database can be built from the ground up in ~6,000 lines of C#. 47 tests, a NuGet package, a Next.js admin UI, a CLI, and seven doc pages. Use it for embedded scenarios, prototypes, small-to-medium production workloads, and understanding how databases actually work.
     </div>
   </div>
 </section>

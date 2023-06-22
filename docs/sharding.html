@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Sharding — DocumentForge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="index.html" class="brand"><span class="brand-dot"></span>DocumentForge</a>
+    <div class="nav-links">
+      <a href="getting-started.html">Getting Started</a>
+      <a href="query-language.html">Query Language</a>
+      <a href="data-modeling.html">Data Modeling</a>
+      <a href="replication.html">Replication</a>
+      <a href="sharding.html" class="active">Sharding</a>
+      <a href="deployment.html">Deployment</a>
+      <a href="performance.html">Performance</a>
+    </div>
+  </div>
+</nav>
+
+<section class="page-title">
+  <div class="container">
+    <div class="eyebrow">Chapter 07</div>
+    <h1>Sharding</h1>
+    <p>Scale horizontally across N nodes. Consistent hashing. Online rebalance with zero downtime.</p>
+  </div>
+</section>
+
+<div class="doc-layout">
+  <aside class="toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#when">When to shard</a></li>
+      <li><a href="#cluster">DocumentForgeCluster</a></li>
+      <li><a href="#policies">Per-collection policies</a></li>
+      <li><a href="#routing">Routing rules</a></li>
+      <li><a href="#consistent">Consistent hashing</a></li>
+      <li><a href="#config">Cluster config file</a></li>
+      <li><a href="#local">Running locally</a></li>
+      <li><a href="#scale-up">Scale up (add shards)</a></li>
+      <li><a href="#scale-down">Scale down (drop shards)</a></li>
+      <li><a href="#online">Online rebalance</a></li>
+    </ul>
+  </aside>
+
+  <article>
+    <h2 id="when">When to shard</h2>
+    <table>
+      <thead><tr><th>Scale</th><th>Recommendation</th></tr></thead>
+      <tbody>
+        <tr><td>&lt; 10M docs</td><td>Single file. Add a follower for HA. Done.</td></tr>
+        <tr><td>10M&nbsp;&ndash;&nbsp;100M docs</td><td>Single file, 2&ndash;3 followers for read scale.</td></tr>
+        <tr><td>100M&nbsp;&ndash;&nbsp;1B docs</td><td>Shard. Each shard holds 50&ndash;100M on commodity hardware.</td></tr>
+        <tr><td>&gt; 1B docs</td><td>Shard with care. Pick your partition key thoughtfully; it's expensive to change.</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="cluster">DocumentForgeCluster</h2>
+    <p>The router is a thin C# class that sits in front of N shards. Each shard is a full <code>DocumentForgeDb</code> accessed through an <code>IShardTransport</code> (in-process for tests, HTTP for real deployments).</p>
+
+    <pre><span class="hl-kw">using</span> DocumentForge.Engine.Cluster;
+
+<span class="hl-kw">using var</span> cluster = <span class="hl-kw">new</span> DocumentForgeCluster()
+    .AddShard(<span class="hl-kw">new</span> HttpShardTransport(<span class="hl-str">"dubai"</span>,     <span class="hl-str">"http://dubai.internal:5000"</span>))
+    .AddShard(<span class="hl-kw">new</span> HttpShardTransport(<span class="hl-str">"singapore"</span>, <span class="hl-str">"http://sg.internal:5000"</span>))
+    .AddShard(<span class="hl-kw">new</span> HttpShardTransport(<span class="hl-str">"london"</span>,    <span class="hl-str">"http://ldn.internal:5000"</span>))
+    <span class="hl-com">// per-collection policy</span>
+    .ShardCollection(<span class="hl-str">"orders"</span>,  shardKeyPath: <span class="hl-str">"pnr"</span>)
+    .ShardCollection(<span class="hl-str">"flights"</span>, shardKeyPath: <span class="hl-str">"flightNumber"</span>)
+    .ReplicateCollection(<span class="hl-str">"airports"</span>)
+    .ReplicateCollection(<span class="hl-str">"aircraft"</span>);</pre>
+
+    <h2 id="policies">Per-collection policies</h2>
+    <p>Two strategies, one per collection:</p>
+
+    <h4>Hash (sharded)</h4>
+    <p>Each document lives on exactly one shard, chosen by hashing the <em>shard key</em> path. Good for <strong>large</strong> collections where most queries have the key in <code>WHERE</code>.</p>
+    <pre>.ShardCollection(<span class="hl-str">"orders"</span>, shardKeyPath: <span class="hl-str">"pnr"</span>)</pre>
+
+    <h4>Replicated</h4>
+    <p>Every shard holds a full copy. Good for <strong>small</strong> reference data so <code>JOIN</code>s stay local (no cross-shard lookup).</p>
+    <pre>.ReplicateCollection(<span class="hl-str">"airports"</span>)</pre>
+
+    <h2 id="routing">Routing rules</h2>
+
+    <table>
+      <thead><tr><th>Query pattern</th><th>How it's routed</th></tr></thead>
+      <tbody>
+        <tr><td><code>WHERE shardKey = 'X'</code></td><td>Straight to one shard — fast path</td></tr>
+        <tr><td><code>WHERE otherField = ...</code></td><td>Scatter to every shard, merge results</td></tr>
+        <tr><td><code>SELECT COUNT(*)</code></td><td>Scatter; cluster sums the per-shard counts</td></tr>
+        <tr><td><code>SELECT SUM / MIN / MAX / AVG</code></td><td>Scatter; cluster merges across shards</td></tr>
+        <tr><td><code>GROUP BY</code></td><td>Scatter with group-by; cluster merges buckets across shards</td></tr>
+        <tr><td><code>INSERT</code></td><td>Hash the shard key, send to one shard (or all if replicated)</td></tr>
+        <tr><td><code>JOIN</code> with replicated table</td><td>Stays local on each shard — no cross-shard fetch</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="consistent">Consistent hashing</h2>
+    <p>Under the hood, shard selection uses a consistent hash ring (Ketama-style):</p>
+
+    <ol>
+      <li>Each shard gets <strong>150 virtual nodes</strong> placed at deterministic positions on a 2<sup>32</sup> ring</li>
+      <li>A key is hashed (FNV-1a 32-bit) to a ring position</li>
+      <li>Walk clockwise to the next vnode — that's the owning shard</li>
+    </ol>
+
+    <div class="callout">
+      <strong>Why not just <code>hash(key) % N</code>?</strong> Because going from 3 shards to 4 would move ~75% of your keys. Consistent hashing moves only ~25% (the keys near the new shard's ring positions).
+    </div>
+
+    <h2 id="config">Cluster config file</h2>
+    <p>Every node should read the <strong>same</strong> <code>cluster.json</code>. This is how they all agree on which document belongs where.</p>
+
+    <pre>{
+  <span class="hl-str">"Version"</span>: <span class="hl-num">1</span>,
+  <span class="hl-str">"VirtualNodesPerShard"</span>: <span class="hl-num">150</span>,
+  <span class="hl-str">"Shards"</span>: [
+    { <span class="hl-str">"Name"</span>: <span class="hl-str">"shard-a"</span>, <span class="hl-str">"Endpoint"</span>: <span class="hl-str">"http://host-a:5000"</span> },
+    { <span class="hl-str">"Name"</span>: <span class="hl-str">"shard-b"</span>, <span class="hl-str">"Endpoint"</span>: <span class="hl-str">"http://host-b:5000"</span> },
+    { <span class="hl-str">"Name"</span>: <span class="hl-str">"shard-c"</span>, <span class="hl-str">"Endpoint"</span>: <span class="hl-str">"http://host-c:5000"</span> }
+  ],
+  <span class="hl-str">"Collections"</span>: {
+    <span class="hl-str">"orders"</span>:   { <span class="hl-str">"Strategy"</span>: <span class="hl-str">"Hash"</span>, <span class="hl-str">"ShardKeyPath"</span>: <span class="hl-str">"pnr"</span> },
+    <span class="hl-str">"flights"</span>:  { <span class="hl-str">"Strategy"</span>: <span class="hl-str">"Hash"</span>, <span class="hl-str">"ShardKeyPath"</span>: <span class="hl-str">"flightNumber"</span> },
+    <span class="hl-str">"airports"</span>: { <span class="hl-str">"Strategy"</span>: <span class="hl-str">"Replicated"</span> }
+  }
+}</pre>
+
+    <p>Load it and build a cluster:</p>
+
+    <pre><span class="hl-kw">var</span> config = ClusterConfig.Load(<span class="hl-str">"cluster.json"</span>);
+<span class="hl-kw">using var</span> cluster = DocumentForgeCluster.FromConfig(config,
+    desc =&gt; <span class="hl-kw">new</span> HttpShardTransport(desc.Name, desc.Endpoint));</pre>
+
+    <h2 id="local">Running locally (multi-node dev)</h2>
+    <p>The repo ships with scripts to run a 3-node cluster on <code>localhost</code> — perfect for development and for understanding the system.</p>
+
+    <pre><span class="hl-com"># PowerShell</span>
+.\scripts\start-cluster.ps1
+
+<span class="hl-com"># bash</span>
+./scripts/start-cluster.sh</pre>
+
+    <p>This launches three <code>DocumentForge.Api</code> processes:</p>
+
+    <table>
+      <thead><tr><th>Node</th><th>URL</th><th>Data folder</th></tr></thead>
+      <tbody>
+        <tr><td>shard-a</td><td>http://localhost:5001</td><td>scripts/sample-cluster/data/shard-a</td></tr>
+        <tr><td>shard-b</td><td>http://localhost:5002</td><td>scripts/sample-cluster/data/shard-b</td></tr>
+        <tr><td>shard-c</td><td>http://localhost:5003</td><td>scripts/sample-cluster/data/shard-c</td></tr>
+      </tbody>
+    </table>
+
+    <p>Each node reads its own <code>node-X.json</code>:</p>
+
+    <pre>{
+  <span class="hl-str">"nodeName"</span>: <span class="hl-str">"shard-a"</span>,
+  <span class="hl-str">"port"</span>: <span class="hl-num">5001</span>,
+  <span class="hl-str">"dataDir"</span>: <span class="hl-str">"./scripts/sample-cluster/data/shard-a"</span>
+}</pre>
+
+    <p>Check them all are alive:</p>
+
+    <pre>dotnet run --project samples/DocumentForge.Ctl -- health scripts/sample-cluster/cluster.json</pre>
+
+    <h2 id="scale-up">Scale up (add shards)</h2>
+    <p>Adding shards has two parts — update the config, then rebalance the data so keys that hash to new shards actually live there.</p>
+
+    <pre><span class="hl-com"># 1. Edit cluster.json to add more shards (or use dfctl):</span>
+dotnet run --project samples/DocumentForge.Ctl -- \
+    cluster add-shard new-cluster.json shard-d http://host-d:5000
+dotnet run --project samples/DocumentForge.Ctl -- \
+    cluster add-shard new-cluster.json shard-e http://host-e:5000
+
+<span class="hl-com"># 2. Preview what moves (no data change yet):</span>
+dotnet run --project samples/DocumentForge.Ctl -- \
+    rebalance cluster.json new-cluster.json --plan-only
+
+<span class="hl-com"># 3. Execute (prompts for confirmation):</span>
+dotnet run --project samples/DocumentForge.Ctl -- \
+    rebalance cluster.json new-cluster.json</pre>
+
+    <p>With consistent hashing, going from 3 to 5 shards moves only ~40% of keys — not all of them.</p>
+
+    <h2 id="scale-down">Scale down (drop a shard)</h2>
+    <p>Same command, just omit the shard you want to drop from the new config. Its data redistributes to the surviving shards. After the rebalance completes, the dropped node ends up empty and you can decommission it.</p>
+
+    <pre><span class="hl-com"># Build new config without shard-c, then run:</span>
+dotnet run --project samples/DocumentForge.Ctl -- \
+    rebalance cluster-with-c.json cluster-without-c.json</pre>
+
+    <h2 id="online">Online rebalance (zero downtime)</h2>
+    <p>The commands above run an <em>offline</em> rebalance — you need a maintenance window. For production traffic that can't pause, use the online rebalance API from your C# bootstrap code:</p>
+
+    <pre><span class="hl-kw">using</span> DocumentForge.Engine.Cluster;
+
+<span class="hl-com">// 1. Build the NEW cluster with the new topology</span>
+<span class="hl-kw">var</span> newConfig = ClusterConfig.Load(<span class="hl-str">"cluster-new.json"</span>);
+<span class="hl-kw">using var</span> cluster = DocumentForgeCluster.FromConfig(newConfig, MakeTransport);
+
+<span class="hl-com">// 2. Open connections to the OLD shards (for reads during migration)</span>
+<span class="hl-kw">var</span> oldConfig = ClusterConfig.Load(<span class="hl-str">"cluster-old.json"</span>);
+<span class="hl-kw">var</span> previousShards = oldConfig.Shards.Select(MakeTransport).ToList();
+
+<span class="hl-com">// 3. Run the online rebalance - clients keep reading and writing</span>
+<span class="hl-kw">var</span> report = <span class="hl-kw">await</span> ClusterRebalancer.RunOnlineAsync(
+    cluster, oldConfig, newConfig, previousShards,
+    onProgress: p =&gt; Console.WriteLine(<span class="hl-kw">$"</span>{p.CollectionName}: moved {p.DocsMoved}"));
+
+<span class="hl-com">// 4. When done, drop the previous ring</span>
+ClusterRebalancer.CompleteOnlineRebalance(cluster, previousShards);</pre>
+
+    <h4>What happens during the migration</h4>
+    <ul>
+      <li><strong>Writes</strong> go to the new ring. The cluster also issues a best-effort delete on the previous ring location to clean stale copies.</li>
+      <li><strong>Reads by shard key</strong> try the new ring first; on miss, fall back to the previous ring (the doc may not have migrated yet).</li>
+      <li><strong>Scatter reads</strong> query both rings and dedup by <code>_id</code> so no document appears twice even mid-move.</li>
+      <li><strong>The rebalancer</strong> copies data from old to new in the background. Idempotent — if a client already wrote a newer version at the destination, the rebalancer leaves it alone.</li>
+    </ul>
+
+    <div class="callout">
+      <strong>Verified:</strong> the test suite includes <code>Cluster_OnlineRebalance_ZeroDataLossWithConcurrentWrites</code> — 200 initial docs on 2 shards, 50 concurrent writes during the rebalance to 4 shards. Every doc still findable via single-shard queries after completion. No losses, no duplicates.
+    </div>
+  </article>
+</div>
+
+<footer>
+  <div class="container">
+    <p><strong>DocumentForge</strong> — built with care, zero dependencies.</p>
+    <p class="meta">MIT License · Open Source · Version 0.1.0</p>
+  </div>
+</footer>
+
+</body>
+</html>
