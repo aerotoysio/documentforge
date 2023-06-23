@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Security — DocumentForge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="index.html" class="brand"><span class="brand-dot"></span>DocumentForge</a>
+    <div class="nav-links">
+      <a href="getting-started.html">Getting Started</a>
+      <a href="query-language.html">Query Language</a>
+      <a href="data-modeling.html">Data Modeling</a>
+      <a href="replication.html">Replication</a>
+      <a href="sharding.html">Sharding</a>
+      <a href="deployment.html">Deployment</a>
+      <a href="security.html" class="active">Security</a>
+      <a href="performance.html">Performance</a>
+    </div>
+  </div>
+</nav>
+
+<section class="page-title">
+  <div class="container">
+    <div class="eyebrow">Chapter 08</div>
+    <h1>Security</h1>
+    <p>Three optional knobs. Off for dev. On for production. No identity platform reinventing.</p>
+  </div>
+</section>
+
+<div class="doc-layout">
+  <aside class="toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#philosophy">Philosophy</a></li>
+      <li><a href="#threats">Threat model</a></li>
+      <li><a href="#knob1">API key</a></li>
+      <li><a href="#knob2">Replication secret</a></li>
+      <li><a href="#knob3">TLS</a></li>
+      <li><a href="#network">Network hygiene</a></li>
+      <li><a href="#atrest">Data at rest</a></li>
+      <li><a href="#checklist">Prod checklist</a></li>
+      <li><a href="#notbuilt">What we don't build</a></li>
+    </ul>
+  </aside>
+
+  <article>
+    <h2 id="philosophy">Philosophy</h2>
+    <p>DocumentForge is a database, not an identity platform. We provide three simple knobs that cover the common cases &mdash; bearer-token auth on the REST API, a shared secret for replication handshakes, and TLS for encrypted transport. Everything else (user accounts, RBAC, OAuth, OIDC) is better handled by an API gateway in front of DocumentForge.</p>
+    <p>By default everything is off. This keeps the dev loop friction-free. Turn knobs on individually as you go to production.</p>
+
+    <h2 id="threats">Threat model</h2>
+    <table>
+      <thead><tr><th>Surface</th><th>Default</th><th>With all knobs on</th></tr></thead>
+      <tbody>
+        <tr><td>REST API</td><td>Open (localhost only by default)</td><td>Bearer-token auth, TLS</td></tr>
+        <tr><td>Replication protocol</td><td>No handshake secret</td><td>Shared secret required</td></tr>
+        <tr><td>Cluster inter-shard (HTTP)</td><td>Plain HTTP</td><td>TLS + bearer token</td></tr>
+        <tr><td>Data file on disk</td><td>OS file permissions</td><td>OS file permissions + disk encryption (your job)</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="knob1">Knob 1 — API key (bearer token)</h2>
+    <p>If set, every HTTP request must include:</p>
+    <pre>Authorization: Bearer &lt;your-api-key&gt;</pre>
+
+    <h4>Configure a node</h4>
+    <pre>{
+  <span class="hl-str">"nodeName"</span>: <span class="hl-str">"shard-a"</span>,
+  <span class="hl-str">"port"</span>: <span class="hl-num">5001</span>,
+  <span class="hl-str">"dataDir"</span>: <span class="hl-str">"./data/shard-a"</span>,
+  <span class="hl-str">"security"</span>: {
+    <span class="hl-str">"apiKey"</span>: <span class="hl-str">"sk_prod_abc123xyz"</span>
+  }
+}</pre>
+
+    <p>Or via CLI / env:</p>
+    <pre>dotnet run --project samples/DocumentForge.Api -- \
+    --node-name shard-a --port 5001 \
+    --api-key sk_prod_abc123xyz
+
+<span class="hl-com"># or</span>
+DFDB_API_KEY=sk_prod_abc123xyz dotnet run --project samples/DocumentForge.Api</pre>
+
+    <h4>From the admin UI</h4>
+    <p>Go to Settings, paste the key. It's stored in <code>localStorage</code> and attached to every fetch. Works offline across page loads.</p>
+
+    <h4>From your application</h4>
+    <pre><span class="hl-kw">using var</span> cluster = DocumentForgeCluster.FromConfig(config,
+    desc =&gt; <span class="hl-kw">new</span> HttpShardTransport(desc.Name, desc.LeaderEndpoint,
+                                   apiKey: <span class="hl-str">"sk_prod_abc123xyz"</span>));</pre>
+
+    <p>The constant-time compare ensures timing attacks don't leak partial-match information.</p>
+
+    <h2 id="knob2">Knob 2 — Replication secret</h2>
+    <p>Before a follower starts receiving streamed operations from a leader, it presents a shared secret. Mismatch = connection dropped. Prevents attackers on your network from pretending to be followers (siphoning every write) or leaders (injecting fake writes).</p>
+
+    <pre>{
+  <span class="hl-str">"security"</span>: {
+    <span class="hl-str">"replicationSecret"</span>: <span class="hl-str">"rp_xyz789abc"</span>
+  }
+}</pre>
+
+    <p>The leader and every follower must agree on the same secret. In C# code:</p>
+    <pre>leader.StartLogicalReplicationServer(port: <span class="hl-num">5500</span>,
+    sharedSecret: <span class="hl-str">"rp_xyz789abc"</span>);
+
+follower.StartLogicalReplicationFollower(<span class="hl-str">"leader-host"</span>, <span class="hl-num">5500</span>,
+    sharedSecret: <span class="hl-str">"rp_xyz789abc"</span>);</pre>
+
+    <h2 id="knob3">Knob 3 — TLS</h2>
+    <p>ASP.NET Kestrel handles this; point at a PFX cert file.</p>
+    <pre>{
+  <span class="hl-str">"security"</span>: {
+    <span class="hl-str">"tls"</span>: {
+      <span class="hl-str">"certPath"</span>: <span class="hl-str">"./certs/node.pfx"</span>,
+      <span class="hl-str">"certPassword"</span>: <span class="hl-str">"env:TLS_PASSWORD"</span>
+    }
+  }
+}</pre>
+
+    <p>When <code>certPassword</code> starts with <code>env:</code>, the value is read from that environment variable at startup &mdash; keeps secrets out of config files.</p>
+
+    <p>The URL scheme flips to <code>https://</code>. Point clients (including the admin UI) at the HTTPS URL.</p>
+
+    <h2 id="network">Network hygiene</h2>
+    <ul>
+      <li>By default, the API binds to <strong>localhost only</strong>. Add <code>"bindAllInterfaces": true</code> (or <code>--bind-all</code>) to open it to other hosts.</li>
+      <li>Only open the replication port to other nodes in your cluster &mdash; never to the public internet.</li>
+      <li>Run nodes inside a VPN, service mesh, or a private network whenever possible. Defense in depth.</li>
+    </ul>
+
+    <h2 id="atrest">Data at rest</h2>
+    <p>DocumentForge does <strong>not</strong> encrypt data files. This is intentional &mdash; OS-level disk encryption is available, well-audited, and better than anything we'd ship.</p>
+    <ul>
+      <li><strong>Windows:</strong> BitLocker on the volume holding your <code>.dfdb</code> files</li>
+      <li><strong>Linux:</strong> LUKS or dm-crypt</li>
+      <li><strong>macOS:</strong> FileVault</li>
+      <li><strong>Cloud:</strong> AWS EBS encryption, GCP persistent disk encryption, Azure Disk encryption &mdash; all transparent</li>
+    </ul>
+
+    <h2 id="checklist">Production checklist</h2>
+    <ul>
+      <li>✓ API key set on every node</li>
+      <li>✓ Replication secret set on every node participating in replication</li>
+      <li>✓ TLS enabled on every node (or traffic stays strictly internal)</li>
+      <li>✓ Firewall: only expose replication port to other cluster members</li>
+      <li>✓ API port exposed only to approved clients (app servers, admin UI)</li>
+      <li>✓ OS-level disk encryption enabled on data volumes</li>
+      <li>✓ Backup mechanism does not copy unencrypted files off the encrypted volume</li>
+      <li>✓ Secrets (API key, replication secret, TLS password) stored in a secret manager, not in the config file</li>
+      <li>✓ Rotate the API key and replication secret on a schedule</li>
+    </ul>
+
+    <h2 id="notbuilt">What we don't build (and where to go)</h2>
+    <table>
+      <thead><tr><th>Need</th><th>Where to get it</th></tr></thead>
+      <tbody>
+        <tr><td>User accounts / RBAC</td><td>Auth0, Keycloak, AWS Cognito in front of the API</td></tr>
+        <tr><td>OAuth / OIDC / SAML</td><td>Same &mdash; an API gateway terminates and forwards</td></tr>
+        <tr><td>Field-level encryption</td><td>Application layer (encrypt before insert)</td></tr>
+        <tr><td>Key rotation automation</td><td>HashiCorp Vault, AWS Secrets Manager, Azure Key Vault</td></tr>
+        <tr><td>Data-at-rest encryption</td><td>OS disk encryption (above)</td></tr>
+        <tr><td>Audit logging to SIEM</td><td>Tap the REST API proxy / gateway you deploy in front</td></tr>
+        <tr><td>Rate limiting / quotas</td><td>API gateway (Kong, Tyk, Envoy)</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <strong>Tested:</strong> the test suite includes <code>Replication_SharedSecretEnforced</code> &mdash; a follower with the right secret connects successfully and receives ops; a follower with the wrong secret is rejected and sees zero ops. Invariant: an attacker can't siphon writes or inject fake ones without the secret.
+    </div>
+  </article>
+</div>
+
+<footer>
+  <div class="container">
+    <p><strong>DocumentForge</strong> — built with care, zero dependencies.</p>
+    <p class="meta">MIT License · Open Source · Version 0.1.0</p>
+  </div>
+</footer>
+
+</body>
+</html>

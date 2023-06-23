@@ -112,6 +112,7 @@ public sealed class LogicalReplicationServer : IDisposable
     private readonly List<TcpClient> _followers = new();
     private readonly object _lock = new();
     private readonly CancellationTokenSource _cts = new();
+    private readonly string? _secret;
     private Task? _acceptTask;
     private Task? _heartbeatTask;
     private bool _disposed;
@@ -125,11 +126,12 @@ public sealed class LogicalReplicationServer : IDisposable
     public int FollowerCount { get { lock (_lock) return _followers.Count; } }
     public ulong CurrentSeq => (ulong)Interlocked.Read(ref _nextSeq) - 1;
 
-    public LogicalReplicationServer(int port, int opLogCapacity = 10_000)
+    public LogicalReplicationServer(int port, int opLogCapacity = 10_000, string? secret = null)
     {
         Port = port;
         OpLog = new OpLogBuffer(opLogCapacity);
         _listener = new TcpListener(IPAddress.Any, port);
+        _secret = secret;
     }
 
     public void Start()
@@ -216,6 +218,24 @@ public sealed class LogicalReplicationServer : IDisposable
             }
             var followerLastSeq = BitConverter.ToUInt64(handshake, 5);
 
+            // Optional shared-secret check
+            if (_secret is not null)
+            {
+                var lenBuf = new byte[2];
+                if (!await ReadExactBytes(stream, lenBuf, _cts.Token)) { client.Close(); return; }
+                var secretLen = BitConverter.ToUInt16(lenBuf);
+                if (secretLen is 0 or > 256) { Console.WriteLine("[LogicalRep] Invalid secret length"); client.Close(); return; }
+                var secretBuf = new byte[secretLen];
+                if (!await ReadExactBytes(stream, secretBuf, _cts.Token)) { client.Close(); return; }
+                var presented = System.Text.Encoding.UTF8.GetString(secretBuf);
+                if (!ConstantTimeEquals(presented, _secret))
+                {
+                    Console.WriteLine($"[LogicalRep] SECURITY: follower presented invalid replication secret. Dropping.");
+                    client.Close();
+                    return;
+                }
+            }
+
             // Figure out what we need to catchup
             var catchupOps = OpLog.GetOpsAfter(followerLastSeq);
             if (catchupOps is null)
@@ -258,6 +278,26 @@ public sealed class LogicalReplicationServer : IDisposable
             var op = new LogicalOp(CurrentSeq, LogicalOpType.Heartbeat, "", Array.Empty<byte>());
             BroadcastTo(null, op);
         }
+    }
+
+    private static async Task<bool> ReadExactBytes(System.Net.Sockets.NetworkStream stream, byte[] buffer, CancellationToken ct)
+    {
+        int total = 0;
+        while (total < buffer.Length)
+        {
+            int n = await stream.ReadAsync(buffer.AsMemory(total), ct);
+            if (n == 0) return false;
+            total += n;
+        }
+        return true;
+    }
+
+    private static bool ConstantTimeEquals(string a, string b)
+    {
+        if (a.Length != b.Length) return false;
+        int diff = 0;
+        for (int i = 0; i < a.Length; i++) diff |= a[i] ^ b[i];
+        return diff == 0;
     }
 
     private static byte[] BuildRecord(LogicalOp op)
@@ -303,6 +343,7 @@ public sealed class LogicalReplicationFollower : IDisposable
     private readonly int _port;
     private readonly string _seqFilePath;
     private readonly Action<LogicalOp> _apply;
+    private readonly string? _secret;
     private TcpClient? _client;
     private Task? _streamTask;
     private readonly CancellationTokenSource _cts = new();
@@ -317,12 +358,13 @@ public sealed class LogicalReplicationFollower : IDisposable
     public long GapsDetected => Interlocked.Read(ref _gapsDetected);
     public DateTimeOffset LastMessageAt { get { lock (this) return _lastMessageAt; } }
 
-    public LogicalReplicationFollower(string host, int port, string seqFilePath, Action<LogicalOp> apply)
+    public LogicalReplicationFollower(string host, int port, string seqFilePath, Action<LogicalOp> apply, string? secret = null)
     {
         _host = host;
         _port = port;
         _seqFilePath = seqFilePath;
         _apply = apply;
+        _secret = secret;
         _lastAppliedSeq = LoadSeq();
     }
 
@@ -363,6 +405,17 @@ public sealed class LogicalReplicationFollower : IDisposable
             handshake[4] = (byte)LogicalOpType.Handshake;
             BitConverter.TryWriteBytes(handshake.AsSpan(5), _lastAppliedSeq);
             await stream.WriteAsync(handshake, _cts.Token);
+
+            // If a shared secret is configured, send it immediately after the handshake.
+            // Format: [Len:2 u16][UTF-8 bytes]
+            if (_secret is not null)
+            {
+                var secretBytes = System.Text.Encoding.UTF8.GetBytes(_secret);
+                var prefix = new byte[2];
+                BitConverter.TryWriteBytes(prefix, (ushort)secretBytes.Length);
+                await stream.WriteAsync(prefix, _cts.Token);
+                await stream.WriteAsync(secretBytes, _cts.Token);
+            }
 
             while (!_cts.IsCancellationRequested)
             {

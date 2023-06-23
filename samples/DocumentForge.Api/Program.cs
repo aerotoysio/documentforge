@@ -12,11 +12,62 @@ using DocumentForge.Index;
 var config = NodeConfig.Load(args);
 
 var builder = WebApplication.CreateBuilder(args);
-builder.WebHost.UseUrls($"http://localhost:{config.Port}");
+
+// --- Bind URL (HTTP or HTTPS) ---
+var scheme = config.Security?.Tls is not null ? "https" : "http";
+var host = config.BindAllInterfaces ? "0.0.0.0" : "localhost";
+var bindUrl = $"{scheme}://{host}:{config.Port}";
+builder.WebHost.UseUrls(bindUrl);
+
+// --- TLS ---
+if (config.Security?.Tls is { } tls)
+{
+    builder.WebHost.ConfigureKestrel(k =>
+    {
+        k.ConfigureHttpsDefaults(https =>
+        {
+            var pwd = tls.ResolveCertPassword();
+            https.ServerCertificate = pwd is null
+                ? new System.Security.Cryptography.X509Certificates.X509Certificate2(tls.CertPath)
+                : new System.Security.Cryptography.X509Certificates.X509Certificate2(tls.CertPath, pwd);
+        });
+    });
+}
+
 builder.Services.AddCors(opts => opts.AddDefaultPolicy(p =>
     p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
 var app = builder.Build();
 app.UseCors();
+
+// --- Bearer token auth (optional) ---
+if (!string.IsNullOrEmpty(config.Security?.ApiKey))
+{
+    var expected = config.Security.ApiKey;
+    app.Use(async (ctx, next) =>
+    {
+        // Allow CORS preflight without auth
+        if (ctx.Request.Method == "OPTIONS") { await next(); return; }
+
+        var header = ctx.Request.Headers["Authorization"].ToString();
+        if (!header.StartsWith("Bearer ", StringComparison.Ordinal) ||
+            !ConstantTimeEquals(header.Substring(7), expected))
+        {
+            ctx.Response.StatusCode = 401;
+            await ctx.Response.WriteAsJsonAsync(new { error = "Unauthorized. Provide Authorization: Bearer <apiKey>." });
+            return;
+        }
+        await next();
+    });
+}
+
+// Constant-time compare so we don't leak length / match-prefix info via timing
+static bool ConstantTimeEquals(string a, string b)
+{
+    if (a.Length != b.Length) return false;
+    int diff = 0;
+    for (int i = 0; i < a.Length; i++) diff |= a[i] ^ b[i];
+    return diff == 0;
+}
 
 Directory.CreateDirectory(config.DataDir);
 var dbPath = Path.Combine(config.DataDir, "data.dfdb");
@@ -25,7 +76,10 @@ var db = DocumentForgeDb.OpenOrCreate(dbPath);
 Console.WriteLine("=============================================================");
 Console.WriteLine($"  DocumentForge node: {config.NodeName}");
 Console.WriteLine($"  Data dir:  {Path.GetFullPath(config.DataDir)}");
-Console.WriteLine($"  Listening: http://localhost:{config.Port}");
+Console.WriteLine($"  Listening: {bindUrl}");
+Console.WriteLine($"  Security:  API key {(string.IsNullOrEmpty(config.Security?.ApiKey) ? "DISABLED (dev mode)" : "ENABLED")}" +
+                  $"  |  TLS {(config.Security?.Tls is null ? "OFF" : "ON")}" +
+                  $"  |  Replication secret {(string.IsNullOrEmpty(config.Security?.ReplicationSecret) ? "OFF" : "ON")}");
 Console.WriteLine("  Endpoints:");
 Console.WriteLine("    POST   /query              - Execute SQL query");
 Console.WriteLine("    POST   /seed               - Seed sample airline data");
@@ -257,6 +311,9 @@ sealed class NodeConfig
     public string NodeName { get; set; } = "node-1";
     public int Port { get; set; } = 5000;
     public string DataDir { get; set; } = Path.Combine(Directory.GetCurrentDirectory(), "data");
+    /// <summary>If true, bind to 0.0.0.0 (all interfaces). Default: localhost only — safer.</summary>
+    public bool BindAllInterfaces { get; set; } = false;
+    public SecurityConfig? Security { get; set; }
 
     public static NodeConfig Load(string[] args)
     {
@@ -280,17 +337,65 @@ sealed class NodeConfig
                 case "--node-name": c.NodeName = args[i + 1]; break;
                 case "--port":      c.Port = int.Parse(args[i + 1]); break;
                 case "--data-dir":  c.DataDir = args[i + 1]; break;
+                case "--api-key":
+                    c.Security ??= new SecurityConfig();
+                    c.Security.ApiKey = args[i + 1];
+                    break;
+                case "--replication-secret":
+                    c.Security ??= new SecurityConfig();
+                    c.Security.ReplicationSecret = args[i + 1];
+                    break;
+                case "--bind-all": c.BindAllInterfaces = true; break;
             }
         }
 
-        // 3. Env vars (applied only if nothing above set them)
+        // 3. Env vars
         var envName = Environment.GetEnvironmentVariable("DFDB_NODE_NAME");
         var envPort = Environment.GetEnvironmentVariable("DFDB_PORT");
         var envDir  = Environment.GetEnvironmentVariable("DFDB_DATA_DIR");
+        var envKey  = Environment.GetEnvironmentVariable("DFDB_API_KEY");
+        var envRep  = Environment.GetEnvironmentVariable("DFDB_REPLICATION_SECRET");
         if (c.NodeName == "node-1" && !string.IsNullOrEmpty(envName)) c.NodeName = envName;
         if (c.Port == 5000 && int.TryParse(envPort, out var p)) c.Port = p;
         if (c.DataDir.EndsWith("data") && !string.IsNullOrEmpty(envDir)) c.DataDir = envDir;
+        if (!string.IsNullOrEmpty(envKey))
+        {
+            c.Security ??= new SecurityConfig();
+            c.Security.ApiKey ??= envKey;
+        }
+        if (!string.IsNullOrEmpty(envRep))
+        {
+            c.Security ??= new SecurityConfig();
+            c.Security.ReplicationSecret ??= envRep;
+        }
 
         return c;
+    }
+}
+
+sealed class SecurityConfig
+{
+    /// <summary>If set, every REST request must send Authorization: Bearer &lt;apiKey&gt;.</summary>
+    public string? ApiKey { get; set; }
+
+    /// <summary>If set, replication connections must present this secret in their handshake.</summary>
+    public string? ReplicationSecret { get; set; }
+
+    /// <summary>If set, serve HTTPS instead of HTTP using the given PFX cert.</summary>
+    public TlsConfig? Tls { get; set; }
+}
+
+sealed class TlsConfig
+{
+    public string CertPath { get; set; } = "";
+    /// <summary>PFX password. Prefix with "env:" to read from an env var, e.g. "env:TLS_PASSWORD".</summary>
+    public string? CertPassword { get; set; }
+
+    public string? ResolveCertPassword()
+    {
+        if (string.IsNullOrEmpty(CertPassword)) return null;
+        if (CertPassword.StartsWith("env:", StringComparison.OrdinalIgnoreCase))
+            return Environment.GetEnvironmentVariable(CertPassword.Substring(4));
+        return CertPassword;
     }
 }

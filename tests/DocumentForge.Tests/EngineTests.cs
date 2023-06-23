@@ -485,6 +485,54 @@ public class EngineTests : IDisposable
     }
 
     [Fact]
+    public async System.Threading.Tasks.Task Replication_SharedSecretEnforced()
+    {
+        int port = 6500 + System.Random.Shared.Next(100);
+        var leaderPath = Path.Combine(Path.GetTempPath(), $"sec_leader_{Guid.NewGuid():N}.dfdb");
+        var good = Path.Combine(Path.GetTempPath(), $"sec_good_{Guid.NewGuid():N}.dfdb");
+        var bad  = Path.Combine(Path.GetTempPath(), $"sec_bad_{Guid.NewGuid():N}.dfdb");
+
+        try
+        {
+            using var leader = DocumentForgeDb.Create(leaderPath);
+            leader.StartLogicalReplicationServer(port, sharedSecret: "correct-secret");
+            await System.Threading.Tasks.Task.Delay(200);
+
+            // Good follower with matching secret
+            using var goodFollower = DocumentForgeDb.Create(good);
+            goodFollower.StartLogicalReplicationFollower("localhost", port, sharedSecret: "correct-secret");
+
+            // Bad follower with WRONG secret - should be rejected
+            using var badFollower = DocumentForgeDb.Create(bad);
+            badFollower.StartLogicalReplicationFollower("localhost", port, sharedSecret: "wrong-secret");
+
+            // Wait for handshake attempts to settle
+            for (int i = 0; i < 30 && leader.GetLogicalFollowerCount() == 0; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+            await System.Threading.Tasks.Task.Delay(500); // extra time for the bad follower to attempt + be rejected
+
+            // Only the good follower should be in the leader's connected set
+            Assert.Equal(1, leader.GetLogicalFollowerCount());
+
+            // Writes replicate to the good one
+            leader.Insert("orders", """{"pnr": "AUTH001"}""");
+            for (int i = 0; i < 20 && goodFollower.LogicallyReplicatedOps() < 1; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+            Assert.True(goodFollower.LogicallyReplicatedOps() >= 1);
+
+            // Bad follower saw nothing
+            Assert.Equal(0, badFollower.LogicallyReplicatedOps());
+        }
+        finally
+        {
+            foreach (var p in new[] { leaderPath, good, bad })
+            {
+                try { File.Delete(p); File.Delete(p + ".wal"); File.Delete(p + ".recovery"); File.Delete(p + ".followerseq"); } catch { }
+            }
+        }
+    }
+
+    [Fact]
     public async System.Threading.Tasks.Task Cluster_OnlineRebalance_ZeroDataLossWithConcurrentWrites()
     {
         // Start with 2 shards, run concurrent writes while rebalancing to 4 shards.
