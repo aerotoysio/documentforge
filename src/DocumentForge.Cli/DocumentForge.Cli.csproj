@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>dfdb</AssemblyName>
+    <RootNamespace>DocumentForge.Cli</RootNamespace>
+    <!-- Don't try to start Kestrel just because we're a .Web project - we start it explicitly in ServeCommand -->
+    <UseAppHost>true</UseAppHost>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <!-- Single-file publishing defaults; opt in via dotnet publish -->
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DocumentForge.Engine\DocumentForge.Engine.csproj" />
+  </ItemGroup>
+
+  <!-- Pull in the airline seed data file so `dfdb seed` works out of the box -->
+  <ItemGroup>
+    <Compile Include="..\..\samples\DocumentForge.AirlineDemo\SeedData.cs" Link="SeedData.cs" />
+  </ItemGroup>
+</Project>

@@ -31,6 +31,9 @@ artifacts/
 *.nupkg
 *.snupkg
 
+## Published single-file binaries
+dist/
+
 ## OS
 Thumbs.db
 .DS_Store
