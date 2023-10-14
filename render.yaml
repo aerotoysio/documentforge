@@ -1,0 +1,49 @@
+# Render blueprint for a single-node DocumentForge instance.
+#
+# What this provisions:
+#   - One web service running the Dockerfile at the repo root
+#   - A 10 GB persistent disk mounted at /data
+#   - A health check hitting /health
+#   - Two secrets you populate in the Render dashboard after first deploy
+#
+# Usage:
+#   1. Push this repo to GitHub/GitLab.
+#   2. In Render, click "New +" -> "Blueprint" and point it at the repo.
+#   3. Render reads this file, creates the service and disk.
+#   4. Set the two "sync: false" env vars (API key, replication secret)
+#      in the dashboard before the first deploy, or after.
+#
+# Scaling up:
+#   - Increase disk.sizeGB when you outgrow 10 GB.
+#   - Change `plan:` from starter to a larger tier for more RAM/CPU.
+#   - To run a sharded cluster, copy this file per-shard with different
+#     `name:` and `nodeName:` values, or deploy three services by hand.
+#
+# See: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: documentforge
+    runtime: docker
+    plan: starter           # 512 MB RAM. Bump to `standard` (2 GB) or higher for real workloads.
+    region: oregon          # or frankfurt / singapore / ohio / virginia
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+
+    disk:
+      name: dfdb-data
+      mountPath: /data
+      sizeGB: 10            # grow this as needed; Render lets you resize without downtime
+
+    envVars:
+      - key: DFDB_NODE_NAME
+        value: render-1
+      - key: DFDB_DATA_DIR
+        value: /data
+      # Secrets - set these in the Render dashboard (sync: false keeps them out of git)
+      - key: DFDB_API_KEY
+        sync: false
+      - key: DFDB_REPLICATION_SECRET
+        sync: false

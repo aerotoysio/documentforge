@@ -1,0 +1,37 @@
+# Build artefacts
+**/bin
+**/obj
+**/*.user
+**/*.suo
+dist/
+TestResults/
+coverage/
+
+# Editors / IDEs
+.vs/
+.vscode/
+.idea/
+
+# Version control
+.git/
+.gitignore
+
+# Admin UI - not shipped in the server image
+admin-ui/
+
+# Large local datasets
+scripts/sample-cluster/data/
+**/*.dfdb
+**/*.dfdb.wal
+**/*.dfdb.recovery
+
+# Node
+**/node_modules
+**/npm-debug.log
+
+# OS / misc
+**/.DS_Store
+**/Thumbs.db
+
+# Docs site (not needed for the server image)
+docs/
