@@ -23,24 +23,24 @@ Write-Host ""
 # Start each node in its own window so logs are visible
 Start-Process pwsh -ArgumentList @(
     '-NoExit', '-Command',
-    "dotnet run --project `"$root/samples/DocumentForge.Api`" --configuration Release -- --config `"$cluster/node-a.json`""
+    "dotnet run --project `"$root/src/DocumentForge.Cli`" --configuration Release -- serve --config `"$cluster/node-a.json`""
 ) -WorkingDirectory $root
 
 Start-Process pwsh -ArgumentList @(
     '-NoExit', '-Command',
-    "dotnet run --project `"$root/samples/DocumentForge.Api`" --configuration Release -- --config `"$cluster/node-b.json`""
+    "dotnet run --project `"$root/src/DocumentForge.Cli`" --configuration Release -- serve --config `"$cluster/node-b.json`""
 ) -WorkingDirectory $root
 
 Start-Process pwsh -ArgumentList @(
     '-NoExit', '-Command',
-    "dotnet run --project `"$root/samples/DocumentForge.Api`" --configuration Release -- --config `"$cluster/node-c.json`""
+    "dotnet run --project `"$root/src/DocumentForge.Cli`" --configuration Release -- serve --config `"$cluster/node-c.json`""
 ) -WorkingDirectory $root
 
 Write-Host ""
 Write-Host "Three windows opened, one per shard. Wait ~5 seconds for them to start."
 Write-Host ""
 Write-Host "Then check health:" -ForegroundColor Yellow
-Write-Host "  dotnet run --project samples/DocumentForge.Ctl -- health $cluster/cluster.json"
+Write-Host "  dfdb health $cluster/cluster.json"
 Write-Host ""
 Write-Host "Or point the admin UI at shard A:" -ForegroundColor Yellow
 Write-Host "  cd admin-ui"

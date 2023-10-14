@@ -290,7 +290,7 @@ export default function ClusterPage() {
         <pre className="code-block">{`# 1. Copy cluster.json to every node
 # 2. On each node, copy its matching node-*.json
 # 3. Start each node:
-dotnet run --project samples/DocumentForge.Api -- --config node-shard-a-leader.json
+dfdb serve --config node-shard-a-leader.json
 # ... one command per node, across your datacenters
 
 # 4. Wire replication (followers connect to their leader's replication port).

@@ -15,9 +15,14 @@ npm run dev
 You'll also need the DocumentForge REST API running somewhere:
 
 ```bash
-# From the repo root
-cd ..
-dotnet run --project samples/DocumentForge.Api
+# From the repo root — pick one:
+
+# Dev (runs via dotnet)
+dotnet run --project src/DocumentForge.Cli -- serve --port 5000 --data-dir ./data
+
+# Or use a published binary
+./dist/win-x64/dfdb.exe serve --port 5000 --data-dir ./data
+
 # → http://localhost:5000
 ```
 

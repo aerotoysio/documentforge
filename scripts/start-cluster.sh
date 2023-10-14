@@ -21,14 +21,14 @@ echo "  Shard C:  http://localhost:5003   data: $CLUSTER/data/shard-c"
 echo ""
 
 for node in a b c; do
-  dotnet run --project "$ROOT/samples/DocumentForge.Api" --configuration Release -- --config "$CLUSTER/node-$node.json" \
+  dotnet run --project "$ROOT/src/DocumentForge.Cli" --configuration Release -- serve --config "$CLUSTER/node-$node.json" \
     >"$CLUSTER/logs/shard-$node.log" 2>&1 &
   echo "  started shard-$node (PID $!, log: $CLUSTER/logs/shard-$node.log)"
 done
 
 echo ""
 echo "Wait ~5 seconds for nodes to warm up, then check health:"
-echo "  dotnet run --project samples/DocumentForge.Ctl -- health $CLUSTER/cluster.json"
+echo "  dfdb health $CLUSTER/cluster.json"
 echo ""
 echo "Or point the admin UI at shard A:"
 echo "  cd admin-ui"

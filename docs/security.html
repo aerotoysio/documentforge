@@ -22,6 +22,7 @@
       <a href="sharding.html">Sharding</a>
       <a href="deployment.html">Deployment</a>
       <a href="security.html" class="active">Security</a>
+      <a href="cli-reference.html">CLI</a>
       <a href="performance.html">Performance</a>
     </div>
   </div>
@@ -82,12 +83,10 @@
 }</pre>
 
     <p>Or via CLI / env:</p>
-    <pre>dotnet run --project samples/DocumentForge.Api -- \
-    --node-name shard-a --port 5001 \
-    --api-key sk_prod_abc123xyz
+    <pre>dfdb serve --node-name shard-a --port 5001 --api-key sk_prod_abc123xyz
 
 <span class="hl-com"># or</span>
-DFDB_API_KEY=sk_prod_abc123xyz dotnet run --project samples/DocumentForge.Api</pre>
+DFDB_API_KEY=sk_prod_abc123xyz dfdb serve</pre>
 
     <h4>From the admin UI</h4>
     <p>Go to Settings, paste the key. It's stored in <code>localStorage</code> and attached to every fetch. Works offline across page loads.</p>

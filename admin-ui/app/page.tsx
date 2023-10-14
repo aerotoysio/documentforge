@@ -29,8 +29,11 @@ export default function Dashboard() {
         <h3>Can&apos;t reach the database API</h3>
         <p>Tried <code style={{ background: 'var(--gray-100)', padding: '2px 6px' }}>{API_URL}</code> — {error}</p>
         <h3 style={{ marginTop: 20 }}>Start the API:</h3>
-        <pre className="code-block">{`# From the repo root
-dotnet run --project samples/DocumentForge.Api
+        <pre className="code-block">{`# From the repo root — dev mode
+dotnet run --project src/DocumentForge.Cli -- serve --port 5000 --data-dir ./data
+
+# Or with the published binary
+./dist/win-x64/dfdb.exe serve --port 5000 --data-dir ./data
 # → listens on http://localhost:5000`}</pre>
         <h3 style={{ marginTop: 20 }}>Or point this UI at a different host:</h3>
         <pre className="code-block">{`# In admin-ui/.env.local

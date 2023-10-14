@@ -14,8 +14,8 @@ export default function RebalancePage() {
       </div>
 
       <h2>Offline rebalance (simpler)</h2>
-      <pre className="code-block">{`dfctl rebalance old-cluster.json new-cluster.json --plan-only
-dfctl rebalance old-cluster.json new-cluster.json`}</pre>
+      <pre className="code-block">{`dfdb rebalance old-cluster.json new-cluster.json --plan-only
+dfdb rebalance old-cluster.json new-cluster.json`}</pre>
 
       <h2>Online rebalance (zero downtime)</h2>
       <div className="card">
