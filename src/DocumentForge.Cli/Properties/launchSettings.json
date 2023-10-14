@@ -1,0 +1,12 @@
+{
+  "profiles": {
+    "DocumentForge.Cli": {
+      "commandName": "Project",
+      "launchBrowser": true,
+      "environmentVariables": {
+        "ASPNETCORE_ENVIRONMENT": "Development"
+      },
+      "applicationUrl": "https://localhost:60732;http://localhost:60733"
+    }
+  }
+}
