@@ -102,7 +102,9 @@ public static class ServeCommand
         Console.WriteLine($"  replication: {replicationSummary}");
         Console.WriteLine();
         Console.WriteLine("  app API:   POST /query | GET /stats | GET /collections | POST /collections/{name}");
-        Console.WriteLine("             GET|DELETE /collections/{name}/{id} | POST /collections/{name}/bulk");
+        Console.WriteLine("             POST /collections/{name}/bulk");
+        Console.WriteLine("             GET|DELETE /collections/{name}/{id}                (by internal _id)");
+        Console.WriteLine("             GET|DELETE /collections/{name}/by/{field}/{value}  (by any field)");
         Console.WriteLine("             DELETE /collections/{name} | GET /indexes/{collection} | POST /index");
         Console.WriteLine("             POST /seed | GET /health");
         Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint");
@@ -213,7 +215,9 @@ public static class ServeCommand
         {
             var coll = db.GetCollection(name);
             if (coll is null) return Results.NotFound();
-            var docId = new DocumentId(Guid.Parse(id));
+            if (!Guid.TryParse(id, out var guid))
+                return Results.BadRequest(new { error = "This endpoint expects DocumentForge's internal _id. To delete by a business key, use DELETE /collections/{name}/by/{field}/{value}." });
+            var docId = new DocumentId(guid);
             var doc = coll.FindById(docId);
             if (doc is null) return Results.NotFound();
             if (coll.Delete(docId)) db.NotifyDocDeleted(name, docId, doc);
@@ -225,10 +229,63 @@ public static class ServeCommand
         {
             var coll = db.GetCollection(name);
             if (coll is null) return Results.NotFound();
-            if (!Guid.TryParse(id, out var guid)) return Results.BadRequest(new { error = "Invalid document id" });
+            if (!Guid.TryParse(id, out var guid))
+                return Results.BadRequest(new { error = "This endpoint expects DocumentForge's internal _id (a Guid-formatted 16-byte value returned from POST /collections/{name}). To look up by your own business key, use GET /collections/{name}/by/{field}/{value}." });
             var doc = coll.FindById(new DocumentId(guid));
             if (doc is null) return Results.NotFound();
             return Results.Ok(JsonDocument.Parse(doc.ToJson()).RootElement);
+        });
+
+        // Look up by any field - e.g. GET /collections/orders/by/pnr/ABC123
+        // Uses an index when one exists on the field; falls back to collection scan otherwise.
+        // The field name is validated against a whitelist to prevent SQL injection;
+        // the value is escaped by doubling single quotes.
+        app.MapGet("/collections/{name}/by/{field}/{value}", (string name, string field, string value) =>
+        {
+            if (!IsValidFieldPath(field))
+                return Results.BadRequest(new { error = "Field name must match [a-zA-Z_][a-zA-Z0-9_.\\[\\]]*" });
+
+            var coll = db.GetCollection(name);
+            if (coll is null) return Results.NotFound();
+
+            var safeValue = value.Replace("'", "''");
+            var sql = $"SELECT * FROM {name} WHERE {field} = '{safeValue}' LIMIT 1";
+            var r = db.Execute(sql);
+            if (!r.Success) return Results.BadRequest(new { error = r.Message });
+            if (r.Documents.Count == 0) return Results.NotFound();
+
+            return Results.Ok(new
+            {
+                collection = name,
+                plan = r.QueryPlan,
+                executionTimeMs = r.ExecutionTime.TotalMilliseconds,
+                document = JsonDocument.Parse(r.Documents[0].ToJson()).RootElement
+            });
+        });
+
+        // Delete by any field - same semantics as the GET-by-field above.
+        // Deletes at most the matching documents (no LIMIT clause means all matches).
+        app.MapDelete("/collections/{name}/by/{field}/{value}", (string name, string field, string value) =>
+        {
+            if (!IsValidFieldPath(field))
+                return Results.BadRequest(new { error = "Field name must match [a-zA-Z_][a-zA-Z0-9_.\\[\\]]*" });
+
+            var coll = db.GetCollection(name);
+            if (coll is null) return Results.NotFound();
+
+            var safeValue = value.Replace("'", "''");
+            var sql = $"DELETE FROM {name} WHERE {field} = '{safeValue}'";
+            var r = db.Execute(sql);
+            if (!r.Success) return Results.BadRequest(new { error = r.Message });
+
+            return Results.Ok(new
+            {
+                success = true,
+                collection = name,
+                deletedCount = r.AffectedCount,
+                plan = r.QueryPlan,
+                executionTimeMs = r.ExecutionTime.TotalMilliseconds
+            });
         });
 
         // Bulk insert: accepts a JSON array of documents.
@@ -533,6 +590,17 @@ public static class ServeCommand
         for (int i = 0; i < a.Length; i++) diff |= a[i] ^ b[i];
         return diff == 0;
     }
+
+    /// <summary>
+    /// Whitelists the characters allowed in a JSON field path coming from a URL.
+    /// Accepts names, dot notation, and bracket indices: passenger, passenger.lastName,
+    /// flights[0].airport. Blocks everything that could form SQL syntax.
+    /// </summary>
+    private static readonly System.Text.RegularExpressions.Regex _fieldPathRegex =
+        new("^[a-zA-Z_][a-zA-Z0-9_.\\[\\]]*$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private static bool IsValidFieldPath(string field) =>
+        !string.IsNullOrEmpty(field) && _fieldPathRegex.IsMatch(field);
 }
 
 // ---- DTOs ----
