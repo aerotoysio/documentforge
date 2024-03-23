@@ -1467,6 +1467,83 @@ public class EngineTests : IDisposable
         Assert.Equal("Alice", result.Documents[0]["name"].AsString);
     }
 
+    [Fact]
+    public void Query_SelectDistinct_SingleField()
+    {
+        _db.Insert("flights", """{"airline": "AA", "from": "JFK"}""");
+        _db.Insert("flights", """{"airline": "AA", "from": "LAX"}""");
+        _db.Insert("flights", """{"airline": "UA", "from": "JFK"}""");
+        _db.Insert("flights", """{"airline": "AA", "from": "JFK"}""");
+
+        var result = _db.Execute("SELECT DISTINCT airline FROM flights");
+
+        Assert.True(result.Success);
+        Assert.Equal(2, result.Documents.Count);
+        Assert.Contains("DISTINCT", result.QueryPlan);
+
+        var airlines = result.Documents.Select(d => d["airline"].AsString).OrderBy(x => x).ToList();
+        Assert.Equal(new[] { "AA", "UA" }, airlines);
+    }
+
+    [Fact]
+    public void Query_SelectDistinct_MultipleFields_DeduplicatesTuples()
+    {
+        _db.Insert("flights", """{"airline": "AA", "origin": "JFK", "destination": "LAX"}""");
+        _db.Insert("flights", """{"airline": "AA", "origin": "JFK", "destination": "LAX"}""");
+        _db.Insert("flights", """{"airline": "AA", "origin": "LAX", "destination": "JFK"}""");
+        _db.Insert("flights", """{"airline": "UA", "origin": "JFK", "destination": "LAX"}""");
+
+        var result = _db.Execute("SELECT DISTINCT airline, origin, destination FROM flights");
+
+        Assert.True(result.Success);
+        // Three unique (airline, origin, destination) tuples - the duplicate AA/JFK/LAX collapses
+        Assert.Equal(3, result.Documents.Count);
+    }
+
+    [Fact]
+    public void Query_SelectDistinct_WithWhere_AppliesWhereThenDedupes()
+    {
+        _db.Insert("flights", """{"airline": "AA", "status": "ON_TIME"}""");
+        _db.Insert("flights", """{"airline": "AA", "status": "DELAYED"}""");
+        _db.Insert("flights", """{"airline": "UA", "status": "ON_TIME"}""");
+        _db.Insert("flights", """{"airline": "AA", "status": "ON_TIME"}""");
+
+        var result = _db.Execute("SELECT DISTINCT airline FROM flights WHERE status = 'ON_TIME'");
+
+        Assert.True(result.Success);
+        Assert.Equal(2, result.Documents.Count);
+        var airlines = result.Documents.Select(d => d["airline"].AsString).OrderBy(x => x).ToList();
+        Assert.Equal(new[] { "AA", "UA" }, airlines);
+    }
+
+    [Fact]
+    public void Query_SelectDistinct_NestedPath()
+    {
+        _db.Insert("orders", """{"pnr": "A1", "passenger": {"lastName": "Smith"}}""");
+        _db.Insert("orders", """{"pnr": "A2", "passenger": {"lastName": "Jones"}}""");
+        _db.Insert("orders", """{"pnr": "A3", "passenger": {"lastName": "Smith"}}""");
+
+        var result = _db.Execute("SELECT DISTINCT passenger.lastName FROM orders");
+
+        Assert.True(result.Success);
+        Assert.Equal(2, result.Documents.Count);
+    }
+
+    [Fact]
+    public void Query_SelectDistinct_WithLimit_AppliesDistinctBeforeLimit()
+    {
+        for (int i = 0; i < 10; i++)
+            _db.Insert("flights", $$"""{"airline": "AA", "n": {{i}}}""");
+        for (int i = 0; i < 10; i++)
+            _db.Insert("flights", $$"""{"airline": "UA", "n": {{i}}}""");
+
+        // 20 docs total, 2 distinct airlines. LIMIT 5 should still only return 2 rows.
+        var result = _db.Execute("SELECT DISTINCT airline FROM flights LIMIT 5");
+
+        Assert.True(result.Success);
+        Assert.Equal(2, result.Documents.Count);
+    }
+
     public void Dispose()
     {
         _db.Dispose();

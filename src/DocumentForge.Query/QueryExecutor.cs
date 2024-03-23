@@ -54,10 +54,19 @@ public sealed class QueryExecutor
         if (collection is null)
             return QueryResult.Ok(new List<BsonDocument>(), "EMPTY (collection not found)");
 
-        // Can we push LIMIT down? Only if we don't need to sort afterward or join.
+        // Can we push LIMIT down? Only if we don't need to sort afterward,
+        // join, aggregate/group, or dedupe. Each of those operations needs
+        // the full result set before LIMIT can be safely applied.
         int? effectiveLimit = null;
-        if (stmt.OrderByPath is null && stmt.Limit.HasValue && stmt.Join is null)
+        if (stmt.OrderByPath is null
+            && stmt.Limit.HasValue
+            && stmt.Join is null
+            && !stmt.HasAggregates
+            && stmt.GroupByPaths.Count == 0
+            && !stmt.IsDistinct)
+        {
             effectiveLimit = (stmt.Offset ?? 0) + stmt.Limit.Value;
+        }
 
         List<BsonDocument> results;
         string plan;
@@ -109,6 +118,34 @@ public sealed class QueryExecutor
             plan = $"{plan} + AGGREGATE";
         }
 
+        // DISTINCT must operate on the user-visible row shape, so when a non-*
+        // projection is requested we project early. Aggregations have already
+        // shaped the rows, so they're already in user-visible form.
+        // Importantly we drop _id from the projection here - if every row has
+        // a unique _id, dedupe collapses nothing.
+        bool projectedEarly = false;
+        if (stmt.IsDistinct
+            && !stmt.HasAggregates
+            && stmt.Fields.Count > 0
+            && !stmt.Fields.Contains("*"))
+        {
+            results = results.Select(doc => ProjectFields(doc, stmt.Fields, includeId: false)).ToList();
+            projectedEarly = true;
+        }
+
+        if (stmt.IsDistinct)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var deduped = new List<BsonDocument>(results.Count);
+            foreach (var doc in results)
+            {
+                // Dedupe by the JSON of the (already-projected) doc.
+                if (seen.Add(doc.ToJson())) deduped.Add(doc);
+            }
+            results = deduped;
+            plan = $"{plan} + DISTINCT";
+        }
+
         // ORDER BY
         if (stmt.OrderByPath is not null)
         {
@@ -130,7 +167,8 @@ public sealed class QueryExecutor
             results = results.Take(stmt.Limit.Value).ToList();
 
         // Field projection - skip when aggregates are present (ApplyAggregations already shaped the row)
-        if (stmt.Fields.Count > 0 && !stmt.Fields.Contains("*") && !stmt.HasAggregates)
+        // and skip when DISTINCT already projected early (above).
+        if (stmt.Fields.Count > 0 && !stmt.Fields.Contains("*") && !stmt.HasAggregates && !projectedEarly)
         {
             results = results.Select(doc => ProjectFields(doc, stmt.Fields)).ToList();
         }
@@ -659,12 +697,14 @@ public sealed class QueryExecutor
         return doc;
     }
 
-    private static BsonDocument ProjectFields(BsonDocument doc, List<string> fields)
+    private static BsonDocument ProjectFields(BsonDocument doc, List<string> fields, bool includeId = true)
     {
         var projected = new BsonDocument();
-        // Always include _id
-        var id = doc["_id"];
-        if (!id.IsNull) projected["_id"] = id;
+        if (includeId)
+        {
+            var id = doc["_id"];
+            if (!id.IsNull) projected["_id"] = id;
+        }
 
         foreach (var field in fields)
         {

@@ -46,6 +46,7 @@ public sealed class Lexer
         ["MIN"] = TokenType.Min,
         ["MAX"] = TokenType.Max,
         ["GROUP"] = TokenType.Group, // followed by BY (handled specially)
+        ["DISTINCT"] = TokenType.Distinct,
     };
 
     public Lexer(string input)

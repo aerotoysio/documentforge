@@ -48,6 +48,14 @@ public sealed class Parser
     {
         Expect(TokenType.Select);
 
+        // Optional DISTINCT modifier - applies to whatever projection comes next
+        bool isDistinct = false;
+        if (Current.Type == TokenType.Distinct)
+        {
+            isDistinct = true;
+            _pos++;
+        }
+
         // Check for COUNT(*)
         if (Current.Type == TokenType.Count)
         {
@@ -66,7 +74,7 @@ public sealed class Parser
             return new CountStatement { Collection = countCollection, Where = countWhere };
         }
 
-        var stmt = new SelectStatement();
+        var stmt = new SelectStatement { IsDistinct = isDistinct };
 
         // Fields - can be *, paths, or aggregate functions like SUM(path), COUNT(*)
         if (Current.Type == TokenType.Star)

@@ -5,6 +5,7 @@ public abstract class Statement { }
 
 public sealed class SelectStatement : Statement
 {
+    public bool IsDistinct { get; set; }
     public List<string> Fields { get; set; } = new();  // ["*"] for all
     public List<AggregateField> Aggregates { get; set; } = new();
     public List<string> GroupByPaths { get; set; } = new();
