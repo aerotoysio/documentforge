@@ -172,19 +172,57 @@ public static class ServeCommand
 
     private static void MapEndpoints(WebApplication app, DocumentForgeDb db)
     {
-        app.MapPost("/query", (QueryRequest request) =>
+        // POST /query - materialised JSON response (default, back-compat).
+        // Pass ?stream=true OR Accept: application/x-ndjson for an NDJSON stream:
+        // first line is the metadata envelope, then one document per line.
+        app.MapPost("/query", async (QueryRequest request, HttpRequest httpReq, HttpResponse httpRes, bool? stream) =>
         {
             if (string.IsNullOrWhiteSpace(request.Sql))
                 return Results.BadRequest(new { error = "Missing 'sql' field" });
+
+            var wantsStream = stream == true
+                || httpReq.Headers.Accept.ToString().Contains("application/x-ndjson", StringComparison.OrdinalIgnoreCase);
+
             var result = db.Execute(request.Sql);
             if (!result.Success) return Results.BadRequest(new { error = result.Message });
-            var docs = result.Documents.Select(d => JsonDocument.Parse(d.ToJson()).RootElement).ToList();
-            return Results.Ok(new
+
+            if (!wantsStream)
             {
-                success = true, count = result.Documents.Count, affected = result.AffectedCount,
-                plan = result.QueryPlan, executionTimeMs = result.ExecutionTime.TotalMilliseconds,
-                message = result.Message, documents = docs
+                var docs = result.Documents.Select(d => JsonDocument.Parse(d.ToJson()).RootElement).ToList();
+                return Results.Ok(new
+                {
+                    success = true, count = result.Documents.Count, affected = result.AffectedCount,
+                    plan = result.QueryPlan, executionTimeMs = result.ExecutionTime.TotalMilliseconds,
+                    message = result.Message, documents = docs
+                });
+            }
+
+            // NDJSON: line 1 = envelope, lines 2..N = one doc per line.
+            httpRes.ContentType = "application/x-ndjson";
+            httpRes.Headers["X-DFDB-Plan"] = result.QueryPlan;
+            httpRes.Headers["X-DFDB-Count"] = result.Documents.Count.ToString();
+            httpRes.Headers["X-DFDB-ExecutionMs"] = result.ExecutionTime.TotalMilliseconds.ToString("F2");
+
+            var envelope = JsonSerializer.Serialize(new
+            {
+                kind = "meta",
+                count = result.Documents.Count,
+                affected = result.AffectedCount,
+                plan = result.QueryPlan,
+                executionTimeMs = result.ExecutionTime.TotalMilliseconds,
+                message = result.Message
             });
+            await httpRes.WriteAsync(envelope);
+            await httpRes.WriteAsync("\n");
+            await httpRes.Body.FlushAsync();
+
+            foreach (var doc in result.Documents)
+            {
+                await httpRes.WriteAsync(doc.ToJson());
+                await httpRes.WriteAsync("\n");
+            }
+            await httpRes.Body.FlushAsync();
+            return Results.Empty;
         });
 
         app.MapGet("/collections", () => Results.Ok(new { collections = db.GetCollectionNames() }));
@@ -264,13 +302,9 @@ public static class ServeCommand
             if (!found.Success) return Results.BadRequest(new { error = found.Message });
             if (found.Documents.Count == 0) return Results.NotFound();
 
-            var existingId = found.Documents[0]["_id"];
-            if (existingId.IsNull)
-                return Results.BadRequest(new { error = "Matched document has no _id - cannot replace." });
-
             try
             {
-                var docId = new DocumentId(Guid.Parse(existingId.ToJson().Trim('"')));
+                var docId = found.Documents[0].GetId();
                 var ok = db.Replace(name, docId, json);
                 if (!ok) return Results.NotFound();
                 return Results.Ok(new
