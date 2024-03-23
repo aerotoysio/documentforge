@@ -1530,6 +1530,54 @@ public class EngineTests : IDisposable
     }
 
     [Fact]
+    public void Replace_UpdatesDocumentAndPreservesId()
+    {
+        var id = _db.Insert("orders", """{"pnr": "ABC123", "status": "PENDING"}""");
+
+        var ok = _db.Replace("orders", id, """{"pnr": "ABC123", "status": "CONFIRMED", "extra": 42}""");
+
+        Assert.True(ok);
+        var coll = _db.GetCollection("orders");
+        var doc = coll!.FindById(id);
+        Assert.NotNull(doc);
+        Assert.Equal("CONFIRMED", doc!["status"].AsString);
+        Assert.Equal(42, doc["extra"].AsInt32);
+        // _id is preserved on replace - SQL lookup by id still works
+        var byIdLookup = _db.Execute($"SELECT * FROM orders WHERE pnr = 'ABC123'");
+        Assert.Single(byIdLookup.Documents);
+    }
+
+    [Fact]
+    public void Replace_KeepsIndexesCoherent()
+    {
+        var id = _db.Insert("orders", """{"pnr": "OLD123", "passenger": {"lastName": "Original"}}""");
+        _db.CreateIndex("orders", "passenger.lastName", "idx_lastname");
+
+        // Pre-replace: indexed lookup finds it
+        var before = _db.Execute("SELECT * FROM orders WHERE passenger.lastName = 'Original'");
+        Assert.Single(before.Documents);
+        Assert.Contains("INDEX_SCAN", before.QueryPlan);
+
+        // Replace with a different lastName
+        _db.Replace("orders", id, """{"pnr": "OLD123", "passenger": {"lastName": "Replaced"}}""");
+
+        // Post-replace: old key has nothing, new key has the doc
+        var oldQuery = _db.Execute("SELECT * FROM orders WHERE passenger.lastName = 'Original'");
+        Assert.Empty(oldQuery.Documents);
+        var newQuery = _db.Execute("SELECT * FROM orders WHERE passenger.lastName = 'Replaced'");
+        Assert.Single(newQuery.Documents);
+        Assert.Contains("INDEX_SCAN", newQuery.QueryPlan);
+    }
+
+    [Fact]
+    public void Replace_ReturnsFalseWhenIdDoesNotExist()
+    {
+        var bogus = new DocumentId(Guid.NewGuid());
+        var ok = _db.Replace("orders", bogus, """{"x": 1}""");
+        Assert.False(ok);
+    }
+
+    [Fact]
     public void Query_SelectDistinct_WithLimit_AppliesDistinctBeforeLimit()
     {
         for (int i = 0; i < 10; i++)

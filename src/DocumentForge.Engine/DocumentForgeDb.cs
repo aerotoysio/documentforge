@@ -278,6 +278,53 @@ public sealed class DocumentForgeDb : IDisposable
     }
 
     /// <summary>
+    /// Replace an entire document by its DocumentId. The new document keeps the
+    /// original _id (we always re-stamp it) so callers don't have to thread it through.
+    /// Updates indexes; broadcasts to followers as a delete-then-insert pair.
+    /// Returns true if the document was found and replaced, false if not found.
+    /// </summary>
+    public bool Replace(string collectionName, DocumentId id, BsonDocument newDoc)
+    {
+        ThrowIfReadOnly();
+        _transactionManager.AcquireWriteLock();
+        try
+        {
+            var collection = _catalog.GetOrCreateCollection(collectionName);
+            var oldDoc = collection.FindById(id);
+            if (oldDoc is null) return false;
+
+            // Always preserve the original _id so the replacement is in place.
+            newDoc["_id"] = oldDoc["_id"];
+
+            if (!collection.Update(id, newDoc)) return false;
+            _indexManager.OnDocumentUpdated(collectionName, id, oldDoc, newDoc);
+
+            // Replicate as delete + insert (LogicalOpType.Update is on the roadmap).
+            if (_logicalServer is not null)
+            {
+                var oldBytes = BsonSerializer.Serialize(oldDoc);
+                _logicalServer.BroadcastNewOp(LogicalOpType.Delete, collectionName, oldBytes);
+                var newBytes = BsonSerializer.Serialize(newDoc);
+                _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, newBytes);
+            }
+            return true;
+        }
+        finally
+        {
+            _transactionManager.ReleaseWriteLock();
+        }
+    }
+
+    /// <summary>
+    /// Convenience overload: parse JSON then replace.
+    /// </summary>
+    public bool Replace(string collectionName, DocumentId id, string json)
+    {
+        var doc = BsonDocument.FromJson(json);
+        return Replace(collectionName, id, doc);
+    }
+
+    /// <summary>
     /// Bulk update: finds all docs matching the WHERE clause via SQL and applies SET clauses.
     /// Single lock acquisition for the entire operation.
     /// </summary>
