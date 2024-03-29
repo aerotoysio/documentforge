@@ -53,6 +53,13 @@ public sealed class BTreeIndex
 
         if (Definition.IsUnique && _tree.TryGetValue(key, out var existing) && existing.Count > 0)
         {
+            // Self-collision: the sole existing entry already points at the same
+            // document. This happens during update flows where the index value is
+            // re-asserted (PUT same doc with same indexed value). The right answer
+            // is "already correctly indexed, nothing to do" - not an error.
+            if (existing.Count == 1 && existing[0].Equals(docId))
+                return;
+
             throw new DuplicateKeyException(Definition.Name, key.ToString());
         }
 
@@ -61,6 +68,8 @@ public sealed class BTreeIndex
             list = new List<DocumentId>(1);
             _tree[key] = list;
         }
+        // Idempotency: don't double-insert the same docId at the same key.
+        if (list.Contains(docId)) return;
         list.Add(docId);
 
         if (!_bulkMode)

@@ -108,7 +108,9 @@ public static class ServeCommand
         Console.WriteLine("             DELETE /collections/{name} | GET /indexes/{collection} | POST /index");
         Console.WriteLine("             POST /seed | GET /health");
         Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint");
-        Console.WriteLine("             POST /admin/compact/{collection} | POST /admin/rebuild-indexes/{collection}");
+        Console.WriteLine("             POST /admin/compact/{collection}");
+        Console.WriteLine("             POST /admin/rebuild-indexes/{collection}");
+        Console.WriteLine("             POST /admin/rebuild-index/{collection}/{indexName}");
         Console.WriteLine("  replication:");
         Console.WriteLine("             GET  /replication/status");
         Console.WriteLine("             POST /replication/start-leader | /replication/start-follower");
@@ -558,6 +560,28 @@ public static class ServeCommand
                     success = true,
                     collection,
                     indexesRebuilt = indexes.Count,
+                    timeMs = sw.Elapsed.TotalMilliseconds
+                });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        // Rebuild ONE named index. Surgical recovery for single-index drift
+        // (e.g. issue #1 - a unique index out of sync with the collection).
+        app.MapPost("/admin/rebuild-index/{collection}/{indexName}", (string collection, string indexName) =>
+        {
+            try
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var ok = db.RebuildIndex(collection, indexName);
+                sw.Stop();
+                if (!ok)
+                    return Results.NotFound(new { error = $"Collection '{collection}' or index '{indexName}' not found." });
+                return Results.Ok(new
+                {
+                    success = true,
+                    collection,
+                    indexName,
                     timeMs = sw.Elapsed.TotalMilliseconds
                 });
             }
