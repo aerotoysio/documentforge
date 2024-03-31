@@ -312,6 +312,44 @@ public sealed class Parser
             return new IsNullExpression { JsonPath = path, IsNotNull = isNotNull };
         }
 
+        // path IN (v1, v2, v3) -> lower to (path = v1 OR path = v2 OR path = v3).
+        // The downstream planner will recognise the OR-of-equalities-on-same-column
+        // shape and emit a multi-key INDEX_SCAN when an index exists on `path`.
+        if (Current.Type == TokenType.In)
+        {
+            _pos++;
+            Expect(TokenType.LeftParen);
+            var values = new List<(object? value, TokenType valueType)>();
+            values.Add(ReadLiteralValue());
+            while (Match(TokenType.Comma))
+                values.Add(ReadLiteralValue());
+            Expect(TokenType.RightParen);
+
+            Expression expr = new ComparisonExpression
+            {
+                JsonPath = path,
+                Operator = TokenType.Equals,
+                Value = values[0].value,
+                ValueType = values[0].valueType
+            };
+            for (int i = 1; i < values.Count; i++)
+            {
+                expr = new LogicalExpression
+                {
+                    Left = expr,
+                    Operator = TokenType.Or,
+                    Right = new ComparisonExpression
+                    {
+                        JsonPath = path,
+                        Operator = TokenType.Equals,
+                        Value = values[i].value,
+                        ValueType = values[i].valueType
+                    }
+                };
+            }
+            return expr;
+        }
+
         var op = Current.Type;
         if (op is not (TokenType.Equals or TokenType.NotEquals or
             TokenType.GreaterThan or TokenType.LessThan or
