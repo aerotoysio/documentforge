@@ -278,6 +278,80 @@ public sealed class DocumentForgeDb : IDisposable
     }
 
     /// <summary>
+    /// Bulk insert with per-document tracking, index maintenance, and replication.
+    /// Holds the write lock once for the whole batch, so it's still bulk-fast,
+    /// but each insert is independently tried/caught - we get IDs for successes
+    /// and structured errors for failures.
+    ///
+    /// When <paramref name="atomic"/> is true, the first failure rolls back every
+    /// previously-inserted doc in the same lock window before returning. The lock
+    /// guarantees no other writer sees a partial state.
+    /// </summary>
+    public BulkInsertResult BulkInsertTracked(
+        string collectionName,
+        IReadOnlyList<BsonDocument> documents,
+        bool atomic = false)
+    {
+        ThrowIfReadOnly();
+        _transactionManager.AcquireWriteLock();
+        try
+        {
+            var collection = _catalog.GetOrCreateCollection(collectionName);
+            var insertedIds = new List<DocumentId>(documents.Count);
+            var errors = new List<BulkInsertError>();
+
+            for (int i = 0; i < documents.Count; i++)
+            {
+                try
+                {
+                    var doc = documents[i];
+                    doc.EnsureId();
+                    var id = collection.Insert(doc);
+                    _indexManager.OnDocumentInserted(collectionName, id, doc);
+                    insertedIds.Add(id);
+
+                    if (_logicalServer is not null)
+                    {
+                        var bytes = BsonSerializer.Serialize(doc);
+                        _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, bytes);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    errors.Add(new BulkInsertError(i, ex.Message));
+
+                    if (atomic)
+                    {
+                        // Roll back every successful insert from this batch.
+                        // Same write-lock window so concurrent readers never observe
+                        // the partially-applied state.
+                        foreach (var rollbackId in insertedIds)
+                        {
+                            var existing = collection.FindById(rollbackId);
+                            if (existing is not null && collection.Delete(rollbackId))
+                            {
+                                _indexManager.OnDocumentDeleted(collectionName, rollbackId, existing);
+                                if (_logicalServer is not null)
+                                {
+                                    var bytes = BsonSerializer.Serialize(existing);
+                                    _logicalServer.BroadcastNewOp(LogicalOpType.Delete, collectionName, bytes);
+                                }
+                            }
+                        }
+                        return new BulkInsertResult(Array.Empty<DocumentId>(), errors, RolledBack: true);
+                    }
+                }
+            }
+
+            return new BulkInsertResult(insertedIds, errors, RolledBack: false);
+        }
+        finally
+        {
+            _transactionManager.ReleaseWriteLock();
+        }
+    }
+
+    /// <summary>
     /// Replace an entire document by its DocumentId. The new document keeps the
     /// original _id (we always re-stamp it) so callers don't have to thread it through.
     /// Updates indexes; broadcasts to followers as a delete-then-insert pair.
@@ -948,3 +1022,17 @@ public sealed class CompactionResult
     public long PagesCompacted { get; set; }
     public long BytesReclaimed { get; set; }
 }
+
+/// <summary>
+/// Result of <see cref="DocumentForgeDb.BulkInsertTracked"/>. Always reports
+/// per-doc successes (their assigned <see cref="InsertedIds"/>) and per-doc
+/// failures (<see cref="Errors"/>). When the call ran with <c>atomic=true</c>
+/// and any error occurred, <see cref="RolledBack"/> is true and
+/// <see cref="InsertedIds"/> is empty.
+/// </summary>
+public sealed record BulkInsertResult(
+    IReadOnlyList<Core.DocumentId> InsertedIds,
+    IReadOnlyList<BulkInsertError> Errors,
+    bool RolledBack);
+
+public sealed record BulkInsertError(int Index, string Error);
