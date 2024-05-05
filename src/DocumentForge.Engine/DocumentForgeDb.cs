@@ -202,7 +202,21 @@ public sealed class DocumentForgeDb : IDisposable
 
     public bool DropCollection(string name)
     {
-        return _catalog.DropCollection(name);
+        ThrowIfReadOnly();
+        _transactionManager.AcquireWriteLock();
+        try
+        {
+            // Drop the indexes BEFORE the collection, so even if something
+            // throws mid-way the registry never lists indexes for a vanished
+            // collection. Both halves run inside the same write lock so
+            // concurrent readers never see the partial state.
+            _indexManager.DropAllIndexesForCollection(name);
+            return _catalog.DropCollection(name);
+        }
+        finally
+        {
+            _transactionManager.ReleaseWriteLock();
+        }
     }
 
     // --- Document API (convenience methods) ---
@@ -229,6 +243,13 @@ public sealed class DocumentForgeDb : IDisposable
         {
             var collection = _catalog.GetOrCreateCollection(collectionName);
             doc.EnsureId(); // ensure _id is set BEFORE we broadcast, so followers get the same id
+
+            // Pre-validate uniqueness. If any unique index would reject the doc,
+            // throw BEFORE the page write so the on-disk state is untouched.
+            // Pre-fix this happened in the wrong order: page wrote, index threw,
+            // doc stranded on disk. (issue #9)
+            _indexManager.ValidateUniqueInsert(collectionName, doc);
+
             var id = collection.Insert(doc);
             _indexManager.OnDocumentInserted(collectionName, id, doc);
 
@@ -306,6 +327,10 @@ public sealed class DocumentForgeDb : IDisposable
                 {
                     var doc = documents[i];
                     doc.EnsureId();
+                    // Validate before the page write so a unique-index conflict
+                    // doesn't leave a stranded doc behind (issue #9).
+                    _indexManager.ValidateUniqueInsert(collectionName, doc);
+
                     var id = collection.Insert(doc);
                     _indexManager.OnDocumentInserted(collectionName, id, doc);
                     insertedIds.Add(id);

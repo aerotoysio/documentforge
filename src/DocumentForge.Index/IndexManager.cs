@@ -11,8 +11,14 @@ namespace DocumentForge.Index;
 /// </summary>
 public sealed class IndexManager
 {
-    private readonly Dictionary<string, List<BTreeIndex>> _indexesByCollection = new();
-    private readonly Dictionary<string, BTreeIndex> _indexesByName = new();
+    // Both dictionaries are case-insensitive on lookup. CollectionName already
+    // normalises to lowercase, so the comparer is belt-and-braces there. Index
+    // names retain caller's original case (so the IndexDefinition.Name displayed
+    // back to operators is what they typed) but lookup never depends on case.
+    private readonly Dictionary<string, List<BTreeIndex>> _indexesByCollection
+        = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, BTreeIndex> _indexesByName
+        = new(StringComparer.OrdinalIgnoreCase);
 
     // Persistence infrastructure (may be null for in-memory-only use in tests)
     private readonly IPageCache? _cache;
@@ -109,6 +115,24 @@ public sealed class IndexManager
         _catalog?.Save(_indexesByName.Values.Select(i => i.Definition));
     }
 
+    /// <summary>
+    /// Drop every index belonging to the given collection. Used by DropCollection
+    /// so the index registry doesn't leak entries that would phantom-reject a
+    /// re-seed of the same data.
+    /// </summary>
+    public void DropAllIndexesForCollection(string collectionName)
+    {
+        var key = new CollectionName(collectionName).Value;
+        if (!_indexesByCollection.TryGetValue(key, out var list)) return;
+
+        // Snapshot before mutating - we're about to clear the list.
+        foreach (var index in list.ToList())
+            _indexesByName.Remove(index.Definition.Name);
+
+        _indexesByCollection.Remove(key);
+        _catalog?.Save(_indexesByName.Values.Select(i => i.Definition));
+    }
+
     public IReadOnlyList<BTreeIndex> GetIndexes(string collectionName)
     {
         var key = new CollectionName(collectionName).Value;
@@ -140,6 +164,41 @@ public sealed class IndexManager
 
         foreach (var index in indexes)
             InsertDocIntoIndex(index, doc, docId);
+    }
+
+    /// <summary>
+    /// Throws <see cref="DuplicateKeyException"/> if inserting <paramref name="doc"/>
+    /// into <paramref name="collectionName"/> would violate any unique index.
+    /// Pure read - never mutates. Call before committing the page write so a
+    /// rejected uniqueness check leaves the on-disk state untouched.
+    /// </summary>
+    public void ValidateUniqueInsert(string collectionName, BsonDocument doc)
+    {
+        var key = new CollectionName(collectionName).Value;
+        if (!_indexesByCollection.TryGetValue(key, out var indexes)) return;
+
+        foreach (var index in indexes)
+        {
+            if (!index.Definition.IsUnique) continue;
+
+            if (index.Definition.IsComposite)
+            {
+                var compKey = BuildCompositeKey(doc, index.Definition.Paths);
+                if (compKey is not null && index.Search(compKey).Any())
+                    throw new DuplicateKeyException(index.Definition.Name, compKey.ToString());
+            }
+            else
+            {
+                var values = JsonPathExtractor.ExtractAll(doc, index.Definition.JsonPath);
+                foreach (var val in values)
+                {
+                    if (val.IsNull) continue;
+                    var indexKey = new IndexKey(val);
+                    if (index.Search(indexKey).Any())
+                        throw new DuplicateKeyException(index.Definition.Name, indexKey.ToString());
+                }
+            }
+        }
     }
 
     public void OnDocumentDeleted(string collectionName, DocumentId docId, BsonDocument doc)
