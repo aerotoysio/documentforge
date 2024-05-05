@@ -27,6 +27,7 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
             </div>
             <nav>
               <Link href="/">Dashboard</Link>
+              <Link href="/studio" style={{ color: '#fff', fontWeight: 700 }}>✦ Studio</Link>
               <Link href="/query">Query console</Link>
               <Link href="/collections">Collections</Link>
               <Link href="/cluster">Cluster</Link>

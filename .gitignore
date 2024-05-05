@@ -42,3 +42,4 @@ Thumbs.db
 ## Local test artifacts
 cluster.json
 *.test.json
+tsconfig.tsbuildinfo
