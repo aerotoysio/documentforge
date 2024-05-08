@@ -1,24 +1,40 @@
-// Thin client for the dfdb REST API (from `dfdb serve`).
-// Override the default URL with NEXT_PUBLIC_DFDB_URL.
-// API key (bearer token) is stored in localStorage and attached to every request.
+// Thin client for the dfdb REST API.
+//
+// Every call resolves URL + auth from the *active connection* in the
+// connection registry (see lib/connections.ts). For a one-off override
+// (e.g. health-check the swarm), pass `{ connection }` to any function.
 
-export const API_URL = process.env.NEXT_PUBLIC_DFDB_URL || 'http://localhost:5000';
-const KEY_STORAGE = 'dfdb_api_key';
+import { Connection, getActiveConnection } from './connections';
 
-export function getApiKey(): string | null {
-  if (typeof window === 'undefined') return null;
-  return window.localStorage.getItem(KEY_STORAGE);
+const ENV_FALLBACK_URL = process.env.NEXT_PUBLIC_DFDB_URL || 'http://localhost:5000';
+const LEGACY_KEY_KEY = 'dfdb_api_key';
+
+export interface CallOptions {
+  connection?: Connection | null;
 }
 
-export function setApiKey(key: string | null) {
-  if (typeof window === 'undefined') return;
-  if (key) window.localStorage.setItem(KEY_STORAGE, key);
-  else window.localStorage.removeItem(KEY_STORAGE);
+function isBrowser() { return typeof window !== 'undefined'; }
+
+function resolveConn(opts?: CallOptions): { baseUrl: string; apiKey?: string } {
+  const explicit = opts?.connection;
+  if (explicit) return { baseUrl: explicit.baseUrl, apiKey: explicit.apiKey };
+
+  const active = getActiveConnection();
+  if (active) return { baseUrl: active.baseUrl, apiKey: active.apiKey };
+
+  // No registry yet (first paint, before migration runs). Use env + legacy key.
+  const legacyKey = isBrowser() ? window.localStorage.getItem(LEGACY_KEY_KEY) ?? undefined : undefined;
+  return { baseUrl: ENV_FALLBACK_URL, apiKey: legacyKey };
 }
 
-function authHeaders(): Record<string, string> {
-  const key = getApiKey();
-  return key ? { Authorization: `Bearer ${key}` } : {};
+function urlFor(path: string, opts?: CallOptions): string {
+  const { baseUrl } = resolveConn(opts);
+  return baseUrl.replace(/\/+$/, '') + path;
+}
+
+function authHeaders(opts?: CallOptions): Record<string, string> {
+  const { apiKey } = resolveConn(opts);
+  return apiKey ? { Authorization: `Bearer ${apiKey}` } : {};
 }
 
 async function handle(r: Response) {
@@ -26,7 +42,7 @@ async function handle(r: Response) {
   let body: any;
   try { body = text ? JSON.parse(text) : null; } catch { body = text; }
   if (r.status === 401) {
-    throw new Error('UNAUTHORIZED: API key missing or invalid. Set one in Settings.');
+    throw new Error('UNAUTHORIZED: API key missing or invalid for this connection.');
   }
   if (!r.ok) {
     const msg = (body && (body.error || body.message)) || `${r.status} ${r.statusText}`;
@@ -38,57 +54,74 @@ async function handle(r: Response) {
   return body;
 }
 
+// ---------- Legacy compat ----------
+// Keep the old API_URL export so older components don't break; new code should
+// read from the active connection directly via useActiveConnection().
+export const API_URL = ENV_FALLBACK_URL;
+
+export function getApiKey(): string | null {
+  const { apiKey } = resolveConn();
+  return apiKey ?? null;
+}
+export function setApiKey(key: string | null) {
+  // Legacy seam: writes to the legacy storage key. Not used by the new
+  // connection-aware flow, but kept so /settings still works.
+  if (!isBrowser()) return;
+  if (key) window.localStorage.setItem(LEGACY_KEY_KEY, key);
+  else window.localStorage.removeItem(LEGACY_KEY_KEY);
+}
+
 // ---------- Health & meta ----------
-export async function getHealth() {
-  const r = await fetch(`${API_URL}/health`);
+export async function getHealth(opts?: CallOptions) {
+  const r = await fetch(urlFor('/health', opts));
   return handle(r);
 }
 
-export async function getStats() {
-  const r = await fetch(`${API_URL}/stats`, { headers: authHeaders() });
+export async function getStats(opts?: CallOptions) {
+  const r = await fetch(urlFor('/stats', opts), { headers: authHeaders(opts) });
   return handle(r);
 }
 
-export async function getCollections() {
-  const r = await fetch(`${API_URL}/collections`, { headers: authHeaders() });
+export async function getCollections(opts?: CallOptions) {
+  const r = await fetch(urlFor('/collections', opts), { headers: authHeaders(opts) });
   return handle(r);
 }
 
-export async function getReplicationStatus() {
-  const r = await fetch(`${API_URL}/replication/status`, { headers: authHeaders() });
+export async function getReplicationStatus(opts?: CallOptions) {
+  const r = await fetch(urlFor('/replication/status', opts), { headers: authHeaders(opts) });
   return handle(r);
 }
 
 // ---------- Query ----------
-export async function query(sql: string) {
-  const r = await fetch(`${API_URL}/query`, {
+export async function query(sql: string, opts?: CallOptions) {
+  const r = await fetch(urlFor('/query', opts), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
     body: JSON.stringify({ sql }),
   });
   return handle(r);
 }
 
 // ---------- Document CRUD ----------
-export async function listDocs(collection: string, limit = 100) {
-  const r = await fetch(`${API_URL}/collections/${collection}?limit=${limit}`, { headers: authHeaders() });
+export async function listDocs(collection: string, limit = 100, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/collections/${collection}?limit=${limit}`, opts), { headers: authHeaders(opts) });
   return handle(r);
 }
 
-export async function findById(collection: string, id: string) {
-  const r = await fetch(`${API_URL}/collections/${collection}/${id}`, { headers: authHeaders() });
+export async function findById(collection: string, id: string, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/collections/${collection}/${id}`, opts), { headers: authHeaders(opts) });
   return handle(r);
 }
 
-export async function findByField(collection: string, field: string, value: string) {
-  const r = await fetch(`${API_URL}/collections/${collection}/by/${field}/${encodeURIComponent(value)}`, { headers: authHeaders() });
+export async function findByField(collection: string, field: string, value: string, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/collections/${collection}/by/${field}/${encodeURIComponent(value)}`, opts), { headers: authHeaders(opts) });
   return handle(r);
 }
 
-export async function insertDoc(collection: string, doc: any) {
-  const r = await fetch(`${API_URL}/collections/${collection}`, {
+export async function insertDoc(collection: string, doc: any, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/collections/${collection}`, opts), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
     body: typeof doc === 'string' ? doc : JSON.stringify(doc),
   });
   return handle(r);
@@ -97,94 +130,152 @@ export async function insertDoc(collection: string, doc: any) {
 export async function bulkInsert(
   collection: string,
   docs: any[],
-  opts: { atomic?: boolean; skipIndexes?: boolean } = {},
+  opts?: CallOptions & { atomic?: boolean; skipIndexes?: boolean },
 ) {
   const params = new URLSearchParams();
-  if (opts.atomic) params.set('atomic', 'true');
-  if (opts.skipIndexes) params.set('skipIndexes', 'true');
+  if (opts?.atomic) params.set('atomic', 'true');
+  if (opts?.skipIndexes) params.set('skipIndexes', 'true');
   const qs = params.toString();
-  const r = await fetch(`${API_URL}/collections/${collection}/bulk${qs ? '?' + qs : ''}`, {
+  const r = await fetch(urlFor(`/collections/${collection}/bulk${qs ? '?' + qs : ''}`, opts), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
     body: JSON.stringify(docs),
   });
   return handle(r);
 }
 
-export async function replaceById(collection: string, id: string, doc: any) {
-  const r = await fetch(`${API_URL}/collections/${collection}/${id}`, {
+export async function replaceById(collection: string, id: string, doc: any, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/collections/${collection}/${id}`, opts), {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
     body: typeof doc === 'string' ? doc : JSON.stringify(doc),
   });
   return handle(r);
 }
 
-export async function replaceByField(collection: string, field: string, value: string, doc: any) {
-  const r = await fetch(`${API_URL}/collections/${collection}/by/${field}/${encodeURIComponent(value)}`, {
+export async function replaceByField(collection: string, field: string, value: string, doc: any, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/collections/${collection}/by/${field}/${encodeURIComponent(value)}`, opts), {
     method: 'PUT',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
     body: typeof doc === 'string' ? doc : JSON.stringify(doc),
   });
   return handle(r);
 }
 
-export async function deleteById(collection: string, id: string) {
-  const r = await fetch(`${API_URL}/collections/${collection}/${id}`, {
+export async function deleteById(collection: string, id: string, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/collections/${collection}/${id}`, opts), {
     method: 'DELETE',
-    headers: authHeaders(),
+    headers: authHeaders(opts),
   });
   return handle(r);
 }
 
-export async function deleteByField(collection: string, field: string, value: string) {
-  const r = await fetch(`${API_URL}/collections/${collection}/by/${field}/${encodeURIComponent(value)}`, {
+export async function deleteByField(collection: string, field: string, value: string, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/collections/${collection}/by/${field}/${encodeURIComponent(value)}`, opts), {
     method: 'DELETE',
-    headers: authHeaders(),
+    headers: authHeaders(opts),
   });
   return handle(r);
 }
 
-export async function dropCollection(collection: string) {
-  const r = await fetch(`${API_URL}/collections/${collection}`, {
+export async function dropCollection(collection: string, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/collections/${collection}`, opts), {
     method: 'DELETE',
-    headers: { 'X-Confirm': 'true', ...authHeaders() },
+    headers: { 'X-Confirm': 'true', ...authHeaders(opts) },
   });
   return handle(r);
 }
 
 // ---------- Indexes ----------
-export async function getIndexes(collection: string) {
-  const r = await fetch(`${API_URL}/indexes/${collection}`, { headers: authHeaders() });
+export async function getIndexes(collection: string, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/indexes/${collection}`, opts), { headers: authHeaders(opts) });
   return handle(r);
 }
 
-export async function createIndex(collection: string, path: string, name: string, unique: boolean) {
-  const r = await fetch(`${API_URL}/index`, {
+export async function createIndex(collection: string, path: string, name: string, unique: boolean, opts?: CallOptions) {
+  const r = await fetch(urlFor('/index', opts), {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
     body: JSON.stringify({ collection, path, name, unique }),
   });
   return handle(r);
 }
 
 // ---------- Admin ----------
-export async function flushDb() {
-  const r = await fetch(`${API_URL}/admin/flush`, { method: 'POST', headers: authHeaders() });
+export async function flushDb(opts?: CallOptions) {
+  const r = await fetch(urlFor('/admin/flush', opts), { method: 'POST', headers: authHeaders(opts) });
   return handle(r);
 }
 
-export async function compactCollection(collection: string) {
-  const r = await fetch(`${API_URL}/admin/compact/${collection}`, { method: 'POST', headers: authHeaders() });
+export async function checkpointDb(opts?: CallOptions) {
+  const r = await fetch(urlFor('/admin/checkpoint', opts), { method: 'POST', headers: authHeaders(opts) });
   return handle(r);
 }
 
-export async function rebuildIndexes(collection: string) {
-  const r = await fetch(`${API_URL}/admin/rebuild-indexes/${collection}`, { method: 'POST', headers: authHeaders() });
+export async function compactCollection(collection: string, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/admin/compact/${collection}`, opts), { method: 'POST', headers: authHeaders(opts) });
   return handle(r);
 }
 
-export async function rebuildIndex(collection: string, indexName: string) {
-  const r = await fetch(`${API_URL}/admin/rebuild-index/${collection}/${indexName}`, { method: 'POST', headers: authHeaders() });
+export async function rebuildIndexes(collection: string, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/admin/rebuild-indexes/${collection}`, opts), { method: 'POST', headers: authHeaders(opts) });
+  return handle(r);
+}
+
+export async function rebuildIndex(collection: string, indexName: string, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/admin/rebuild-index/${collection}/${indexName}`, opts), { method: 'POST', headers: authHeaders(opts) });
+  return handle(r);
+}
+
+// ---------- Replication control ----------
+export async function startLeader(port: number, sharedSecret?: string, opts?: CallOptions) {
+  const r = await fetch(urlFor('/replication/start-leader', opts), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
+    body: JSON.stringify({ port, sharedSecret }),
+  });
+  return handle(r);
+}
+
+export async function startFollower(host: string, port: number, sharedSecret?: string, opts?: CallOptions) {
+  const r = await fetch(urlFor('/replication/start-follower', opts), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
+    body: JSON.stringify({ host, port, sharedSecret }),
+  });
+  return handle(r);
+}
+
+export async function promoteToLeader(port: number, opts?: CallOptions) {
+  const r = await fetch(urlFor('/replication/promote', opts), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
+    body: JSON.stringify({ port }),
+  });
+  return handle(r);
+}
+
+export async function setReadOnly(readOnly: boolean, opts?: CallOptions) {
+  const r = await fetch(urlFor(readOnly ? '/replication/read-only' : '/replication/read-write', opts), {
+    method: 'POST',
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+
+export async function enableAutoFailover(silenceSeconds: number, newLeaderPort: number, opts?: CallOptions) {
+  const r = await fetch(urlFor('/replication/auto-failover/enable', opts), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
+    body: JSON.stringify({ silenceSeconds, newLeaderPort }),
+  });
+  return handle(r);
+}
+
+export async function disableAutoFailover(opts?: CallOptions) {
+  const r = await fetch(urlFor('/replication/auto-failover/disable', opts), {
+    method: 'POST',
+    headers: authHeaders(opts),
+  });
   return handle(r);
 }
