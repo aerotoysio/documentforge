@@ -1907,6 +1907,43 @@ public class EngineTests : IDisposable
         Assert.Single(_db.Execute("SELECT * FROM TaxVersions").Documents);
     }
 
+    // --- Issue #10: dotted collection names via SQL ---
+    [Fact]
+    public void Sql_Select_FromMultiDotCollectionName_FindsDocuments()
+    {
+        // The user's exact scenario: collection name "aerotoys.tax.environments",
+        // 'id' is a string field, query has both bare-FROM and FROM+WHERE shapes.
+        _db.Insert("aerotoys.tax.environments", """{"id": "env-dev", "v": 1}""");
+        _db.Insert("aerotoys.tax.environments", """{"id": "env-staging", "v": 2}""");
+        _db.Insert("aerotoys.tax.environments", """{"id": "env-prod", "v": 3}""");
+
+        // Triangulation #1: bare-FROM should find them all.
+        var bare = _db.Execute("SELECT * FROM aerotoys.tax.environments");
+        Assert.True(bare.Success);
+        Assert.Equal(3, bare.Documents.Count);
+
+        // Triangulation #2: FROM + WHERE on a string field. The user reports
+        // this returns 0 with plan "EMPTY (collection not found)".
+        var filtered = _db.Execute("SELECT * FROM aerotoys.tax.environments WHERE id = 'env-staging'");
+        Assert.True(filtered.Success);
+        Assert.Single(filtered.Documents);
+        Assert.Equal("env-staging", filtered.Documents[0]["id"].AsString);
+    }
+
+    [Fact]
+    public void Sql_Select_UnknownCollection_ReturnsErrorNotEmptyResult()
+    {
+        // Pre-fix: silently returned `Success=true, Documents=[]` with plan
+        // 'EMPTY (collection not found)' — indistinguishable from a legitimate
+        // empty result. Now must be a clear error.
+        _db.Insert("orders", """{"pnr": "ABC"}""");
+
+        var r = _db.Execute("SELECT * FROM does_not_exist WHERE x = 1");
+
+        Assert.False(r.Success);
+        Assert.Contains("does_not_exist", r.Message ?? "");
+    }
+
     [Fact]
     public void Query_InClause_NumericValues()
     {
