@@ -1,0 +1,70 @@
+# DocumentForge — full-stack quickstart
+#
+# Spins up the dfdb engine + admin UI with one command. Both are built locally
+# from this repo by default; flip `image:` lines to `ghcr.io/aerotoysio/...:latest`
+# if you'd rather pull our published images.
+#
+# Quickstart:
+#   cp .env.example .env          # then edit .env
+#   docker compose up -d
+#   open http://localhost:3000     (admin UI)
+#   curl http://localhost:5000/health   (engine API)
+#
+# Production tweaks worth knowing about:
+#   - Set DFDB_API_KEY in .env (any non-empty value enables auth on the engine)
+#   - Set DFDB_REPLICATION_SECRET if you'll add follower nodes
+#   - Bind ports to 127.0.0.1 (default) — only flip to "0.0.0.0:5000:5000"
+#     if you understand your network
+#   - The engine writes documents into the `dfdb-data` volume — don't delete
+#     unless you mean it
+
+services:
+  documentforge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/aerotoysio/documentforge:latest
+    container_name: documentforge
+    restart: unless-stopped
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:5000:5000"        # engine HTTP API
+      # - "127.0.0.1:5500:5500"      # uncomment if running as a replication leader
+    volumes:
+      - dfdb-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:5000/health || exit 1"]
+      interval: 30s
+      timeout: 3s
+      start_period: 10s
+      retries: 3
+
+  admin-ui:
+    build:
+      context: ./admin-ui
+      dockerfile: Dockerfile
+      args:
+        # NEXT_PUBLIC_* values are baked into the JS bundle at build time.
+        # Default targets a same-host browser (you running `docker compose up` locally).
+        # For a public deployment, override at build time:
+        #   docker compose build --build-arg NEXT_PUBLIC_DFDB_URL=https://dfdb.example.com admin-ui
+        NEXT_PUBLIC_DFDB_URL: ${NEXT_PUBLIC_DFDB_URL:-http://localhost:5000}
+    image: ghcr.io/aerotoysio/documentforge-admin:latest
+    container_name: documentforge-admin
+    restart: unless-stopped
+    depends_on:
+      documentforge:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3000:3000"        # browser → http://localhost:3000
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:3000/ || exit 1"]
+      interval: 30s
+      timeout: 3s
+      start_period: 15s
+      retries: 3
+
+volumes:
+  dfdb-data:
+    name: dfdb-data
