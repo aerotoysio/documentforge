@@ -56,29 +56,91 @@ public sealed class IndexCatalog
         _definitions.Clear();
         _definitions.AddRange(definitions);
 
-        // Ensure we have a catalog page
+        // Walk the existing chain so we can reuse its pages instead of leaking
+        // them. The catalog grows and shrinks over time (CreateIndex / DropIndex)
+        // and the previous Save left exactly the chain we need to overwrite.
+        // Pages we don't end up needing get freed at the end.
+        var existing = new List<PageId>();
+        if (_catalogPage.IsValid)
+        {
+            var p = _catalogPage;
+            while (p.IsValid)
+            {
+                existing.Add(p);
+                var data = _cache.GetPage(p);
+                p = new DataPage(data).Header.NextPageId;
+            }
+        }
+
+        // Ensure the head page exists. If this is the first Save ever (catalog
+        // page Invalid), allocate it now; otherwise reuse the head from the
+        // existing chain.
         if (!_catalogPage.IsValid)
         {
             _catalogPage = _allocator.AllocatePage(PageType.CollectionCatalog);
+            existing.Add(_catalogPage);
         }
 
-        // Reset the catalog page: clear header and rewrite entries
-        var pageData = _cache.GetPage(_catalogPage);
-        var header = PageHeader.CreateData(_catalogPage);
-        header.PageType = PageType.CollectionCatalog;
-        Array.Clear(pageData);
-        header.WriteTo(pageData);
-        var page = new DataPage(pageData);
+        int chainIndex = 0;
+        var currentPageId = existing[chainIndex];
+        var currentPage = ResetCatalogPage(currentPageId);
 
         foreach (var def in _definitions)
         {
             var bytes = SerializeDefinition(def);
-            int slot = page.Insert(bytes);
-            if (slot < 0)
-                throw new DocumentForgeException("Index catalog overflow - too many indexes for one page (TODO: multi-page).");
+            int slot = currentPage.Insert(bytes);
+            if (slot >= 0) continue;
+
+            // Page full. Either reuse the next existing chain page or allocate
+            // a fresh one, link from the current page, and switch to it.
+            chainIndex++;
+            PageId nextPageId;
+            if (chainIndex < existing.Count)
+            {
+                nextPageId = existing[chainIndex];
+            }
+            else
+            {
+                nextPageId = _allocator.AllocatePage(PageType.CollectionCatalog);
+                existing.Add(nextPageId);
+            }
+
+            // Stamp the link on the just-finished page and persist it before
+            // moving on; the chain has to be valid as soon as we walk away.
+            currentPage.SetNextPage(nextPageId);
+            _cache.PutPage(currentPageId, currentPage.RawData, isDirty: true);
+
+            currentPageId = nextPageId;
+            currentPage = ResetCatalogPage(currentPageId);
+
+            int retry = currentPage.Insert(bytes);
+            if (retry < 0)
+                // Single definition larger than a whole page. Names + paths
+                // would have to be enormous to hit this. Keep the throw so we
+                // notice if it ever becomes real.
+                throw new DocumentForgeException(
+                    $"Index catalog: definition '{def.Name}' is too large to fit in a single page.");
         }
 
-        _cache.PutPage(_catalogPage, page.RawData, isDirty: true);
+        // Persist the final page and clear NextPageId on it so the chain ends
+        // cleanly even if a previous Save had a longer tail.
+        currentPage.SetNextPage(PageId.Invalid);
+        _cache.PutPage(currentPageId, currentPage.RawData, isDirty: true);
+
+        // Free any leftover pages from the prior chain that we no longer need.
+        // (catalog shrunk — e.g. a DropIndex reduced the def count.)
+        for (int i = chainIndex + 1; i < existing.Count; i++)
+            _allocator.FreePage(existing[i]);
+    }
+
+    private DataPage ResetCatalogPage(PageId pageId)
+    {
+        var pageData = _cache.GetPage(pageId);
+        Array.Clear(pageData);
+        var header = PageHeader.CreateData(pageId);
+        header.PageType = PageType.CollectionCatalog;
+        header.WriteTo(pageData);
+        return new DataPage(pageData);
     }
 
     private static byte[] SerializeDefinition(IndexDefinition def)
