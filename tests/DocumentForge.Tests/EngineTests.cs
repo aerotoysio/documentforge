@@ -2246,6 +2246,82 @@ public class EngineTests : IDisposable
         }
     }
 
+    // --- Snapshot / backup API (issue #27) ---
+
+    [Fact]
+    public void Snapshot_ProducesIndependentFileWithSameContent()
+    {
+        _db.Insert("orders", """{"pnr":"ABC","seat":"12A"}""");
+        _db.Insert("orders", """{"pnr":"DEF","seat":"14B"}""");
+        _db.CreateIndex("orders", "pnr", "idx_orders_pnr", unique: true);
+
+        var snapshotPath = Path.Combine(Path.GetTempPath(), $"snapshot_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            _db.Snapshot(snapshotPath);
+            Assert.True(File.Exists(snapshotPath));
+
+            // The snapshot must open as an independent DB with the same docs
+            // AND the same indexes (so queries plan correctly post-restore).
+            using var restored = DocumentForgeDb.Open(snapshotPath);
+            var rows = restored.Execute("SELECT * FROM orders").Documents;
+            Assert.Equal(2, rows.Count);
+            Assert.Single(restored.GetIndexes("orders"));
+
+            // Indexed lookup against the snapshot finds the row — proves the
+            // index entries copied over and the catalog pointer survived.
+            var byPnr = restored.Execute("SELECT * FROM orders WHERE pnr = 'ABC'").Documents;
+            Assert.Single(byPnr);
+            Assert.Equal("12A", byPnr[0]["seat"].AsString);
+        }
+        finally
+        {
+            try { File.Delete(snapshotPath); } catch { }
+            try { File.Delete(snapshotPath + ".wal"); } catch { }
+            try { File.Delete(snapshotPath + ".recovery"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Snapshot_LiveDbContinuesToWorkAfterSnapshot()
+    {
+        _db.Insert("orders", """{"pnr":"BEFORE"}""");
+
+        var snapshotPath = Path.Combine(Path.GetTempPath(), $"snapshot_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            _db.Snapshot(snapshotPath);
+
+            // Live DB must accept new writes after the snapshot returns; the
+            // brief write-lock window during snapshot shouldn't leave the
+            // engine in any kind of degraded state.
+            _db.Insert("orders", """{"pnr":"AFTER"}""");
+            Assert.Equal(2, _db.Execute("SELECT * FROM orders").Documents.Count);
+
+            // The snapshot must not contain the post-snapshot row.
+            using var restored = DocumentForgeDb.Open(snapshotPath);
+            var rows = restored.Execute("SELECT * FROM orders").Documents;
+            Assert.Single(rows);
+            Assert.Equal("BEFORE", rows[0]["pnr"].AsString);
+        }
+        finally
+        {
+            try { File.Delete(snapshotPath); } catch { }
+            try { File.Delete(snapshotPath + ".wal"); } catch { }
+            try { File.Delete(snapshotPath + ".recovery"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Snapshot_SameAsLivePath_ThrowsClearError()
+    {
+        // Copying to the same path would self-truncate the live data file
+        // mid-flush. The engine catches that ahead of File.Copy with an
+        // ArgumentException so the failure mode is "no-op + clear error",
+        // not "corrupt the live database".
+        Assert.Throws<ArgumentException>(() => _db.Snapshot(_dbPath));
+    }
+
     public void Dispose()
     {
         _db.Dispose();
