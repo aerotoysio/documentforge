@@ -118,7 +118,7 @@ public static class ServeCommand
         Console.WriteLine("             DELETE /collections/{name} | GET /indexes/{collection} | POST /index");
         Console.WriteLine("             POST /tx/batch                  (atomic multi-doc transaction)");
         Console.WriteLine("             POST /seed | GET /health");
-        Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint");
+        Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint | POST /admin/snapshot");
         Console.WriteLine("             POST /admin/compact/{collection}");
         Console.WriteLine("             POST /admin/rebuild-indexes/{collection}");
         Console.WriteLine("             POST /admin/rebuild-index/{collection}/{indexName}");
@@ -705,6 +705,36 @@ public static class ServeCommand
             return Results.Ok(new { success = true, timeMs = sw.Elapsed.TotalMilliseconds });
         });
 
+        // Take a consistent snapshot of the data file. Blocks writes briefly
+        // (the duration of FlushAll + the file copy) and returns when the
+        // snapshot is durable. The result file at targetPath is a
+        // self-contained .dfdb that DocumentForgeDb.Open can load directly.
+        //
+        // For multi-GB datasets the copy dominates wall time; consider
+        // running this against a follower instead so the leader's writes
+        // aren't paused.
+        app.MapPost("/admin/snapshot", (SnapshotRequest req) =>
+        {
+            if (string.IsNullOrWhiteSpace(req.TargetPath))
+                return Results.BadRequest(new { error = "targetPath is required." });
+            try
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                db.Snapshot(req.TargetPath);
+                sw.Stop();
+                long bytes = 0;
+                try { bytes = new FileInfo(req.TargetPath).Length; } catch { }
+                return Results.Ok(new
+                {
+                    success = true,
+                    targetPath = req.TargetPath,
+                    bytesCopied = bytes,
+                    timeMs = Math.Round(sw.Elapsed.TotalMilliseconds, 1)
+                });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
         // Rebuild every index on a collection from scratch.
         // Needed after a bulk insert that used ?skipIndexes=true, or any time
         // an operator suspects index corruption.
@@ -773,10 +803,25 @@ public static class ServeCommand
 
     private static void MapReplicationEndpoints(WebApplication app, DocumentForgeDb db, NodeConfig config)
     {
-        // Current role + observability - safe for routine polling
+        // Current role + observability - safe for routine polling.
+        //
+        // The follower list and the follower's `leader.endpoint` are both
+        // populated from socket-level state the engine already tracks
+        // (FollowerCount, RemoteEndPoint, the configured _host:_port).
+        // Admin UIs use these to draw the topology graph without operators
+        // having to hand-tag each connection with a shard id (issue #12).
+        //
+        // Note: per-follower live ack tracking (`lastAckSeq`, `lagSeq`) is
+        // intentionally not here. The wire protocol is fire-and-forget today
+        // — we know each follower's seq AT HANDSHAKE only — and surfacing
+        // a stale value as if it were live would be worse than omitting it.
+        // Phase 2 of the multi-doc tx work (issue #13) is the natural place
+        // to add ack framing; the lag fields land then.
         app.MapGet("/replication/status", () =>
         {
             var rep = config.Replication;
+            var currentSeq = db.LeaderCurrentSeq;
+            var followers = db.GetLogicalFollowers();
             return Results.Ok(new
             {
                 node = config.NodeName,
@@ -784,15 +829,29 @@ public static class ServeCommand
                 readOnly = db.IsReadOnly,
                 leader = new
                 {
-                    currentSeq = db.LeaderCurrentSeq,
-                    followerCount = db.GetLogicalFollowerCount()
+                    currentSeq,
+                    followerCount = db.GetLogicalFollowerCount(),
+                    followers = followers.Select(f => new
+                    {
+                        endpoint = f.Endpoint,
+                        connectedAt = f.ConnectedAtUtc,
+                        handshakeSeq = f.HandshakeSeq,
+                        // Worst-case lag: how far behind the follower was when it
+                        // handshaked. If the link has stayed up, real lag is at
+                        // most this; we can't claim less without acks.
+                        worstCaseLagSeq = currentSeq > f.HandshakeSeq
+                            ? currentSeq - f.HandshakeSeq : 0UL,
+                    }).ToArray(),
                 },
                 follower = new
                 {
                     lastAppliedSeq = db.FollowerLastSeq,
                     opsApplied = db.LogicallyReplicatedOps(),
                     gapsDetected = db.GapsDetected,
-                    autoFailoverPromoted = db.WasAutoFailoverPromoted
+                    autoFailoverPromoted = db.WasAutoFailoverPromoted,
+                    leader = db.LogicalFollowerLeaderEndpoint is null
+                        ? null
+                        : (object)new { endpoint = db.LogicalFollowerLeaderEndpoint },
                 }
             });
         });
@@ -887,6 +946,7 @@ public static class ServeCommand
 public record QueryRequest(string Sql);
 public record SeedRequest(int? Orders);
 public record CreateIndexRequest(string Collection, string Path, string? Name = null, bool Unique = false);
+public record SnapshotRequest(string TargetPath);
 public record StartLeaderRequest(int Port, string? SharedSecret = null);
 public record StartFollowerRequest(string Host, int Port, string? SharedSecret = null);
 public record PromoteRequest(int Port);

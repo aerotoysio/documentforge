@@ -9,6 +9,7 @@ namespace DocumentForge.Engine;
 
 public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.ITransactionScope
 {
+    private readonly DatabaseLock _lock;
     private readonly DataFile _dataFile;
     private readonly PageCache _pageCache;
     private readonly PageAllocator _allocator;
@@ -28,9 +29,10 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
 
     public string FilePath { get; }
 
-    private DocumentForgeDb(string filePath, DataFile dataFile, DatabaseOptions options)
+    private DocumentForgeDb(string filePath, DataFile dataFile, DatabaseLock lockHandle, DatabaseOptions options)
     {
         FilePath = filePath;
+        _lock = lockHandle;
         _dataFile = dataFile;
         _pageCache = new PageCache(dataFile, options.CacheSizeInPages);
         _allocator = new PageAllocator(dataFile, _pageCache);
@@ -102,37 +104,63 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     public static DocumentForgeDb Create(string filePath, DatabaseOptions? options = null)
     {
         options ??= new DatabaseOptions();
-        var dataFile = DataFile.Create(filePath);
-        var db = new DocumentForgeDb(filePath, dataFile, options);
-        db._catalog.Load();
-        // New DB has no indexes yet
-        return db;
+        // Acquire the on-disk lock BEFORE creating the data file so two
+        // concurrent Create calls don't both succeed and end up with
+        // overlapping writes. If the data file exists already and is locked
+        // by someone else, the FileMode.CreateNew below would fail anyway —
+        // checking the lock first gives a clearer error.
+        var lockHandle = DatabaseLock.Acquire(filePath, options.ForceUnlock);
+        try
+        {
+            var dataFile = DataFile.Create(filePath);
+            var db = new DocumentForgeDb(filePath, dataFile, lockHandle, options);
+            db._catalog.Load();
+            // New DB has no indexes yet
+            return db;
+        }
+        catch
+        {
+            lockHandle.Dispose();
+            throw;
+        }
     }
 
     public static DocumentForgeDb Open(string filePath, DatabaseOptions? options = null)
     {
         options ??= new DatabaseOptions();
 
-        // CRASH RECOVERY: before opening the data file, check for an unfinished recovery log.
-        // If it exists and has records, it means we crashed mid-flush.
-        // Replay the log entries directly onto the data file to restore durability.
-        var recoveryPath = filePath + ".recovery";
-        int recoveredPages = ReplayRecoveryLog(filePath, recoveryPath);
-
-        var dataFile = DataFile.Open(filePath);
-        var db = new DocumentForgeDb(filePath, dataFile, options);
-        db._catalog.Load();
-        // Load persistent indexes (no rebuild from scratch!)
-        db._indexManager.LoadFromCatalog();
-        // Eagerly build location maps for all collections - avoids 1s lag on first query
-        foreach (var collName in db._catalog.GetCollectionNames())
+        // Acquire the on-disk lock BEFORE recovery replay or any data-file
+        // mutation. The recovery log is rewritten by replay, so two processes
+        // racing on Open could each clobber the other's recovery progress.
+        var lockHandle = DatabaseLock.Acquire(filePath, options.ForceUnlock);
+        try
         {
-            db._catalog.GetCollection(collName)?.BuildLocationMap();
-        }
+            // CRASH RECOVERY: before opening the data file, check for an unfinished recovery log.
+            // If it exists and has records, it means we crashed mid-flush.
+            // Replay the log entries directly onto the data file to restore durability.
+            var recoveryPath = filePath + ".recovery";
+            int recoveredPages = ReplayRecoveryLog(filePath, recoveryPath);
 
-        if (recoveredPages > 0)
-            Console.WriteLine($"[DocumentForge] Recovered {recoveredPages} page(s) from crash recovery log.");
-        return db;
+            var dataFile = DataFile.Open(filePath);
+            var db = new DocumentForgeDb(filePath, dataFile, lockHandle, options);
+            db._catalog.Load();
+            // Load persistent indexes (no rebuild from scratch!)
+            db._indexManager.LoadFromCatalog();
+            // Eagerly build location maps for all collections - avoids 1s lag on first query
+            foreach (var collName in db._catalog.GetCollectionNames())
+            {
+                db._catalog.GetCollection(collName)?.BuildLocationMap();
+            }
+
+            if (recoveredPages > 0)
+                Console.WriteLine($"[DocumentForge] Recovered {recoveredPages} page(s) from crash recovery log.");
+            return db;
+        }
+        catch
+        {
+            lockHandle.Dispose();
+            throw;
+        }
     }
 
     public static DocumentForgeDb OpenOrCreate(string filePath, DatabaseOptions? options = null)
@@ -963,6 +991,19 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     public int GetLogicalFollowerCount() => _logicalServer?.FollowerCount ?? 0;
 
     /// <summary>
+    /// Snapshot of currently-connected followers as the leader sees them.
+    /// Surfaces in <c>/replication/status</c> so admin UIs can wire up topology
+    /// without operators hand-typing shard membership. Empty list if this node
+    /// isn't a leader (or has no followers).
+    /// </summary>
+    public IReadOnlyList<FollowerInfo> GetLogicalFollowers() =>
+        _logicalServer?.GetFollowers() ?? Array.Empty<FollowerInfo>();
+
+    /// <summary>The leader this follower is reading from as <c>"host:port"</c>,
+    /// or null if this node isn't a follower.</summary>
+    public string? LogicalFollowerLeaderEndpoint => _logicalFollower?.LeaderEndpoint;
+
+    /// <summary>
     /// Start this DB as a logical replication follower (read-only replica).
     /// Applies incoming ops through the engine's own Insert/Delete/CreateIndex so indexes
     /// and location maps stay coherent. Queries on this instance will see replicated data.
@@ -1219,6 +1260,54 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         _pageCache.FlushAll();
     }
 
+    /// <summary>
+    /// Take a consistent on-disk snapshot of the database to <paramref name="targetPath"/>.
+    /// Acquires the write lock briefly: flushes every dirty page, fsyncs, then
+    /// copies the data file. New writes are blocked for the duration of the
+    /// flush + copy and resume on return.
+    ///
+    /// <para>
+    /// Result file is a self-contained <c>.dfdb</c> that <see cref="Open"/> can
+    /// load directly. The recovery log and WAL are NOT copied — the snapshot
+    /// is always taken at a checkpointed boundary, so the data file alone is
+    /// authoritative. Operators restoring from the snapshot just point a new
+    /// node at it; no recovery dance.
+    /// </para>
+    ///
+    /// <para>
+    /// For a multi-GB dataset the copy itself dominates the wall time. If the
+    /// pause is unacceptable, run the snapshot against a follower node — the
+    /// follower's pause doesn't affect the leader's write throughput.
+    /// </para>
+    /// </summary>
+    public void Snapshot(string targetPath)
+    {
+        if (string.Equals(Path.GetFullPath(targetPath), Path.GetFullPath(FilePath),
+                StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Snapshot targetPath must differ from the live data file.");
+
+        _transactionManager.AcquireWriteLock();
+        try
+        {
+            // FlushAll fsyncs the data file via OnAfterFlushComplete and
+            // truncates the recovery log. After this returns, the on-disk
+            // data file alone reflects the full committed state.
+            _pageCache.FlushAll();
+
+            // Copy under the write lock so no concurrent writer can race in
+            // between flush and copy. File.Copy on .NET reads with FileShare
+            // semantics that match a normal read — we still hold the data
+            // file's own handle, but Copy goes through a separate read path.
+            var targetDir = Path.GetDirectoryName(targetPath);
+            if (!string.IsNullOrEmpty(targetDir)) Directory.CreateDirectory(targetDir);
+            File.Copy(FilePath, targetPath, overwrite: true);
+        }
+        finally
+        {
+            _transactionManager.ReleaseWriteLock();
+        }
+    }
+
     public void Dispose()
     {
         if (!_disposed)
@@ -1234,6 +1323,10 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             _dataFile.Dispose();
             var recoveryPath = FilePath + ".recovery";
             try { if (File.Exists(recoveryPath) && new FileInfo(recoveryPath).Length == 0) File.Delete(recoveryPath); } catch { }
+            // Release the on-disk lock LAST so a crash mid-shutdown still leaves
+            // the lock visible. Releasing earlier would briefly let a second
+            // opener race in while we're still flushing/closing.
+            _lock.Dispose();
             _disposed = true;
         }
     }
