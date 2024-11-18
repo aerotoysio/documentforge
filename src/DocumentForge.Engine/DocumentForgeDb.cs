@@ -7,7 +7,7 @@ using DocumentForge.Transactions;
 
 namespace DocumentForge.Engine;
 
-public sealed class DocumentForgeDb : IDisposable
+public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.ITransactionScope
 {
     private readonly DatabaseLock _lock;
     private readonly DataFile _dataFile;
@@ -707,9 +707,232 @@ public sealed class DocumentForgeDb : IDisposable
 
     // --- Transaction API ---
 
+    /// <summary>
+    /// Open a multi-document transaction. Stage writes via the returned handle's
+    /// Insert/Replace/Delete/DeleteByField methods, then call Commit() to apply
+    /// them atomically (or Dispose without committing to roll back).
+    /// </summary>
     public Transaction BeginTransaction()
     {
-        return _transactionManager.BeginTransaction();
+        ThrowIfReadOnly();
+        var id = _transactionManager.NextTransactionId();
+        _transactionManager.WriteBegin(id);
+        return new Transaction(id, _transactionManager, this);
+    }
+
+    // --- ITransactionScope ---
+    // Callbacks the Transaction handle uses to read live state and commit
+    // a fully-staged batch under the engine's write lock.
+
+    BsonDocument? ITransactionScope.FindById(string collection, DocumentId id)
+    {
+        var coll = _catalog.GetCollection(collection);
+        return coll?.FindById(id);
+    }
+
+    IEnumerable<BsonDocument> ITransactionScope.FindAll(string collection)
+    {
+        var coll = _catalog.GetCollection(collection);
+        return coll is null ? Array.Empty<BsonDocument>() : coll.FindAll();
+    }
+
+    void ITransactionScope.ApplyCommit(Transaction tx)
+    {
+        ThrowIfReadOnly();
+        _transactionManager.AcquireWriteLock();
+        try
+        {
+            ApplyTransactionLocked(tx);
+        }
+        finally
+        {
+            _transactionManager.ReleaseWriteLock();
+        }
+    }
+
+    /// <summary>
+    /// Commits a staged transaction. The caller must hold the write lock.
+    ///
+    /// Two phases:
+    /// <list type="number">
+    ///   <item><description>Validate every unique-index constraint against the
+    ///   simulated post-commit state — pending deletes already gone, pending
+    ///   replaces using new values, pending inserts adding their keys. If any
+    ///   conflict surfaces, throw before touching storage.</description></item>
+    ///   <item><description>Apply the working set: deletes, then replaces, then
+    ///   inserts. By construction nothing in step 2 can throw a conflict that
+    ///   wasn't caught in step 1.</description></item>
+    /// </list>
+    ///
+    /// A non-uniqueness failure during step 2 (e.g. a doc was concurrently
+    /// removed between the txn's last read and the commit) leaves the state
+    /// partially applied. We don't roll back from there in this release —
+    /// callers see the throw and can re-check the state. See the Phase-2
+    /// crash-atomicity tracking issue for the durable rollback story.
+    /// </summary>
+    private void ApplyTransactionLocked(Transaction tx)
+    {
+        ValidateUniqueIndexesForTx(tx);
+
+        foreach (var (collectionName, ws) in tx.WorkingSets)
+        {
+            var collection = _catalog.GetCollection(collectionName);
+            if (collection is null)
+            {
+                // Pure-insert case: collection doesn't exist yet. Create it.
+                if (ws.Inserts.Count == 0 && ws.Replaces.Count == 0 && ws.Deletes.Count == 0)
+                    continue;
+                collection = _catalog.GetOrCreateCollection(collectionName);
+            }
+
+            // 1. Deletes
+            foreach (var id in ws.Deletes)
+            {
+                var doc = collection.FindById(id);
+                if (doc is null) continue; // raced; nothing to undo
+                if (collection.Delete(id))
+                    _indexManager.OnDocumentDeleted(collectionName, id, doc);
+            }
+
+            // 2. Replaces
+            foreach (var (id, newDoc) in ws.Replaces)
+            {
+                var oldDoc = collection.FindById(id);
+                if (oldDoc is null) continue;
+                newDoc["_id"] = oldDoc["_id"];
+                _indexManager.OnDocumentUpdated(collectionName, id, oldDoc, newDoc);
+                collection.Update(id, newDoc);
+            }
+
+            // 3. Inserts. Uniqueness was pre-validated for the whole batch;
+            // ValidateUniqueInsert runs again here as a defence-in-depth check
+            // since collection.Insert is shared with non-txn paths and we'd
+            // rather throw than silently corrupt.
+            foreach (var (_, doc) in ws.Inserts)
+            {
+                _indexManager.ValidateUniqueInsert(collectionName, doc);
+                var newId = collection.Insert(doc);
+                _indexManager.OnDocumentInserted(collectionName, newId, doc);
+            }
+        }
+
+        // Replicate as individual ops for now; logical-replication follower
+        // ordering already preserves intra-write-lock atomicity. Phase 2
+        // upgrades this to a single transactional batch.
+        if (_logicalServer is not null)
+        {
+            foreach (var (collectionName, ws) in tx.WorkingSets)
+            {
+                foreach (var id in ws.Deletes)
+                {
+                    // We've already deleted from storage; reconstruct the doc
+                    // from the staged delete list isn't possible here, so we
+                    // broadcast a delete-by-id surrogate. Followers replay by
+                    // _id, which is enough for index maintenance + storage.
+                    var idBytes = System.Text.Encoding.UTF8.GetBytes(id.ToString());
+                    _logicalServer.BroadcastNewOp(LogicalOpType.Delete, collectionName, idBytes);
+                }
+                foreach (var (_, newDoc) in ws.Replaces)
+                {
+                    var bytes = BsonSerializer.Serialize(newDoc);
+                    _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, bytes);
+                }
+                foreach (var (_, doc) in ws.Inserts)
+                {
+                    var bytes = BsonSerializer.Serialize(doc);
+                    _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, bytes);
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// Pre-flight check that every unique index in every touched collection
+    /// will be consistent after the txn applies. Builds the simulated
+    /// post-commit set of (key → docId) for each unique index by walking the
+    /// current persistent entries plus the txn's deltas, and throws a
+    /// <see cref="DuplicateKeyException"/> on the first key that ends up
+    /// pointing at two distinct doc ids.
+    /// </summary>
+    private void ValidateUniqueIndexesForTx(Transaction tx)
+    {
+        foreach (var (collectionName, ws) in tx.WorkingSets)
+        {
+            var collection = _catalog.GetCollection(collectionName);
+            foreach (var index in _indexManager.GetIndexes(collectionName))
+            {
+                if (!index.Definition.IsUnique) continue;
+
+                // Snapshot the live (key, docId) entries for this unique index.
+                // Each unique index has at most one docId per key, so a Dictionary
+                // is a faithful simulation surface.
+                var simulated = new Dictionary<IndexKey, DocumentId>();
+                foreach (var (key, docId) in index.ScanAll())
+                    simulated[key] = docId;
+
+                // Apply pending deletes: drop their keys from the simulation.
+                foreach (var id in ws.Deletes)
+                {
+                    var doc = collection?.FindById(id);
+                    if (doc is null) continue;
+                    foreach (var k in KeysFor(doc, index))
+                        if (simulated.TryGetValue(k, out var owner) && owner.Equals(id))
+                            simulated.Remove(k);
+                }
+
+                // Apply pending replaces: drop old keys, add new keys.
+                foreach (var (id, newDoc) in ws.Replaces)
+                {
+                    var oldDoc = collection?.FindById(id);
+                    if (oldDoc is not null)
+                    {
+                        foreach (var k in KeysFor(oldDoc, index))
+                            if (simulated.TryGetValue(k, out var owner) && owner.Equals(id))
+                                simulated.Remove(k);
+                    }
+                    foreach (var k in KeysFor(newDoc, index))
+                    {
+                        if (simulated.TryGetValue(k, out var existing) && !existing.Equals(id))
+                            throw new DuplicateKeyException(index.Definition.Name, k.ToString());
+                        simulated[k] = id;
+                    }
+                }
+
+                // Apply pending inserts: their keys must not already be claimed
+                // by a doc the txn isn't replacing.
+                foreach (var (id, doc) in ws.Inserts)
+                {
+                    foreach (var k in KeysFor(doc, index))
+                    {
+                        if (simulated.TryGetValue(k, out var existing) && !existing.Equals(id))
+                            throw new DuplicateKeyException(index.Definition.Name, k.ToString());
+                        simulated[k] = id;
+                    }
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<IndexKey> KeysFor(BsonDocument doc, BTreeIndex index)
+    {
+        if (index.Definition.IsComposite)
+        {
+            var components = new BsonValue[index.Definition.Paths.Count];
+            for (int i = 0; i < index.Definition.Paths.Count; i++)
+            {
+                var v = JsonPathExtractor.Extract(doc, index.Definition.Paths[i]);
+                if (v.IsNull) yield break;
+                components[i] = v;
+            }
+            yield return new IndexKey(components);
+        }
+        else
+        {
+            foreach (var v in JsonPathExtractor.ExtractAll(doc, index.Definition.JsonPath))
+            {
+                if (!v.IsNull) yield return new IndexKey(v);
+            }
+        }
     }
 
     // --- Replication API ---
