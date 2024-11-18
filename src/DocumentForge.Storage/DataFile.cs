@@ -160,7 +160,14 @@ public sealed class DataFile : IDataFile
             _stream.Seek(24, SeekOrigin.Begin);
             var buf = BitConverter.GetBytes(pageId.Value);
             _stream.Write(buf, 0, 4);
-            _stream.Flush();
+            // Flush(true) → FlushFileBuffers on Windows / fsync on POSIX. The
+            // bare Flush() we used before only pushed the managed buffer; the
+            // 4-byte header pointer could sit in the OS write cache through a
+            // power loss and come back as Invalid on next open, leaving the
+            // catalog page allocated and indexes orphaned. Match the discipline
+            // used by Flush() on line 136 — every header-mutating write must
+            // hit disk before we return.
+            _stream.Flush(true);
         }
     }
 
