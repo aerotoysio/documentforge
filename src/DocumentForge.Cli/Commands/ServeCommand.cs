@@ -650,10 +650,25 @@ public static class ServeCommand
 
     private static void MapReplicationEndpoints(WebApplication app, DocumentForgeDb db, NodeConfig config)
     {
-        // Current role + observability - safe for routine polling
+        // Current role + observability - safe for routine polling.
+        //
+        // The follower list and the follower's `leader.endpoint` are both
+        // populated from socket-level state the engine already tracks
+        // (FollowerCount, RemoteEndPoint, the configured _host:_port).
+        // Admin UIs use these to draw the topology graph without operators
+        // having to hand-tag each connection with a shard id (issue #12).
+        //
+        // Note: per-follower live ack tracking (`lastAckSeq`, `lagSeq`) is
+        // intentionally not here. The wire protocol is fire-and-forget today
+        // — we know each follower's seq AT HANDSHAKE only — and surfacing
+        // a stale value as if it were live would be worse than omitting it.
+        // Phase 2 of the multi-doc tx work (issue #13) is the natural place
+        // to add ack framing; the lag fields land then.
         app.MapGet("/replication/status", () =>
         {
             var rep = config.Replication;
+            var currentSeq = db.LeaderCurrentSeq;
+            var followers = db.GetLogicalFollowers();
             return Results.Ok(new
             {
                 node = config.NodeName,
@@ -661,15 +676,29 @@ public static class ServeCommand
                 readOnly = db.IsReadOnly,
                 leader = new
                 {
-                    currentSeq = db.LeaderCurrentSeq,
-                    followerCount = db.GetLogicalFollowerCount()
+                    currentSeq,
+                    followerCount = db.GetLogicalFollowerCount(),
+                    followers = followers.Select(f => new
+                    {
+                        endpoint = f.Endpoint,
+                        connectedAt = f.ConnectedAtUtc,
+                        handshakeSeq = f.HandshakeSeq,
+                        // Worst-case lag: how far behind the follower was when it
+                        // handshaked. If the link has stayed up, real lag is at
+                        // most this; we can't claim less without acks.
+                        worstCaseLagSeq = currentSeq > f.HandshakeSeq
+                            ? currentSeq - f.HandshakeSeq : 0UL,
+                    }).ToArray(),
                 },
                 follower = new
                 {
                     lastAppliedSeq = db.FollowerLastSeq,
                     opsApplied = db.LogicallyReplicatedOps(),
                     gapsDetected = db.GapsDetected,
-                    autoFailoverPromoted = db.WasAutoFailoverPromoted
+                    autoFailoverPromoted = db.WasAutoFailoverPromoted,
+                    leader = db.LogicalFollowerLeaderEndpoint is null
+                        ? null
+                        : (object)new { endpoint = db.LogicalFollowerLeaderEndpoint },
                 }
             });
         });

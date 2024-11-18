@@ -2174,6 +2174,78 @@ public class EngineTests : IDisposable
             Assert.Empty(reopened.GetIndexes($"c{i:D3}"));
     }
 
+    // --- Replication topology exposure (issue #12) ---
+
+    [Fact]
+    public async System.Threading.Tasks.Task LogicalReplication_LeaderExposesConnectedFollowerEndpoints()
+    {
+        // The /replication/status endpoint needs to surface enough about
+        // connected followers that an admin UI can wire a topology graph
+        // automatically. Today we expose endpoint, connectedAt, and the
+        // handshake seq (worst-case lag baseline). Ack-driven live lag is
+        // tracked separately under the Phase 2 replication-tx work.
+        int port = 5800 + System.Random.Shared.Next(100);
+        var leaderPath = Path.Combine(Path.GetTempPath(), $"topoleader_{Guid.NewGuid():N}.dfdb");
+        var follower1Path = Path.Combine(Path.GetTempPath(), $"topofol1_{Guid.NewGuid():N}.dfdb");
+        var follower2Path = Path.Combine(Path.GetTempPath(), $"topofol2_{Guid.NewGuid():N}.dfdb");
+
+        try
+        {
+            using var leader = DocumentForgeDb.Create(leaderPath);
+            leader.StartLogicalReplicationServer(port);
+            await System.Threading.Tasks.Task.Delay(150);
+
+            // Pre-seed an op on the leader so the second follower's handshake
+            // seq differs from the first — gives the lag column something to
+            // distinguish.
+            leader.Insert("orders", """{"pnr":"X"}""");
+
+            using var follower1 = DocumentForgeDb.Create(follower1Path);
+            follower1.StartLogicalReplicationFollower("localhost", port);
+            for (int i = 0; i < 30 && leader.GetLogicalFollowerCount() < 1; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+
+            leader.Insert("orders", """{"pnr":"Y"}""");
+            leader.Insert("orders", """{"pnr":"Z"}""");
+
+            using var follower2 = DocumentForgeDb.Create(follower2Path);
+            follower2.StartLogicalReplicationFollower("localhost", port);
+            for (int i = 0; i < 30 && leader.GetLogicalFollowerCount() < 2; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+
+            var followers = leader.GetLogicalFollowers();
+            Assert.Equal(2, followers.Count);
+
+            // Both endpoints are loopback addresses with whatever ephemeral
+            // ports the OS assigned. The status endpoint just needs them
+            // recognisable as host:port — we don't pin the exact port.
+            foreach (var f in followers)
+            {
+                Assert.Contains(":", f.Endpoint);
+                Assert.NotEqual("unknown", f.Endpoint);
+                Assert.True(f.ConnectedAtUtc > DateTime.UtcNow.AddMinutes(-1));
+            }
+
+            // The follower side knows its leader's endpoint — what the
+            // status payload uses to populate `follower.leader.endpoint`.
+            Assert.Equal($"localhost:{port}", follower1.LogicalFollowerLeaderEndpoint);
+            Assert.Equal($"localhost:{port}", follower2.LogicalFollowerLeaderEndpoint);
+
+            // A non-replicating db reports null so the JSON omits the field
+            // gracefully via the null-coalesce in /replication/status.
+            using var standalone = DocumentForgeDb.Create(
+                Path.Combine(Path.GetTempPath(), $"topostandalone_{Guid.NewGuid():N}.dfdb"));
+            Assert.Null(standalone.LogicalFollowerLeaderEndpoint);
+            Assert.Empty(standalone.GetLogicalFollowers());
+        }
+        finally
+        {
+            try { File.Delete(leaderPath); File.Delete(leaderPath + ".wal"); File.Delete(leaderPath + ".recovery"); } catch { }
+            try { File.Delete(follower1Path); File.Delete(follower1Path + ".wal"); File.Delete(follower1Path + ".recovery"); File.Delete(follower1Path + ".followerseq"); } catch { }
+            try { File.Delete(follower2Path); File.Delete(follower2Path + ".wal"); File.Delete(follower2Path + ".recovery"); File.Delete(follower2Path + ".followerseq"); } catch { }
+        }
+    }
+
     public void Dispose()
     {
         _db.Dispose();

@@ -740,6 +740,19 @@ public sealed class DocumentForgeDb : IDisposable
     public int GetLogicalFollowerCount() => _logicalServer?.FollowerCount ?? 0;
 
     /// <summary>
+    /// Snapshot of currently-connected followers as the leader sees them.
+    /// Surfaces in <c>/replication/status</c> so admin UIs can wire up topology
+    /// without operators hand-typing shard membership. Empty list if this node
+    /// isn't a leader (or has no followers).
+    /// </summary>
+    public IReadOnlyList<FollowerInfo> GetLogicalFollowers() =>
+        _logicalServer?.GetFollowers() ?? Array.Empty<FollowerInfo>();
+
+    /// <summary>The leader this follower is reading from as <c>"host:port"</c>,
+    /// or null if this node isn't a follower.</summary>
+    public string? LogicalFollowerLeaderEndpoint => _logicalFollower?.LeaderEndpoint;
+
+    /// <summary>
     /// Start this DB as a logical replication follower (read-only replica).
     /// Applies incoming ops through the engine's own Insert/Delete/CreateIndex so indexes
     /// and location maps stay coherent. Queries on this instance will see replicated data.
