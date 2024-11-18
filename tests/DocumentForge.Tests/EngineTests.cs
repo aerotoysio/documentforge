@@ -2322,12 +2322,78 @@ public class EngineTests : IDisposable
         Assert.Throws<ArgumentException>(() => _db.Snapshot(_dbPath));
     }
 
-    public void Dispose()
+    // --- On-disk lock (issue #26) ---
+
+    [Fact]
+    public void Open_RejectsConcurrentSecondOpener()
+    {
+        // The first DB instance is _db (held open by the test fixture). A
+        // second Open of the same path must surface a clear error rather than
+        // silently allowing both to write.
+        Assert.Throws<DatabaseLockedException>(() => DocumentForgeDb.Open(_dbPath));
+    }
+
+    [Fact]
+    public void Open_AfterClose_AcquiresFreshLock()
+    {
+        // Round-trip: dispose the held lock, reopen — the second open must
+        // succeed once the first has cleanly released.
+        _db.Dispose();
+        using var reopened = DocumentForgeDb.Open(_dbPath);
+        // Smoke-test: a real op proves the engine is functional, not just
+        // that the constructor returned.
+        reopened.Insert("orders", """{"pnr":"AFTER"}""");
+        Assert.Single(reopened.Execute("SELECT * FROM orders").Documents);
+    }
+
+    [Fact]
+    public void Open_StaleLockFromDeadHolder_AutoReclaims()
     {
         _db.Dispose();
+        var lockPath = _dbPath + ".lock";
+
+        // Plant a stale lock pointing at a definitely-dead pid on this host.
+        // 0x7FFFFFFF is impossibly out of range for a real process; the
+        // reclaim path will see it doesn't exist and take the lock.
+        var stale = """{"Pid":2147483646,"Host":""" + System.Text.Json.JsonSerializer.Serialize(Environment.MachineName) + ""","OpenedAtUtc":"2020-01-01T00:00:00Z"}""";
+        File.WriteAllText(lockPath, stale);
+
+        using var reopened = DocumentForgeDb.Open(_dbPath);
+        reopened.Insert("orders", """{"pnr":"X"}""");
+        Assert.Single(reopened.Execute("SELECT * FROM orders").Documents);
+    }
+
+    [Fact]
+    public void Open_StaleLockFromDifferentHost_RefusesWithoutForce()
+    {
+        _db.Dispose();
+        var lockPath = _dbPath + ".lock";
+
+        // Holder claims to be on a different host. We can't probe whether
+        // it's alive remotely, so the safe default is to refuse and surface
+        // the error. The user has to either delete the lock file or pass
+        // ForceUnlock = true.
+        var foreign = """{"Pid":1234,"Host":"some-other-machine","OpenedAtUtc":"2020-01-01T00:00:00Z"}""";
+        File.WriteAllText(lockPath, foreign);
+
+        var ex = Assert.Throws<DatabaseLockedException>(() => DocumentForgeDb.Open(_dbPath));
+        Assert.Equal("some-other-machine", ex.HolderHost);
+        Assert.Equal(1234, ex.HolderPid);
+
+        // ForceUnlock = true bypasses the cross-host check.
+        using var forced = DocumentForgeDb.Open(_dbPath, new DatabaseOptions { ForceUnlock = true });
+        Assert.Equal(0, forced.Execute("SELECT * FROM orders").Documents.Count);
+    }
+
+    public void Dispose()
+    {
+        // Test fixtures occasionally call _db.Dispose() themselves (e.g. lock
+        // round-trip tests). Tolerate the redundant Dispose without throwing.
+        try { _db.Dispose(); } catch { }
         try { File.Delete(_dbPath); } catch { }
         try { File.Delete(_dbPath + ".wal"); } catch { }
         try { File.Delete(_dbPath + ".recovery"); } catch { }
         try { File.Delete(_dbPath + ".followerseq"); } catch { }
+        try { File.Delete(_dbPath + ".lock"); } catch { }
     }
 }
