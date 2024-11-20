@@ -10,7 +10,7 @@ namespace DocumentForge.Engine;
 public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.ITransactionScope
 {
     private readonly DatabaseLock _lock;
-    private readonly DataFile _dataFile;
+    private readonly IDataFile _dataFile;
     private readonly PageCache _pageCache;
     private readonly PageAllocator _allocator;
     private readonly CollectionCatalog _catalog;
@@ -29,7 +29,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
 
     public string FilePath { get; }
 
-    private DocumentForgeDb(string filePath, DataFile dataFile, DatabaseLock lockHandle, DatabaseOptions options)
+    private DocumentForgeDb(string filePath, IDataFile dataFile, DatabaseLock lockHandle, DatabaseOptions options)
     {
         FilePath = filePath;
         _lock = lockHandle;
@@ -168,6 +168,39 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         if (File.Exists(filePath))
             return Open(filePath, options);
         return Create(filePath, options);
+    }
+
+    /// <summary>
+    /// Test seam: open a DB backed by a caller-supplied <see cref="IDataFile"/>
+    /// instead of the standard <c>DataFile.Open(filePath)</c>. Used by the
+    /// crash-injection harness (issue #28) to wrap the real data file in a
+    /// fault-injecting decorator. Skips recovery-log replay so the test can
+    /// drive its own state.
+    ///
+    /// <para>
+    /// <c>internal</c> on purpose — this surface is for verifying engine
+    /// invariants under simulated I/O failure, not a public extension point.
+    /// Production callers go through <see cref="Open"/> / <see cref="Create"/>.
+    /// </para>
+    /// </summary>
+    internal static DocumentForgeDb OpenWithDataFile(string filePath, IDataFile dataFile, DatabaseOptions? options = null)
+    {
+        options ??= new DatabaseOptions();
+        var lockHandle = DatabaseLock.Acquire(filePath, options.ForceUnlock);
+        try
+        {
+            var db = new DocumentForgeDb(filePath, dataFile, lockHandle, options);
+            db._catalog.Load();
+            db._indexManager.LoadFromCatalog();
+            foreach (var collName in db._catalog.GetCollectionNames())
+                db._catalog.GetCollection(collName)?.BuildLocationMap();
+            return db;
+        }
+        catch
+        {
+            lockHandle.Dispose();
+            throw;
+        }
     }
 
     /// <summary>
@@ -1310,25 +1343,49 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
 
     public void Dispose()
     {
-        if (!_disposed)
+        if (_disposed) return;
+
+        // Critical-cleanup discipline: the on-disk lock and the data file
+        // handle MUST be released even if FlushAll throws (full disk, fsync
+        // failure, injected fault). Pre-fix a FlushAll throw skipped every
+        // subsequent step including _lock.Dispose, leaving the lock file
+        // held by this process — the next Open in the same process couldn't
+        // reclaim it (FileShare.None) and threw DatabaseLockedException.
+        // Discovered by the crash-injection harness (issue #28).
+        //
+        // Surfacing the FlushAll error to the caller is still the right
+        // behaviour (silent durability loss is the worst outcome), so we
+        // re-throw at the end. But cleanup runs unconditionally first.
+        Exception? deferredFlushError = null;
+        try
         {
             DisableAutoFailover();
-            _replicationServer?.Dispose();
-            _replicationFollower?.Dispose();
-            _logicalServer?.Dispose();
-            _logicalFollower?.Dispose();
-            _pageCache.FlushAll(); // this also truncates the recovery log
-            _walWriter?.Dispose();
-            _recoveryLog?.Dispose();
-            _dataFile.Dispose();
+            try { _replicationServer?.Dispose(); } catch { }
+            try { _replicationFollower?.Dispose(); } catch { }
+            try { _logicalServer?.Dispose(); } catch { }
+            try { _logicalFollower?.Dispose(); } catch { }
+            try { _pageCache.FlushAll(); } // also truncates the recovery log
+            catch (Exception ex) { deferredFlushError = ex; }
+            try { _walWriter?.Dispose(); } catch { }
+            try { _recoveryLog?.Dispose(); } catch { }
+        }
+        finally
+        {
+            // The handles below are load-bearing for the next Open. Always
+            // close them, even when something earlier threw.
+            try { _dataFile.Dispose(); } catch { }
             var recoveryPath = FilePath + ".recovery";
             try { if (File.Exists(recoveryPath) && new FileInfo(recoveryPath).Length == 0) File.Delete(recoveryPath); } catch { }
-            // Release the on-disk lock LAST so a crash mid-shutdown still leaves
-            // the lock visible. Releasing earlier would briefly let a second
-            // opener race in while we're still flushing/closing.
-            _lock.Dispose();
+            // Release the on-disk lock LAST so a clean shutdown still has
+            // the file visible up through the data-file close. Releasing
+            // earlier would briefly let a second opener race in while we're
+            // still closing.
+            try { _lock.Dispose(); } catch { }
             _disposed = true;
         }
+
+        if (deferredFlushError is not null)
+            throw deferredFlushError;
     }
 }
 
