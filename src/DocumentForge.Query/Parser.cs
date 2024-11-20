@@ -166,12 +166,55 @@ public sealed class Parser
         Expect(TokenType.Into);
         var collection = ReadIdentifierPath();
 
-        // Optional VALUES keyword
+        // Two shapes:
+        //   INSERT INTO t (col1, col2) VALUES (val1, val2)        -- tuple form
+        //   INSERT INTO t [VALUES] { "col1": v1, "col2": v2 }     -- JSON form
+        // The tuple form supports scalar functions in value positions
+        // (NEWID(), GETDATE(), LOWER('Alice')), the JSON form does not — its
+        // body is read by BsonDocument.FromJson which has no notion of
+        // function calls.
+        if (Current.Type == TokenType.LeftParen)
+        {
+            return ParseInsertTupleForm(collection);
+        }
+
+        // Optional VALUES keyword (JSON form)
         if (Current.Type == TokenType.Values)
             _pos++;
 
         var json = Expect(TokenType.JsonLiteral).Value;
         return new InsertStatement { Collection = collection, JsonDocument = json };
+    }
+
+    private InsertStatement ParseInsertTupleForm(string collection)
+    {
+        // Column list: (col1, col2, ...). Paths aren't allowed here — only
+        // top-level field names. (Nested-field assignment via dotted paths
+        // could be a follow-up, but UPDATE SET handles that need today.)
+        Expect(TokenType.LeftParen);
+        var columns = new List<string> { Expect(TokenType.Identifier).Value };
+        while (Match(TokenType.Comma))
+            columns.Add(Expect(TokenType.Identifier).Value);
+        Expect(TokenType.RightParen);
+
+        Expect(TokenType.Values);
+        Expect(TokenType.LeftParen);
+        var values = new List<ValueExpression> { ReadValueExpression() };
+        while (Match(TokenType.Comma))
+            values.Add(ReadValueExpression());
+        Expect(TokenType.RightParen);
+
+        if (columns.Count != values.Count)
+            throw new QueryParseException(
+                $"INSERT column/value count mismatch: {columns.Count} columns but {values.Count} values.",
+                Current.Position);
+
+        return new InsertStatement
+        {
+            Collection = collection,
+            Columns = columns,
+            Values = values,
+        };
     }
 
     private UpdateStatement ParseUpdate()

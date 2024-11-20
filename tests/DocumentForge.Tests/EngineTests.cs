@@ -2906,6 +2906,101 @@ public class EngineTests : IDisposable
         }
     }
 
+    // --- INSERT tuple form with scalar functions (issue #34) ---
+
+    [Fact]
+    public void Sql_Insert_TupleForm_AcceptsLiteralsAndFunctions()
+    {
+        // The headline use case from #16: NEWID() + GETDATE() server-side
+        // at insert time. Pre-fix this was the WORKAROUND callers reached
+        // for — generate a Guid client-side, format the JSON, send it up.
+        var r = _db.Execute(
+            "INSERT INTO users (_id, email, createdAt) VALUES (NEWID(), 'a@b.com', GETDATE())");
+        Assert.True(r.Success, r.Message);
+        Assert.Equal(1, r.AffectedCount);
+
+        var rows = _db.Execute("SELECT * FROM users").Documents;
+        Assert.Single(rows);
+        var doc = rows[0];
+
+        // _id is a fresh GUID — parses as one and isn't the empty Guid.
+        Assert.True(Guid.TryParse(doc["_id"].ToString(), out var idGuid));
+        Assert.NotEqual(Guid.Empty, idGuid);
+
+        Assert.Equal("a@b.com", doc["email"].AsString);
+
+        // createdAt was stamped by the server's clock — we can't pin the
+        // exact value, just bracket it.
+        var createdAt = doc["createdAt"].AsDateTime;
+        Assert.True(createdAt.UtcDateTime > DateTime.UtcNow.AddMinutes(-1));
+    }
+
+    [Fact]
+    public void Sql_Insert_TupleForm_NewIdEachCallIsUnique()
+    {
+        // Two consecutive INSERTs with NEWID() must produce different ids —
+        // not constant-folded across calls.
+        _db.Execute("INSERT INTO users (_id, name) VALUES (NEWID(), 'A')");
+        _db.Execute("INSERT INTO users (_id, name) VALUES (NEWID(), 'B')");
+        var ids = _db.Execute("SELECT * FROM users").Documents
+            .Select(d => d["_id"].ToString()).ToList();
+        Assert.Equal(2, ids.Count);
+        Assert.Equal(2, ids.Distinct().Count());
+    }
+
+    [Fact]
+    public void Sql_Insert_TupleForm_NestedFunctionCall()
+    {
+        // LOWER('Alice') as a value — function args nest down through the
+        // ValueExpression tree the same way they do in WHERE / UPDATE SET.
+        var r = _db.Execute("INSERT INTO users (name) VALUES (LOWER('Alice'))");
+        Assert.True(r.Success, r.Message);
+        var doc = _db.Execute("SELECT * FROM users").Documents[0];
+        Assert.Equal("alice", doc["name"].AsString);
+    }
+
+    [Fact]
+    public void Sql_Insert_TupleForm_ColumnValueCountMismatch_FailsCleanly()
+    {
+        var r = _db.Execute("INSERT INTO users (a, b, c) VALUES ('x', 'y')");
+        Assert.False(r.Success);
+        Assert.Contains("mismatch", r.Message ?? "", StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Sql_Insert_JsonForm_StillWorks()
+    {
+        // The classic JSON form has to keep working unchanged — anything
+        // that broke it would silently regress every pre-#34 caller.
+        var r = _db.Execute("""INSERT INTO orders VALUES { "pnr": "ABC", "seat": "12A" }""");
+        Assert.True(r.Success, r.Message);
+        var rows = _db.Execute("SELECT * FROM orders").Documents;
+        Assert.Single(rows);
+        Assert.Equal("ABC", rows[0]["pnr"].AsString);
+        Assert.Equal("12A", rows[0]["seat"].AsString);
+    }
+
+    [Fact]
+    public void Sql_Insert_TupleForm_HonoursUniqueIndex()
+    {
+        _db.Insert("users", """{"email":"existing@x.com"}""");
+        _db.CreateIndex("users", "email", "idx_users_email", unique: true);
+
+        // A function-generated _id colliding with literal-uniqueness on email
+        // — the pre-flight ValidateUniqueInsert in ExecuteInsert catches it
+        // before the row hits storage.
+        var r = _db.Execute(
+            "INSERT INTO users (_id, email) VALUES (NEWID(), 'existing@x.com')");
+        Assert.False(r.Success);
+        Assert.Contains("Duplicate key", r.Message ?? "", StringComparison.OrdinalIgnoreCase);
+
+        // Pre-fix was a real risk: the doc would have been stranded on disk
+        // if uniqueness fired AFTER the page write. Confirm the failed row
+        // didn't leak.
+        var rows = _db.Execute("SELECT * FROM users").Documents;
+        Assert.Single(rows);
+    }
+
     public void Dispose()
     {
         // Test fixtures occasionally call _db.Dispose() themselves (e.g. lock
