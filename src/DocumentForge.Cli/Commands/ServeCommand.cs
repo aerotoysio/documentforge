@@ -277,6 +277,12 @@ public static class ServeCommand
 
         // Replace a document by internal _id. Body is the full new document
         // (the original _id is always preserved — you don't need to include it).
+        //
+        // Issue #18 — optimistic concurrency: if the request carries an
+        // `If-Match: <etag>` header, ReplaceIfEtag is used and a mismatch
+        // returns 412 Precondition Failed with the current ETag in both
+        // the response header and body. Without the header it's
+        // last-write-wins (back-compat with pre-#18 callers).
         app.MapPut("/collections/{name}/{id}", async (string name, string id, HttpRequest request) =>
         {
             if (!Guid.TryParse(id, out var guid))
@@ -289,6 +295,37 @@ public static class ServeCommand
             try
             {
                 var docId = new DocumentId(guid);
+                // ETag passed via the standard `If-Match` HTTP header. We
+                // accept both quoted (`"<etag>"`, RFC 9110 strict) and
+                // unquoted forms — clients hand-rolling the header often
+                // forget the quotes, and for an opaque-string token there's
+                // no semantic difference.
+                var ifMatch = NormaliseIfMatch(request.Headers["If-Match"].ToString());
+
+                if (!string.IsNullOrEmpty(ifMatch))
+                {
+                    string? newEtag;
+                    try { newEtag = db.ReplaceIfEtag(name, docId, json, ifMatch); }
+                    catch (EtagMismatchException ex)
+                    {
+                        return Results.Json(new
+                        {
+                            error = ex.Message,
+                            expected = ex.ExpectedEtag,
+                            actual = ex.ActualEtag,
+                        }, statusCode: StatusCodes.Status412PreconditionFailed);
+                    }
+                    if (newEtag is null) return Results.NotFound();
+                    return Results.Ok(new
+                    {
+                        success = true,
+                        id = docId.ToString(),
+                        collection = name,
+                        etag = newEtag,
+                    });
+                }
+
+                // Last-write-wins path.
                 var ok = db.Replace(name, docId, json);
                 if (!ok) return Results.NotFound();
                 return Results.Ok(new { success = true, id = docId.ToString(), collection = name });
@@ -332,8 +369,10 @@ public static class ServeCommand
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
 
-        // Find a single document by id
-        app.MapGet("/collections/{name}/{id}", (string name, string id) =>
+        // Find a single document by id. Issue #18: returns the current ETag
+        // in an `ETag:` response header so clients can store it and use it
+        // in a subsequent If-Match PUT.
+        app.MapGet("/collections/{name}/{id}", (string name, string id, HttpResponse response) =>
         {
             var coll = db.GetCollection(name);
             if (coll is null) return Results.NotFound();
@@ -341,6 +380,11 @@ public static class ServeCommand
                 return Results.BadRequest(new { error = "This endpoint expects DocumentForge's internal _id (a Guid-formatted 16-byte value returned from POST /collections/{name}). To look up by your own business key, use GET /collections/{name}/by/{field}/{value}." });
             var doc = coll.FindById(new DocumentId(guid));
             if (doc is null) return Results.NotFound();
+
+            var etag = doc.GetEtag();
+            if (!string.IsNullOrEmpty(etag))
+                response.Headers.ETag = $"\"{etag}\"";
+
             return Results.Ok(JsonDocument.Parse(doc.ToJson()).RootElement);
         });
 
@@ -952,6 +996,24 @@ public static class ServeCommand
 
     private static bool IsValidFieldPath(string field) =>
         !string.IsNullOrEmpty(field) && _fieldPathRegex.IsMatch(field);
+
+    /// <summary>
+    /// Normalise an HTTP If-Match header value. RFC 9110 says ETags are quoted
+    /// strong tokens (<c>"abc"</c>) or weak (<c>W/"abc"</c>); in practice
+    /// hand-rolled clients often send the raw token. We accept both, strip the
+    /// quotes / weak prefix, and let <see cref="EtagMismatchException"/> compare
+    /// the unwrapped opaque string.
+    /// </summary>
+    private static string NormaliseIfMatch(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+        var s = raw.Trim();
+        // Strip the weak-validator prefix.
+        if (s.StartsWith("W/", StringComparison.Ordinal)) s = s[2..];
+        // Strip surrounding quotes if present.
+        if (s.Length >= 2 && s[0] == '"' && s[^1] == '"') s = s[1..^1];
+        return s;
+    }
 }
 
 // ---- DTOs ----

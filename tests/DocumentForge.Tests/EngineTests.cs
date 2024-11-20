@@ -3001,6 +3001,87 @@ public class EngineTests : IDisposable
         Assert.Single(rows);
     }
 
+    // --- Optimistic concurrency / ETag (issue #18) ---
+
+    [Fact]
+    public void Insert_StampsFreshEtag()
+    {
+        var id = _db.Insert("users", """{"email":"a@b.com"}""");
+        var doc = _db.GetCollection("users")!.FindById(id)!;
+        var etag = doc.GetEtag();
+        Assert.False(string.IsNullOrEmpty(etag));
+        Assert.True(Guid.TryParse(etag, out _),
+            $"ETag should be a parseable GUID, got '{etag}'");
+    }
+
+    [Fact]
+    public void Replace_RestampsEtag()
+    {
+        // Two consecutive replaces must mint two different etags so an
+        // If-Match client sees the change.
+        var id = _db.Insert("users", """{"email":"a@b.com","v":1}""");
+        var beforeEtag = _db.GetCollection("users")!.FindById(id)!.GetEtag();
+
+        _db.Replace("users", id, """{"email":"a@b.com","v":2}""");
+        var afterEtag = _db.GetCollection("users")!.FindById(id)!.GetEtag();
+
+        Assert.False(string.IsNullOrEmpty(afterEtag));
+        Assert.NotEqual(beforeEtag, afterEtag);
+    }
+
+    [Fact]
+    public void ReplaceIfEtag_MatchingEtag_AppliesAndReturnsNewEtag()
+    {
+        var id = _db.Insert("users", """{"email":"a@b.com","v":1}""");
+        var oldEtag = _db.GetCollection("users")!.FindById(id)!.GetEtag();
+
+        var newEtag = _db.ReplaceIfEtag("users", id, """{"email":"a@b.com","v":2}""", oldEtag);
+        Assert.NotNull(newEtag);
+        Assert.NotEqual(oldEtag, newEtag);
+
+        var doc = _db.GetCollection("users")!.FindById(id)!;
+        Assert.Equal(2, doc["v"].AsInt32);
+        Assert.Equal(newEtag, doc.GetEtag());
+    }
+
+    [Fact]
+    public void ReplaceIfEtag_StaleEtag_ThrowsAndDoesNotApply()
+    {
+        var id = _db.Insert("users", """{"email":"a@b.com","v":1}""");
+        var oldEtag = _db.GetCollection("users")!.FindById(id)!.GetEtag();
+
+        // Someone else updated the doc — etag changed.
+        _db.Replace("users", id, """{"email":"a@b.com","v":2}""");
+
+        // Our stale If-Match must throw and the v=2 row must be untouched.
+        var ex = Assert.Throws<EtagMismatchException>(() =>
+            _db.ReplaceIfEtag("users", id, """{"email":"a@b.com","v":99}""", oldEtag));
+        Assert.Equal(oldEtag, ex.ExpectedEtag);
+
+        var doc = _db.GetCollection("users")!.FindById(id)!;
+        Assert.Equal(2, doc["v"].AsInt32);
+    }
+
+    [Fact]
+    public void ReplaceIfEtag_NotFound_ReturnsNullWithoutThrowing()
+    {
+        var fakeId = new DocumentId(Guid.NewGuid());
+        var result = _db.ReplaceIfEtag("users", fakeId, """{"x":1}""", "any-etag");
+        Assert.Null(result);
+    }
+
+    [Fact]
+    public void Replace_WithoutEtagCheck_StillWorksLastWriteWins()
+    {
+        // Pre-#18 callers using the unguarded Replace must see no
+        // behaviour change — they get last-write-wins, the etag rotates
+        // silently, and no exception fires.
+        var id = _db.Insert("users", """{"email":"a@b.com","v":1}""");
+        Assert.True(_db.Replace("users", id, """{"email":"a@b.com","v":2}"""));
+        Assert.True(_db.Replace("users", id, """{"email":"a@b.com","v":3}"""));
+        Assert.Equal(3, _db.GetCollection("users")!.FindById(id)!["v"].AsInt32);
+    }
+
     public void Dispose()
     {
         // Test fixtures occasionally call _db.Dispose() themselves (e.g. lock

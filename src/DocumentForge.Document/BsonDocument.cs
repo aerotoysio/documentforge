@@ -52,6 +52,26 @@ public sealed class BsonDocument : IEnumerable<KeyValuePair<string, BsonValue>>
             SetId(DocumentId.NewId());
     }
 
+    /// <summary>The reserved <c>_etag</c> field name. Issue #18: server-stamped
+    /// optimistic-concurrency token, refreshed on every Insert and Replace.
+    /// Callers don't supply it; if they do, the engine overwrites.</summary>
+    public const string EtagField = "_etag";
+
+    /// <summary>Read the doc's current <c>_etag</c> as a string. Returns empty
+    /// when unset (a doc inserted before #18 landed, or a doc constructed
+    /// directly from JSON without going through the engine's Insert path).</summary>
+    public string GetEtag()
+    {
+        var v = this[EtagField];
+        return v.IsNull ? string.Empty : v.ToString();
+    }
+
+    /// <summary>Stamp a fresh GUID v4 string into <c>_etag</c>. Called by the
+    /// engine on Insert and at the head of every Replace so optimistic
+    /// concurrency clients can If-Match against the value last GET'd.</summary>
+    public void StampFreshEtag() =>
+        this[EtagField] = BsonValue.FromString(Guid.NewGuid().ToString("D"));
+
     public static BsonDocument FromJson(string json)
     {
         using var jsonDoc = JsonDocument.Parse(json);
