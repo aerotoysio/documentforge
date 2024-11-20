@@ -89,3 +89,16 @@ jobs:
           build-args: ${{ matrix.build_args }}
           cache-from: type=gha,scope=${{ matrix.name }}
           cache-to: type=gha,scope=${{ matrix.name }},mode=max
+
+  trigger-deploy:
+    # Fires once after BOTH matrix entries succeed, not once per entry.
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Watchtower deploy
+        # Push-trigger so the host pulls + recreates within seconds rather
+        # than waiting for the 5-min poll fallback.
+        run: |
+          curl -fsS -X POST \
+            -H "Authorization: Bearer ${{ secrets.WATCHTOWER_TOKEN }}" \
+            https://watchtower.vollandes.com/v1/update
