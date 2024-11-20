@@ -30,4 +30,47 @@
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 
+  <!--
+    Build-identification metadata surfaced by GET /version (issue #36).
+    SourceRevisionId is the C# compiler's hook for embedding a git SHA into
+    the generated AssemblyInformationalVersion (e.g. "0.1.0+a72f80d4..."). We
+    set it from env var DFDB_GIT_SHA when present (Docker / CI / release build),
+    otherwise from `git rev-parse HEAD` if a local repo is available, otherwise
+    leave blank — BuildInfo.GitSha falls back to "dev" at runtime.
+
+    BuildTimeUtc is similarly carried via an AssemblyMetadata attribute so a
+    binary built ten minutes ago and one built last week are distinguishable
+    even when SHAs are unavailable. Honours DFDB_BUILT_AT if set.
+  -->
+  <PropertyGroup>
+    <SourceRevisionId Condition="'$(DFDB_GIT_SHA)' != ''">$(DFDB_GIT_SHA)</SourceRevisionId>
+    <DfdbBuildTimeUtc Condition="'$(DFDB_BUILT_AT)' != ''">$(DFDB_BUILT_AT)</DfdbBuildTimeUtc>
+    <DfdbBuildTimeUtc Condition="'$(DfdbBuildTimeUtc)' == ''">$([System.DateTime]::UtcNow.ToString("o"))</DfdbBuildTimeUtc>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <AssemblyMetadata Include="BuildTimeUtc" Value="$(DfdbBuildTimeUtc)" />
+  </ItemGroup>
+
+  <!--
+    Probe `git rev-parse HEAD` once per build if the env var didn't supply a
+    SHA. Wrapped in `ContinueOnError` so a project built outside a git repo
+    (NuGet restore from a source-only ZIP) doesn't fail the build — BuildInfo
+    just reports "dev" at runtime in that case.
+  -->
+  <Target Name="DetectGitSha"
+          BeforeTargets="GetAssemblyAttributes"
+          Condition="'$(SourceRevisionId)' == '' AND Exists('$(MSBuildThisFileDirectory).git')">
+    <Exec Command="git rev-parse HEAD"
+          WorkingDirectory="$(MSBuildThisFileDirectory)"
+          ConsoleToMSBuild="true"
+          ContinueOnError="true"
+          IgnoreExitCode="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="DfdbDetectedSha" />
+    </Exec>
+    <PropertyGroup>
+      <SourceRevisionId Condition="'$(DfdbDetectedSha)' != ''">$(DfdbDetectedSha.Trim())</SourceRevisionId>
+    </PropertyGroup>
+  </Target>
+
 </Project>
