@@ -2648,6 +2648,206 @@ public class EngineTests : IDisposable
         Assert.Equal(0, forced.Execute("SELECT * FROM orders").Documents.Count);
     }
 
+    // --- Scalar SQL functions (issue #16) ---
+    //
+    // The headline goal is server-side ID/timestamp generation and string
+    // transforms callers can use without round-tripping. INSERT-with-functions
+    // is deferred (would need a JSON+functions parser); this batch covers the
+    // WHERE and UPDATE SET shapes — the immediately useful surface.
+
+    [Fact]
+    public void Sql_Function_Lower_InWhere_MatchesIndexedField()
+    {
+        _db.Insert("users", """{"email":"Alice@Example.com"}""");
+        _db.Insert("users", """{"email":"BOB@x.com"}""");
+
+        // LOWER(email) lets callers normalise on the server side without
+        // having to lower-case the value client-side first.
+        var rows = _db.Execute("SELECT * FROM users WHERE LOWER(email) = 'alice@example.com'").Documents;
+        Assert.Single(rows);
+        Assert.Equal("Alice@Example.com", rows[0]["email"].AsString);
+    }
+
+    [Fact]
+    public void Sql_Function_Upper_InWhereOnLiteralRhs()
+    {
+        _db.Insert("users", """{"name":"ALICE"}""");
+        _db.Insert("users", """{"name":"bob"}""");
+
+        // The right-hand side (a function call wrapping a literal) is the
+        // simpler case — no row context needed for the arg.
+        var rows = _db.Execute("SELECT * FROM users WHERE name = UPPER('alice')").Documents;
+        Assert.Single(rows);
+        Assert.Equal("ALICE", rows[0]["name"].AsString);
+    }
+
+    [Fact]
+    public void Sql_Function_Length_InWhere()
+    {
+        _db.Insert("users", """{"code":"AB"}""");
+        _db.Insert("users", """{"code":"ABCD"}""");
+        _db.Insert("users", """{"code":"ABCDEF"}""");
+
+        var rows = _db.Execute("SELECT * FROM users WHERE LENGTH(code) = 4").Documents;
+        Assert.Single(rows);
+        Assert.Equal("ABCD", rows[0]["code"].AsString);
+    }
+
+    [Fact]
+    public void Sql_Function_Trim_InWhere()
+    {
+        _db.Insert("users", """{"name":"  Alice  "}""");
+        _db.Insert("users", """{"name":"Bob"}""");
+
+        var rows = _db.Execute("SELECT * FROM users WHERE TRIM(name) = 'Alice'").Documents;
+        Assert.Single(rows);
+    }
+
+    [Fact]
+    public void Sql_Function_Coalesce_TwoArg_FallsBackOnNullPath()
+    {
+        _db.Insert("users", """{"name":"Alice","nickname":"Ali"}""");
+        _db.Insert("users", """{"name":"Bob"}""");
+        _db.Insert("users", """{"name":"Charlie","nickname":"Chuck"}""");
+
+        // COALESCE(nickname, name) returns the first non-null. The Bob row
+        // has no nickname → falls through to "Bob"; matches.
+        var rows = _db.Execute("SELECT * FROM users WHERE COALESCE(nickname, name) = 'Bob'").Documents;
+        Assert.Single(rows);
+        Assert.Equal("Bob", rows[0]["name"].AsString);
+    }
+
+    [Fact]
+    public void Sql_Function_Ifnull_AliasOfCoalesce()
+    {
+        _db.Insert("users", """{"name":"Alice"}""");
+
+        // IFNULL is the two-arg shorthand many SQL dialects use; here it's
+        // an alias of COALESCE.
+        var rows = _db.Execute("SELECT * FROM users WHERE IFNULL(nickname, name) = 'Alice'").Documents;
+        Assert.Single(rows);
+    }
+
+    [Fact]
+    public void Sql_Function_Newid_InUpdate_StampsFreshId()
+    {
+        var id = _db.Insert("users", """{"name":"Alice"}""");
+
+        // NEWID() in UPDATE SET — a real motivating use case: backfilling a
+        // GUID column without round-tripping a generated value from the client.
+        var r = _db.Execute("UPDATE users SET sessionToken = NEWID() WHERE name = 'Alice'");
+        Assert.True(r.Success, r.Message);
+        Assert.Equal(1, r.AffectedCount);
+
+        var doc = _db.GetCollection("users")!.FindById(id)!;
+        var token = doc["sessionToken"].AsString;
+        Assert.True(Guid.TryParse(token, out _),
+            $"sessionToken should be a parseable GUID, got '{token}'");
+    }
+
+    [Fact]
+    public void Sql_Function_Newid_TwoCallsProduceDifferentValues()
+    {
+        // Each NEWID() call must be a fresh GUID, not constant-folded to the
+        // same value across rows in a single UPDATE.
+        _db.Insert("users", """{"name":"A"}""");
+        _db.Insert("users", """{"name":"B"}""");
+        _db.Insert("users", """{"name":"C"}""");
+
+        _db.Execute("UPDATE users SET token = NEWID()");
+
+        var tokens = _db.Execute("SELECT * FROM users").Documents
+            .Select(d => d["token"].AsString)
+            .ToList();
+        Assert.Equal(3, tokens.Count);
+        Assert.Equal(3, tokens.Distinct().Count());
+    }
+
+    [Fact]
+    public void Sql_Function_Now_InUpdate_StampsServerTimestamp()
+    {
+        _db.Insert("orders", """{"status":"pending"}""");
+
+        var before = DateTime.UtcNow.AddSeconds(-2);
+        _db.Execute("UPDATE orders SET updatedAt = NOW() WHERE status = 'pending'");
+        var after = DateTime.UtcNow.AddSeconds(2);
+
+        var doc = _db.Execute("SELECT * FROM orders").Documents[0];
+        var stamped = doc["updatedAt"].AsDateTime;
+        Assert.InRange(stamped.UtcDateTime, before, after);
+    }
+
+    [Fact]
+    public void Sql_Function_Getdate_AliasOfNow()
+    {
+        // SQL Server's GETDATE() and ANSI NOW() share an implementation here.
+        _db.Insert("orders", """{"status":"new"}""");
+        _db.Execute("UPDATE orders SET createdAt = GETDATE() WHERE status = 'new'");
+        var stamped = _db.Execute("SELECT * FROM orders").Documents[0]["createdAt"].AsDateTime;
+        Assert.True(stamped.UtcDateTime > DateTime.UtcNow.AddMinutes(-1));
+    }
+
+    [Fact]
+    public void Sql_Function_CurrentTimestamp_AliasOfNow()
+    {
+        _db.Insert("orders", """{"status":"new"}""");
+        _db.Execute("UPDATE orders SET createdAt = CURRENT_TIMESTAMP() WHERE status = 'new'");
+        var stamped = _db.Execute("SELECT * FROM orders").Documents[0]["createdAt"].AsDateTime;
+        Assert.True(stamped.UtcDateTime > DateTime.UtcNow.AddMinutes(-1));
+    }
+
+    [Fact]
+    public void Sql_Function_Lower_InUpdate_NormalisesPathArg()
+    {
+        // SET name = LOWER(name) — function reads the OLD doc value, not the
+        // half-built newDoc. Matters because we update the same field we're
+        // reading from.
+        var id = _db.Insert("users", """{"name":"ALICE"}""");
+
+        var r = _db.Execute("UPDATE users SET name = LOWER(name)");
+        Assert.True(r.Success, r.Message);
+        Assert.Equal(1, r.AffectedCount);
+
+        var doc = _db.GetCollection("users")!.FindById(id)!;
+        Assert.Equal("alice", doc["name"].AsString);
+    }
+
+    [Fact]
+    public void Sql_Function_Coalesce_InUpdate_FillsMissingField()
+    {
+        _db.Insert("users", """{"name":"Alice"}""");
+        _db.Insert("users", """{"name":"Bob","displayName":"Bobby"}""");
+
+        // SET displayName = COALESCE(displayName, name): Alice gets her name
+        // copied (no displayName); Bob keeps Bobby (already set).
+        _db.Execute("UPDATE users SET displayName = COALESCE(displayName, name)");
+
+        var rows = _db.Execute("SELECT * FROM users").Documents;
+        var alice = rows.First(d => d["name"].AsString == "Alice");
+        var bob = rows.First(d => d["name"].AsString == "Bob");
+        Assert.Equal("Alice", alice["displayName"].AsString);
+        Assert.Equal("Bobby", bob["displayName"].AsString);
+    }
+
+    [Fact]
+    public void Sql_Function_Unknown_FailsCleanly()
+    {
+        _db.Insert("users", """{"name":"Alice"}""");
+        // Typo on the function name surfaces as a clear error rather than a
+        // mysterious zero-row result.
+        var r = _db.Execute("SELECT * FROM users WHERE NWID() = 'x'");
+        Assert.False(r.Success);
+        Assert.Contains("NWID", r.Message ?? "", StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public void Sql_Function_WrongArity_FailsCleanly()
+    {
+        _db.Insert("users", """{"name":"Alice"}""");
+        var r = _db.Execute("SELECT * FROM users WHERE LOWER() = 'alice'");
+        Assert.False(r.Success);
+    }
+
     public void Dispose()
     {
         // Test fixtures occasionally call _db.Dispose() themselves (e.g. lock

@@ -25,6 +25,11 @@ public enum TokenType
     Identifier, StringLiteral, NumberLiteral,
     JsonLiteral,
 
+    // Synthetic — used by the parser to flag a comparison/SET value slot that
+    // holds a ValueExpression (literal/path/function-call composition) rather
+    // than a primitive literal. Never produced by the lexer.
+    ValueExpression,
+
     // Special
     Eof
 }
