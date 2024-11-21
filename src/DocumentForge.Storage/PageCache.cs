@@ -22,6 +22,15 @@ public interface IPreFlushHook
 {
     void OnBeforeFlush(PageId pageId, byte[] pageData);
     void OnAfterFlushComplete(); // called after all dirty pages written to data file
+
+    /// <summary>
+    /// Force the recovery log to fsync without truncating it. Called by Evict
+    /// after an unscheduled mid-cache page write so the WAL is durable even
+    /// if the data-file write only made it into the OS buffer (crashed before
+    /// the next FlushAll). Issue #24 parts 2-3 — pre-fix evictions could lose
+    /// committed pages on power loss.
+    /// </summary>
+    void EnsureLogDurable();
 }
 
 public sealed class PageCache : IPageCache
@@ -152,8 +161,15 @@ public sealed class PageCache : IPageCache
             {
                 if (entry.IsDirty)
                 {
+                    // Issue #24 parts 2-3: fsync the WAL after the data-file
+                    // write so a crash before the next FlushAll doesn't lose
+                    // the page. The data-file write itself is unfsynced
+                    // (intentional — that's still amortised at FlushAll
+                    // time), but the WAL holds the canonical bytes and
+                    // recovery-log replay on next Open puts them on disk.
                     _preFlushHook?.OnBeforeFlush(pageId, entry.Data);
                     _dataFile.WritePage(pageId, entry.Data);
+                    _preFlushHook?.EnsureLogDurable();
                 }
                 _lruList.Remove(entry.LruNode);
                 _entries.Remove(pageId.Value);
@@ -171,8 +187,10 @@ public sealed class PageCache : IPageCache
         {
             if (entry.IsDirty)
             {
+                // Same WAL-fsync discipline as Evict — see comment there.
                 _preFlushHook?.OnBeforeFlush(new PageId(pageId), entry.Data);
                 _dataFile.WritePage(new PageId(pageId), entry.Data);
+                _preFlushHook?.EnsureLogDurable();
             }
             _entries.Remove(pageId);
         }

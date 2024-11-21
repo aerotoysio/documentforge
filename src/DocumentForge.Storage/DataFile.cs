@@ -136,6 +136,14 @@ public sealed class DataFile : IDataFile
             BitConverter.TryWriteBytes(countBytes, _pageCount);
             _stream.Write(countBytes, 0, 4);
 
+            // Issue #24 part 3: fsync the file extension + header update
+            // together. Pre-fix a crash between this method returning and
+            // the next FlushAll could leave the file at the new size with
+            // garbage bytes (or vice versa: header thinks N pages exist but
+            // file is shorter). Page allocation is rare enough that one
+            // fsync per call is unmeasurable in any realistic workload.
+            _stream.Flush(true);
+
             return newPageId;
         }
     }
