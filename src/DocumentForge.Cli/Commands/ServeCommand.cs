@@ -722,14 +722,30 @@ public static class ServeCommand
     private static void MapAdminEndpoints(WebApplication app, DocumentForgeDb db, NodeConfig config)
     {
         // Liveness + identity
-        app.MapGet("/health", () => Results.Ok(new
+        app.MapGet("/health", () =>
         {
-            status = "ok",
-            node = config.NodeName,
-            version = "0.1.0",
-            readOnly = db.IsReadOnly,
-            uptimeSeconds = Math.Round((DateTime.UtcNow - _startedAt).TotalSeconds, 1)
-        }));
+            // Issue #25: surface engine-wide health status. A Failed engine
+            // returns 503 so load balancers / orchestrators (Render, k8s,
+            // Docker HEALTHCHECK) take it out of rotation while the operator
+            // restarts it (which runs recovery-log replay).
+            bool healthy = db.HealthStatus == DocumentForge.Core.DatabaseHealthStatus.Healthy;
+            var body = new
+            {
+                status = healthy ? "ok" : "degraded",
+                node = config.NodeName,
+                version = "0.1.0",
+                readOnly = db.IsReadOnly,
+                uptimeSeconds = Math.Round((DateTime.UtcNow - _startedAt).TotalSeconds, 1),
+                health = healthy ? null : new
+                {
+                    state = db.HealthStatus.ToString(),
+                    lastFailure = db.LastHealthFailure?.Message,
+                },
+            };
+            return healthy
+                ? Results.Ok(body)
+                : Results.Json(body, statusCode: StatusCodes.Status503ServiceUnavailable);
+        });
 
         // Build-identification info — returns the SHA, build timestamp, and
         // (when running in a container) the image identifier so deploy

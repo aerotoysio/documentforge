@@ -40,6 +40,34 @@ public class TransactionException : DocumentForgeException
 }
 
 /// <summary>
+/// Engine-wide health state. <see cref="Healthy"/> is the normal mode.
+/// <see cref="Failed"/> means a prior write hit an IOException (full disk,
+/// transient I/O error, networked-filesystem hiccup) and the on-disk state
+/// may be inconsistent in a way the engine can't safely continue past.
+/// New writes throw <see cref="DatabaseHealthException"/>; the only recovery
+/// is Dispose + Open, which runs the recovery-log replay and resets state.
+/// Issue #25.
+/// </summary>
+public enum DatabaseHealthStatus
+{
+    Healthy,
+    Failed,
+}
+
+/// <summary>
+/// Thrown when a write is attempted against an engine that's flipped to
+/// <see cref="DatabaseHealthStatus.Failed"/> by an earlier IOException.
+/// Failing fast prevents the engine from continuing into a corrupted state;
+/// the caller should Dispose and Open fresh, which lets the recovery log
+/// repair anything torn.
+/// </summary>
+public class DatabaseHealthException : DocumentForgeException
+{
+    public DatabaseHealthException(string message) : base(message) { }
+    public DatabaseHealthException(string message, Exception inner) : base(message, inner) { }
+}
+
+/// <summary>
 /// Thrown by <c>ReplaceIfEtag</c> when the document's stored <c>_etag</c>
 /// doesn't match the value the caller asserted. The HTTP layer turns this
 /// into a 412 Precondition Failed (issue #18 — optimistic concurrency).

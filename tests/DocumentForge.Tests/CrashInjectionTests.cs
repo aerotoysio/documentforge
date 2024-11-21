@@ -1,6 +1,7 @@
 using DocumentForge.Core;
 using DocumentForge.Engine;
 using DocumentForge.Storage;
+using DocumentForge.Document;
 using Xunit;
 
 namespace DocumentForge.Tests;
@@ -202,6 +203,120 @@ public sealed class CrashInjectionTests
             using var reopened = DocumentForgeDb.Open(path);
             var r = reopened.Execute("SELECT * FROM orders");
             Assert.True(r.Success, $"Reopen failed to query after tx fault: {r.Message}");
+        }
+        finally { Cleanup(path); }
+    }
+
+    // --- Issue #25: fail-fast on storage I/O failure ---
+
+    [Fact]
+    public void HealthStatus_FlipsToFailed_AfterIOExceptionDuringFlush()
+    {
+        // Pre-fix the IOException out of FlushAll just propagated through
+        // Insert/Replace/Execute and the engine kept accepting more writes
+        // against a possibly-corrupt cache. Now: any IOException flips
+        // HealthStatus to Failed and subsequent writes throw
+        // DatabaseHealthException up front.
+        var path = FreshPath("healthflip");
+        try
+        {
+            using var underlying = OpenOrCreateDataFile(path);
+            var faulty = new FaultyDataFile(underlying) { ThrowOnNextFlush = true };
+            using var db = DocumentForgeDb.OpenWithDataFile(path, faulty);
+
+            db.Insert("orders", """{"pnr":"X"}""");
+            Assert.Equal(DatabaseHealthStatus.Healthy, db.HealthStatus);
+
+            // Flush throws — the IOException flips _health to Failed.
+            Assert.Throws<IOException>(() => db.Flush());
+            Assert.Equal(DatabaseHealthStatus.Failed, db.HealthStatus);
+            Assert.NotNull(db.LastHealthFailure);
+        }
+        finally { Cleanup(path); }
+    }
+
+    [Fact]
+    public void Writes_AreRejected_WhileHealthStatusIsFailed()
+    {
+        // Once Failed, every subsequent write API must throw immediately
+        // with DatabaseHealthException — not silently retry into a
+        // possibly-corrupt cache. Insert, Execute("INSERT..."), Replace,
+        // ReplaceIfEtag all share the EnsureHealthy guard.
+        var path = FreshPath("rejectfailed");
+        try
+        {
+            using var underlying = OpenOrCreateDataFile(path);
+            var faulty = new FaultyDataFile(underlying) { ThrowOnNextFlush = true };
+            using var db = DocumentForgeDb.OpenWithDataFile(path, faulty);
+
+            var id = db.Insert("orders", """{"pnr":"X"}""");
+            try { db.Flush(); } catch (IOException) { /* expected — flips to Failed */ }
+            Assert.Equal(DatabaseHealthStatus.Failed, db.HealthStatus);
+
+            Assert.Throws<DatabaseHealthException>(() =>
+                db.Insert("orders", """{"pnr":"Y"}"""));
+            Assert.Throws<DatabaseHealthException>(() =>
+                db.Replace("orders", id, """{"pnr":"Z"}"""));
+            Assert.Throws<DatabaseHealthException>(() =>
+                db.Execute("INSERT INTO orders (pnr) VALUES ('W')"));
+        }
+        finally { Cleanup(path); }
+    }
+
+    [Fact]
+    public void ReadsStillWork_WhileHealthStatusIsFailed()
+    {
+        // Reads don't touch storage in a way that risks the failure mode —
+        // they return whatever's in cache. The contract is "writes fail,
+        // reads degrade to last-known". Useful so admin UIs can still
+        // diagnose what's there before the operator restarts.
+        var path = FreshPath("readsdegrade");
+        try
+        {
+            using var underlying = OpenOrCreateDataFile(path);
+            var faulty = new FaultyDataFile(underlying) { ThrowOnNextFlush = true };
+            using var db = DocumentForgeDb.OpenWithDataFile(path, faulty);
+
+            db.Insert("orders", """{"pnr":"X"}""");
+            try { db.Flush(); } catch (IOException) { /* expected */ }
+
+            // Read should still work — the in-cache state is still readable.
+            var rows = db.Execute("SELECT * FROM orders").Documents;
+            Assert.Single(rows);
+            Assert.Equal("X", rows[0]["pnr"].AsString);
+        }
+        finally { Cleanup(path); }
+    }
+
+    [Fact]
+    public void DisposeAndReopen_RecoversFromFailedState()
+    {
+        // The documented escape hatch: Dispose + Open replays the recovery
+        // log and re-establishes a Healthy engine. The process can keep
+        // running without restarting itself.
+        var path = FreshPath("recoverhealth");
+        try
+        {
+            using (var underlying = OpenOrCreateDataFile(path))
+            {
+                var faulty = new FaultyDataFile(underlying) { ThrowOnNextFlush = true };
+                using var db = DocumentForgeDb.OpenWithDataFile(path, faulty);
+                db.Insert("orders", """{"pnr":"X"}""");
+                try { db.Flush(); } catch (IOException) { /* expected */ }
+                Assert.Equal(DatabaseHealthStatus.Failed, db.HealthStatus);
+                // db disposes — the wrapper returns IOException out of Dispose
+                // which we catch in the using → swallowed by the outer using
+                // since the engine's Dispose now defers + re-throws.
+                try { db.Dispose(); } catch (IOException) { /* expected */ }
+            }
+
+            using var reopened = DocumentForgeDb.Open(path);
+            Assert.Equal(DatabaseHealthStatus.Healthy, reopened.HealthStatus);
+            // Smoke: writes work again. The pre-fault Insert may or may not
+            // have made it depending on whether the recovery log captured it;
+            // what we ENFORCE is that the engine is functional.
+            reopened.Insert("orders", """{"pnr":"AFTER"}""");
+            Assert.True(reopened.Execute("SELECT * FROM orders").Documents.Count >= 1);
         }
         finally { Cleanup(path); }
     }
