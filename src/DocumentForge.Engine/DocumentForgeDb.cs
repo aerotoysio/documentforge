@@ -960,46 +960,108 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     {
         ValidateUniqueIndexesForTx(tx);
 
-        foreach (var (collectionName, ws) in tx.WorkingSets)
+        // Issue #23: snapshot every doc we touch so a non-uniqueness failure
+        // mid-Apply (IOException, an unexpected throw from Collection.Insert,
+        // etc.) can be reverse-applied. Without this the partial state stays
+        // committed and the caller has no clean way to recover short of
+        // Dispose+Open. Best-effort by design: if the reverse itself throws
+        // (engine probably already in Failed state via #25), we re-throw the
+        // original error and let the caller see both.
+        var applied = new List<AppliedOp>();
+
+        try
         {
-            var collection = _catalog.GetCollection(collectionName);
-            if (collection is null)
+            foreach (var (collectionName, ws) in tx.WorkingSets)
             {
-                // Pure-insert case: collection doesn't exist yet. Create it.
-                if (ws.Inserts.Count == 0 && ws.Replaces.Count == 0 && ws.Deletes.Count == 0)
-                    continue;
-                collection = _catalog.GetOrCreateCollection(collectionName);
-            }
+                var collection = _catalog.GetCollection(collectionName);
+                if (collection is null)
+                {
+                    // Pure-insert case: collection doesn't exist yet. Create it.
+                    if (ws.Inserts.Count == 0 && ws.Replaces.Count == 0 && ws.Deletes.Count == 0)
+                        continue;
+                    collection = _catalog.GetOrCreateCollection(collectionName);
+                }
 
-            // 1. Deletes
-            foreach (var id in ws.Deletes)
-            {
-                var doc = collection.FindById(id);
-                if (doc is null) continue; // raced; nothing to undo
-                if (collection.Delete(id))
-                    _indexManager.OnDocumentDeleted(collectionName, id, doc);
-            }
+                // 1. Deletes
+                foreach (var id in ws.Deletes)
+                {
+                    var doc = collection.FindById(id);
+                    if (doc is null) continue; // raced; nothing to undo
+                    if (collection.Delete(id))
+                    {
+                        _indexManager.OnDocumentDeleted(collectionName, id, doc);
+                        applied.Add(new AppliedOp(collectionName, AppliedOpKind.Delete, id, doc, null));
+                    }
+                }
 
-            // 2. Replaces
-            foreach (var (id, newDoc) in ws.Replaces)
-            {
-                var oldDoc = collection.FindById(id);
-                if (oldDoc is null) continue;
-                newDoc["_id"] = oldDoc["_id"];
-                _indexManager.OnDocumentUpdated(collectionName, id, oldDoc, newDoc);
-                collection.Update(id, newDoc);
-            }
+                // 2. Replaces
+                foreach (var (id, newDoc) in ws.Replaces)
+                {
+                    var oldDoc = collection.FindById(id);
+                    if (oldDoc is null) continue;
+                    newDoc["_id"] = oldDoc["_id"];
+                    _indexManager.OnDocumentUpdated(collectionName, id, oldDoc, newDoc);
+                    collection.Update(id, newDoc);
+                    applied.Add(new AppliedOp(collectionName, AppliedOpKind.Replace, id, oldDoc, newDoc));
+                }
 
-            // 3. Inserts. Uniqueness was pre-validated for the whole batch;
-            // ValidateUniqueInsert runs again here as a defence-in-depth check
-            // since collection.Insert is shared with non-txn paths and we'd
-            // rather throw than silently corrupt.
-            foreach (var (_, doc) in ws.Inserts)
-            {
-                _indexManager.ValidateUniqueInsert(collectionName, doc);
-                var newId = collection.Insert(doc);
-                _indexManager.OnDocumentInserted(collectionName, newId, doc);
+                // 3. Inserts. Uniqueness was pre-validated for the whole batch;
+                // ValidateUniqueInsert runs again here as a defence-in-depth check
+                // since collection.Insert is shared with non-txn paths and we'd
+                // rather throw than silently corrupt.
+                foreach (var (_, doc) in ws.Inserts)
+                {
+                    _indexManager.ValidateUniqueInsert(collectionName, doc);
+                    var newId = collection.Insert(doc);
+                    _indexManager.OnDocumentInserted(collectionName, newId, doc);
+                    applied.Add(new AppliedOp(collectionName, AppliedOpKind.Insert, newId, null, doc));
+                }
             }
+        }
+        catch
+        {
+            // Best-effort reverse-apply in REVERSE order. Each reverse step is
+            // independently try/catch'd so one failure doesn't prevent the
+            // others from running. If everything reverses cleanly the engine
+            // is back at the pre-tx state. If any reverse throws (e.g.
+            // IOException — engine already Failed via #25), the partial state
+            // remains; the caller sees the original throw and knows to
+            // Dispose+Open for proper recovery.
+            //
+            // NOTE: this does NOT survive a process crash mid-Apply — true
+            // crash atomicity needs a tx commit log (TODO file as Phase 3).
+            // Within a running process, this is the difference between
+            // "atomicity at the BsonDoc level" and "no atomicity at all".
+            for (int i = applied.Count - 1; i >= 0; i--)
+            {
+                var op = applied[i];
+                try
+                {
+                    var collection = _catalog.GetCollection(op.Collection);
+                    if (collection is null) continue;
+                    switch (op.Kind)
+                    {
+                        case AppliedOpKind.Delete:
+                            // Re-insert the doc we deleted; Collection.Insert
+                            // preserves the existing _id via EnsureId().
+                            collection.Insert(op.OldDoc!);
+                            _indexManager.OnDocumentInserted(op.Collection, op.Id, op.OldDoc!);
+                            break;
+                        case AppliedOpKind.Replace:
+                            // Restore the old doc body.
+                            _indexManager.OnDocumentUpdated(op.Collection, op.Id, op.NewDoc!, op.OldDoc!);
+                            collection.Update(op.Id, op.OldDoc!);
+                            break;
+                        case AppliedOpKind.Insert:
+                            // Delete the doc we inserted.
+                            if (collection.Delete(op.Id))
+                                _indexManager.OnDocumentDeleted(op.Collection, op.Id, op.NewDoc!);
+                            break;
+                    }
+                }
+                catch { /* best effort; on failure rest of reverse continues */ }
+            }
+            throw;
         }
 
         // Replicate as individual ops for now; logical-replication follower
@@ -1031,6 +1093,22 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             }
         }
     }
+
+    /// <summary>
+    /// One step of work that <see cref="ApplyTransactionLocked"/> already
+    /// applied; recorded so a subsequent failure can reverse it. Replace
+    /// carries both old and new bodies; Delete carries only the old body
+    /// (so we can re-insert it); Insert carries only the new body (so we
+    /// can re-derive index entries to remove). Issue #23.
+    /// </summary>
+    private enum AppliedOpKind { Insert, Replace, Delete }
+
+    private sealed record AppliedOp(
+        string Collection,
+        AppliedOpKind Kind,
+        DocumentId Id,
+        BsonDocument? OldDoc,
+        BsonDocument? NewDoc);
 
     /// <summary>
     /// Pre-flight check that every unique index in every touched collection
