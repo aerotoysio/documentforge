@@ -3082,6 +3082,92 @@ public class EngineTests : IDisposable
         Assert.Equal(3, _db.GetCollection("users")!.FindById(id)!["v"].AsInt32);
     }
 
+    // --- JOIN extensions: LEFT / RIGHT / CROSS (issue #17 Phase A) ---
+
+    [Fact]
+    public void Sql_LeftJoin_NullPadsMissingRightSide()
+    {
+        // Two users; only one has an order. LEFT JOIN must emit BOTH users —
+        // the one without orders comes back with the orders side null-padded.
+        // Pre-#17 this was inexpressible (parser only knew JOIN = INNER).
+        _db.Insert("users", """{"id":"u1","name":"Alice"}""");
+        _db.Insert("users", """{"id":"u2","name":"Bob"}""");
+        _db.Insert("orders", """{"userId":"u1","pnr":"ABC"}""");
+
+        var rows = _db.Execute(
+            "SELECT * FROM users LEFT JOIN orders ON users.id = orders.userId").Documents;
+        Assert.Equal(2, rows.Count);
+
+        // Result docs nest under the source-collection name. Every row has
+        // a `users` block; only Alice's row has a non-empty `orders` block.
+        var alice = rows.First(d => d["users"].AsDocument["name"].AsString == "Alice");
+        var bob = rows.First(d => d["users"].AsDocument["name"].AsString == "Bob");
+        Assert.Equal("ABC", alice["orders"].AsDocument["pnr"].AsString);
+        // Bob's orders side is the null-pad — empty doc.
+        Assert.Equal(0, bob["orders"].AsDocument.Count);
+    }
+
+    [Fact]
+    public void Sql_LeftOuterJoin_AcceptsTheOuterKeyword()
+    {
+        // SQL-92 sugar: `LEFT OUTER JOIN` is a strict synonym for `LEFT JOIN`.
+        _db.Insert("users", """{"id":"u1","name":"Alice"}""");
+        var rows = _db.Execute(
+            "SELECT * FROM users LEFT OUTER JOIN orders ON users.id = orders.userId").Documents;
+        Assert.Single(rows);
+    }
+
+    [Fact]
+    public void Sql_RightJoin_NullPadsMissingLeftSide()
+    {
+        // Two orders; only one has a matching user. RIGHT JOIN emits BOTH
+        // orders — the unmatched one comes back with the users side null.
+        _db.Insert("users", """{"id":"u1","name":"Alice"}""");
+        _db.Insert("orders", """{"userId":"u1","pnr":"ABC"}""");
+        _db.Insert("orders", """{"userId":"u99","pnr":"XYZ"}""");
+
+        var rows = _db.Execute(
+            "SELECT * FROM users RIGHT JOIN orders ON users.id = orders.userId").Documents;
+        Assert.Equal(2, rows.Count);
+
+        var matched = rows.First(d => d["orders"].AsDocument["pnr"].AsString == "ABC");
+        var unmatched = rows.First(d => d["orders"].AsDocument["pnr"].AsString == "XYZ");
+        Assert.Equal("Alice", matched["users"].AsDocument["name"].AsString);
+        Assert.Equal(0, unmatched["users"].AsDocument.Count);
+    }
+
+    [Fact]
+    public void Sql_CrossJoin_ProducesCartesianProduct()
+    {
+        // No ON clause — every left × every right.
+        _db.Insert("colors", """{"name":"red"}""");
+        _db.Insert("colors", """{"name":"blue"}""");
+        _db.Insert("sizes", """{"label":"S"}""");
+        _db.Insert("sizes", """{"label":"M"}""");
+        _db.Insert("sizes", """{"label":"L"}""");
+
+        var r = _db.Execute("SELECT * FROM colors CROSS JOIN sizes");
+        Assert.True(r.Success, r.Message);
+        Assert.Equal(2 * 3, r.Documents.Count);
+        Assert.Contains("CROSS_JOIN", r.QueryPlan);
+    }
+
+    [Fact]
+    public void Sql_InnerJoin_BackwardsCompatibleWithBareJoinKeyword()
+    {
+        // The pre-#17 form `JOIN` (no qualifier) must continue to behave
+        // exactly as it did. Same dataset as the LEFT test above; INNER
+        // returns ONLY Alice (Bob has no order).
+        _db.Insert("users", """{"id":"u1","name":"Alice"}""");
+        _db.Insert("users", """{"id":"u2","name":"Bob"}""");
+        _db.Insert("orders", """{"userId":"u1","pnr":"ABC"}""");
+
+        var rows = _db.Execute(
+            "SELECT * FROM users JOIN orders ON users.id = orders.userId").Documents;
+        Assert.Single(rows);
+        Assert.Equal("Alice", rows[0]["users"].AsDocument["name"].AsString);
+    }
+
     public void Dispose()
     {
         // Test fixtures occasionally call _db.Dispose() themselves (e.g. lock

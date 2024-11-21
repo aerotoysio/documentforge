@@ -29,6 +29,13 @@ public sealed class AggregateField
     public string Alias { get; set; } = ""; // output key in result
 }
 
+/// <summary>
+/// Join algebra. <see cref="Inner"/> emits only matched pairs; <see cref="Left"/>
+/// and <see cref="Right"/> null-pad the unmatched side; <see cref="Cross"/> is the
+/// cartesian product (no ON clause). Issue #17 Phase A.
+/// </summary>
+public enum JoinType { Inner, Left, Right, Cross }
+
 public sealed class JoinClause
 {
     public string Collection { get; set; } = "";
@@ -38,6 +45,11 @@ public sealed class JoinClause
     public string LeftCollection { get; set; } = "";
     public string RightPath { get; set; } = "";
     public string RightCollection { get; set; } = "";
+
+    /// <summary>Inner by default — preserves the pre-#17 behaviour for callers
+    /// that just write <c>JOIN</c>. CROSS is the only type that doesn't carry
+    /// LeftPath/RightPath (no ON clause).</summary>
+    public JoinType Type { get; set; } = JoinType.Inner;
 }
 
 public sealed class InsertStatement : Statement

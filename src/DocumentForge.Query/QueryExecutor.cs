@@ -471,9 +471,28 @@ public sealed class QueryExecutor
     private (List<BsonDocument> docs, string plan) ExecuteHashJoin(SelectStatement stmt, List<BsonDocument> outerDocs)
     {
         var join = stmt.Join!;
+
+        // CROSS JOIN bypasses the hash-join apparatus entirely — it's a
+        // pure cartesian product with no key extraction or null padding.
+        if (join.Type == JoinType.Cross)
+            return ExecuteCrossJoin(stmt, outerDocs);
+
         var joinCollection = _catalog.GetCollection(join.Collection);
         if (joinCollection is null)
-            return (new List<BsonDocument>(), $"HASH_JOIN({join.Collection}:missing)");
+        {
+            // INNER / RIGHT against a missing inner: nothing to emit.
+            // LEFT against a missing inner: every outer row, null-padded.
+            // (The collection genuinely doesn't exist — different from
+            // existing-but-empty, which the regular path handles.)
+            if (join.Type == JoinType.Left)
+            {
+                var leftPadded = outerDocs
+                    .Select(o => CombineDocuments(o, EmptyDoc, stmt.Collection, join.Collection))
+                    .ToList();
+                return (leftPadded, $"HASH_LEFT_JOIN({join.Collection}:missing)");
+            }
+            return (new List<BsonDocument>(), $"{JoinPlanLabel(join.Type)}({join.Collection}:missing)");
+        }
 
         // Determine which side is the outer (the one we already have) vs inner (the one we need to look up)
         bool outerIsLeft = string.Equals(join.LeftCollection, stmt.Collection, StringComparison.OrdinalIgnoreCase);
@@ -491,32 +510,93 @@ public sealed class QueryExecutor
             // We have an index - use it to build the hash map faster (or look up on-demand)
             // For now, just build a full hash map from the collection (simpler)
             innerMap = BuildHashMap(joinCollection, innerPath);
-            joinStrategy = $"HASH_JOIN(using idx:{innerIndex.Definition.Name})";
+            joinStrategy = $"{JoinPlanLabel(join.Type)}(using idx:{innerIndex.Definition.Name})";
         }
         else
         {
             innerMap = BuildHashMap(joinCollection, innerPath);
-            joinStrategy = $"HASH_JOIN({join.Collection})";
+            joinStrategy = $"{JoinPlanLabel(join.Type)}({join.Collection})";
         }
 
-        // For each outer doc, look up matching inner docs and combine
+        // Phase A semantics:
+        //   INNER  — emit only matched pairs (pre-#17 behaviour).
+        //   LEFT   — emit every outer; null-pad if no inner match.
+        //   RIGHT  — emit every inner; null-pad if no outer match. To do this
+        //            cheaply we track which inner docs were matched as we
+        //            walk the outer side, then sweep the unmatched at the end.
         var results = new List<BsonDocument>();
+        HashSet<BsonDocument>? matchedInner = join.Type == JoinType.Right
+            ? new HashSet<BsonDocument>(ReferenceEqualityComparer.Instance)
+            : null;
+
         foreach (var outerDoc in outerDocs)
         {
             var outerKey = JsonPathExtractor.Extract(outerDoc, outerPath);
-            if (outerKey.IsNull) continue;
+            if (outerKey.IsNull)
+            {
+                // Null outer key never matches. LEFT still emits the outer
+                // with null-padded inner; INNER and RIGHT skip.
+                if (join.Type == JoinType.Left)
+                    results.Add(CombineDocuments(outerDoc, EmptyDoc, stmt.Collection, join.Collection));
+                continue;
+            }
 
             if (innerMap.TryGetValue(outerKey, out var matches))
             {
                 foreach (var innerDoc in matches)
                 {
                     results.Add(CombineDocuments(outerDoc, innerDoc, stmt.Collection, join.Collection));
+                    matchedInner?.Add(innerDoc);
                 }
             }
+            else if (join.Type == JoinType.Left)
+            {
+                // LEFT: emit the outer with no inner.
+                results.Add(CombineDocuments(outerDoc, EmptyDoc, stmt.Collection, join.Collection));
+            }
+        }
+
+        if (join.Type == JoinType.Right)
+        {
+            // Sweep unmatched inner rows and null-pad the outer side.
+            foreach (var innerDocs in innerMap.Values)
+                foreach (var innerDoc in innerDocs)
+                    if (!matchedInner!.Contains(innerDoc))
+                        results.Add(CombineDocuments(EmptyDoc, innerDoc, stmt.Collection, join.Collection));
         }
 
         return (results, joinStrategy);
     }
+
+    private (List<BsonDocument> docs, string plan) ExecuteCrossJoin(SelectStatement stmt, List<BsonDocument> outerDocs)
+    {
+        var join = stmt.Join!;
+        var joinCollection = _catalog.GetCollection(join.Collection);
+        if (joinCollection is null)
+            return (new List<BsonDocument>(), $"CROSS_JOIN({join.Collection}:missing)");
+
+        var innerDocs = joinCollection.FindAll().ToList();
+        var results = new List<BsonDocument>(outerDocs.Count * innerDocs.Count);
+        foreach (var outer in outerDocs)
+            foreach (var inner in innerDocs)
+                results.Add(CombineDocuments(outer, inner, stmt.Collection, join.Collection));
+
+        return (results, $"CROSS_JOIN({join.Collection})");
+    }
+
+    /// <summary>Reused as the null-padded side in LEFT/RIGHT joins. A single
+    /// shared empty doc is fine because <see cref="CombineDocuments"/> only
+    /// reads from it and the result is a fresh document.</summary>
+    private static readonly BsonDocument EmptyDoc = new();
+
+    private static string JoinPlanLabel(JoinType t) => t switch
+    {
+        JoinType.Inner => "HASH_JOIN",
+        JoinType.Left => "HASH_LEFT_JOIN",
+        JoinType.Right => "HASH_RIGHT_JOIN",
+        JoinType.Cross => "CROSS_JOIN",
+        _ => "JOIN",
+    };
 
     private static Dictionary<BsonValue, List<BsonDocument>> BuildHashMap(Collection collection, string path)
     {
