@@ -3168,6 +3168,86 @@ public class EngineTests : IDisposable
         Assert.Equal("Alice", rows[0]["users"].AsDocument["name"].AsString);
     }
 
+    // --- JOIN Phase B+C: multi-join chains + compound ON (issue #44) ---
+
+    [Fact]
+    public void Sql_MultiJoin_ChainOfThree()
+    {
+        // a JOIN b ON ... JOIN c ON ...
+        // Pre-#44 the parser exited after the first JOIN; the second one
+        // produced a parse error. Now joins chain left-deep and the
+        // executor walks all of them in source order.
+        _db.Insert("users", """{"id":"u1","name":"Alice"}""");
+        _db.Insert("users", """{"id":"u2","name":"Bob"}""");
+        _db.Insert("orders", """{"userId":"u1","sku":"sku-A"}""");
+        _db.Insert("orders", """{"userId":"u2","sku":"sku-B"}""");
+        _db.Insert("products", """{"sku":"sku-A","name":"Widget"}""");
+        _db.Insert("products", """{"sku":"sku-B","name":"Gadget"}""");
+
+        var r = _db.Execute(
+            "SELECT * FROM users " +
+            "JOIN orders ON users.id = orders.userId " +
+            "JOIN products ON orders.sku = products.sku");
+        Assert.True(r.Success, r.Message);
+        Assert.Equal(2, r.Documents.Count);
+
+        // Each result should carry all three sub-docs (users, orders, products).
+        foreach (var doc in r.Documents)
+        {
+            Assert.True(doc.ContainsKey("users"));
+            Assert.True(doc.ContainsKey("orders"));
+            Assert.True(doc.ContainsKey("products"));
+        }
+    }
+
+    [Fact]
+    public void Sql_CompoundOn_TwoEqualitiesAndedTogether()
+    {
+        // ON a.x = b.x AND a.y = b.y
+        // Composite-key joins are common with surrogate keys and date/version
+        // partitioning. Pre-#44 the parser only accepted a single equality.
+        _db.Insert("orders", """{"region":"US","sku":"A","qty":10}""");
+        _db.Insert("orders", """{"region":"US","sku":"B","qty":5}""");
+        _db.Insert("orders", """{"region":"EU","sku":"A","qty":3}""");
+        _db.Insert("inventory", """{"region":"US","sku":"A","onHand":100}""");
+        _db.Insert("inventory", """{"region":"EU","sku":"A","onHand":50}""");
+        // Note: no inventory row for (US, B) — that order shouldn't match.
+
+        var r = _db.Execute(
+            "SELECT * FROM orders JOIN inventory " +
+            "ON orders.region = inventory.region AND orders.sku = inventory.sku");
+        Assert.True(r.Success, r.Message);
+        Assert.Equal(2, r.Documents.Count);
+
+        // Verify the matched pairs are the right ones.
+        foreach (var doc in r.Documents)
+        {
+            var orderRegion = doc["orders"].AsDocument["region"].AsString;
+            var orderSku = doc["orders"].AsDocument["sku"].AsString;
+            var invRegion = doc["inventory"].AsDocument["region"].AsString;
+            var invSku = doc["inventory"].AsDocument["sku"].AsString;
+            Assert.Equal(orderRegion, invRegion);
+            Assert.Equal(orderSku, invSku);
+        }
+    }
+
+    [Fact]
+    public void Sql_LeftJoin_ChainedAfterInner()
+    {
+        // INNER then LEFT — the LEFT's null-padding should still work after
+        // the chain handed it a combined doc as the outer.
+        _db.Insert("users", """{"id":"u1","name":"Alice"}""");
+        _db.Insert("orders", """{"userId":"u1","sku":"sku-A"}""");
+        // No products at all — LEFT JOIN should null-pad every row.
+        var r = _db.Execute(
+            "SELECT * FROM users " +
+            "JOIN orders ON users.id = orders.userId " +
+            "LEFT JOIN products ON orders.sku = products.sku");
+        Assert.True(r.Success, r.Message);
+        Assert.Single(r.Documents);
+        Assert.Equal(0, r.Documents[0]["products"].AsDocument.Count);
+    }
+
     public void Dispose()
     {
         // Test fixtures occasionally call _db.Dispose() themselves (e.g. lock

@@ -97,12 +97,19 @@ public sealed class QueryExecutor
             plan = "COLLECTION_SCAN";
         }
 
-        // JOIN: combine with another collection using hash join
-        if (stmt.Join is not null)
+        // JOINs: chain left-deep (issue #44 Phase B). The result of each
+        // join feeds the next as the outer side. The "outer collection
+        // name" only matters for the FIRST join's path-prefix splitting;
+        // subsequent joins resolve against the running result set, where
+        // both nested collections are present.
+        if (stmt.Joins.Count > 0)
         {
-            var (joined, joinPlan) = ExecuteHashJoin(stmt, results);
-            results = joined;
-            plan = $"{plan} + {joinPlan}";
+            foreach (var join in stmt.Joins)
+            {
+                var (joined, joinPlan) = ExecuteHashJoin(stmt, join, results);
+                results = joined;
+                plan = $"{plan} + {joinPlan}";
+            }
 
             // Apply WHERE to the combined documents (now that prefixed paths resolve correctly)
             if (stmt.Where is not null)
@@ -468,14 +475,12 @@ public sealed class QueryExecutor
     /// Hash join: build a hash map of the join collection keyed by the ON column,
     /// then for each outer document, look up matches and combine.
     /// </summary>
-    private (List<BsonDocument> docs, string plan) ExecuteHashJoin(SelectStatement stmt, List<BsonDocument> outerDocs)
+    private (List<BsonDocument> docs, string plan) ExecuteHashJoin(SelectStatement stmt, JoinClause join, List<BsonDocument> outerDocs)
     {
-        var join = stmt.Join!;
-
         // CROSS JOIN bypasses the hash-join apparatus entirely — it's a
         // pure cartesian product with no key extraction or null padding.
         if (join.Type == JoinType.Cross)
-            return ExecuteCrossJoin(stmt, outerDocs);
+            return ExecuteCrossJoin(stmt, join, outerDocs);
 
         var joinCollection = _catalog.GetCollection(join.Collection);
         if (joinCollection is null)
@@ -494,28 +499,43 @@ public sealed class QueryExecutor
             return (new List<BsonDocument>(), $"{JoinPlanLabel(join.Type)}({join.Collection}:missing)");
         }
 
-        // Determine which side is the outer (the one we already have) vs inner (the one we need to look up)
-        bool outerIsLeft = string.Equals(join.LeftCollection, stmt.Collection, StringComparison.OrdinalIgnoreCase);
-        string outerPath = outerIsLeft ? join.LeftPath : join.RightPath;
-        string innerPath = outerIsLeft ? join.RightPath : join.LeftPath;
-
-        // Build hash map of inner collection: key (from innerPath) -> list of inner docs
-        // Use index if available for the inner path
-        var innerIndex = _indexManager.FindIndexForPath(join.Collection, innerPath);
-        string joinStrategy;
-        Dictionary<BsonValue, List<BsonDocument>> innerMap;
-
-        if (innerIndex is not null)
+        // For each predicate determine which side resolves against the
+        // outer doc (the running result set) vs the inner (the new
+        // collection being joined in). The outer-side path is taken from
+        // whichever side does NOT match join.Collection — either the
+        // source collection (first join) or a previously-joined collection
+        // (chained — its prefixed path "<coll>.<path>" still resolves on
+        // the combined doc thanks to JsonPathExtractor's dotted-path
+        // support).
+        var preds = join.Predicates.Count > 0 ? join.Predicates : new List<JoinPredicate>
         {
-            // We have an index - use it to build the hash map faster (or look up on-demand)
-            // For now, just build a full hash map from the collection (simpler)
-            innerMap = BuildHashMap(joinCollection, innerPath);
-            joinStrategy = $"{JoinPlanLabel(join.Type)}(using idx:{innerIndex.Definition.Name})";
+            // Back-compat for callers that populated only the legacy single-
+            // predicate fields without going through the parser.
+            new() { LeftCollection = join.LeftCollection, LeftPath = join.LeftPath,
+                    RightCollection = join.RightCollection, RightPath = join.RightPath }
+        };
+        var (outerPaths, innerPaths) = SplitOuterInnerPaths(preds, join.Collection);
+
+        // Build the inner hash map — single-key Dictionary<BsonValue, ...>
+        // for the simple case, multi-key (tuple) for compound ON. Index
+        // hint applies to single-key only; compound queries fall back to
+        // full collection scan today (an "indexed compound join" is its
+        // own much larger feature).
+        Dictionary<object, List<BsonDocument>> innerMap;
+        string joinStrategy;
+        if (innerPaths.Length == 1)
+        {
+            var single = BuildHashMap(joinCollection, innerPaths[0]);
+            innerMap = single.ToDictionary(kvp => (object)kvp.Key, kvp => kvp.Value);
+            var innerIndex = _indexManager.FindIndexForPath(join.Collection, innerPaths[0]);
+            joinStrategy = innerIndex is not null
+                ? $"{JoinPlanLabel(join.Type)}(using idx:{innerIndex.Definition.Name})"
+                : $"{JoinPlanLabel(join.Type)}({join.Collection})";
         }
         else
         {
-            innerMap = BuildHashMap(joinCollection, innerPath);
-            joinStrategy = $"{JoinPlanLabel(join.Type)}({join.Collection})";
+            innerMap = BuildCompositeHashMap(joinCollection, innerPaths);
+            joinStrategy = $"{JoinPlanLabel(join.Type)}({join.Collection}, compound:{innerPaths.Length})";
         }
 
         // Phase A semantics:
@@ -531,11 +551,9 @@ public sealed class QueryExecutor
 
         foreach (var outerDoc in outerDocs)
         {
-            var outerKey = JsonPathExtractor.Extract(outerDoc, outerPath);
-            if (outerKey.IsNull)
+            var outerKey = ExtractKey(outerDoc, outerPaths);
+            if (outerKey is null)
             {
-                // Null outer key never matches. LEFT still emits the outer
-                // with null-padded inner; INNER and RIGHT skip.
                 if (join.Type == JoinType.Left)
                     results.Add(CombineDocuments(outerDoc, EmptyDoc, stmt.Collection, join.Collection));
                 continue;
@@ -551,14 +569,12 @@ public sealed class QueryExecutor
             }
             else if (join.Type == JoinType.Left)
             {
-                // LEFT: emit the outer with no inner.
                 results.Add(CombineDocuments(outerDoc, EmptyDoc, stmt.Collection, join.Collection));
             }
         }
 
         if (join.Type == JoinType.Right)
         {
-            // Sweep unmatched inner rows and null-pad the outer side.
             foreach (var innerDocs in innerMap.Values)
                 foreach (var innerDoc in innerDocs)
                     if (!matchedInner!.Contains(innerDoc))
@@ -568,9 +584,111 @@ public sealed class QueryExecutor
         return (results, joinStrategy);
     }
 
-    private (List<BsonDocument> docs, string plan) ExecuteCrossJoin(SelectStatement stmt, List<BsonDocument> outerDocs)
+    /// <summary>
+    /// Pull the outer-side and inner-side paths out of a predicate list.
+    /// The "inner side" is whichever path's collection matches the join's
+    /// new collection; the "outer side" is the other (could be the source
+    /// collection or a previously-joined one). Returns parallel arrays so
+    /// the caller can extract paired tuples.
+    /// </summary>
+    private static (string[] outerPaths, string[] innerPaths) SplitOuterInnerPaths(
+        List<JoinPredicate> preds, string innerCollection)
     {
-        var join = stmt.Join!;
+        var outers = new string[preds.Count];
+        var inners = new string[preds.Count];
+        for (int i = 0; i < preds.Count; i++)
+        {
+            var p = preds[i];
+            bool rightIsInner = string.Equals(p.RightCollection, innerCollection, StringComparison.OrdinalIgnoreCase);
+            if (rightIsInner)
+            {
+                inners[i] = p.RightPath;
+                // Outer-side path may be prefixed with its collection name
+                // when the doc is a chained-combined doc; we re-attach the
+                // prefix here so JsonPathExtractor.Extract finds it either
+                // way (bare collection docs have the bare path; combined
+                // docs have the prefixed path).
+                outers[i] = string.IsNullOrEmpty(p.LeftCollection)
+                    ? p.LeftPath
+                    : $"{p.LeftCollection}.{p.LeftPath}";
+            }
+            else
+            {
+                inners[i] = p.LeftPath;
+                outers[i] = string.IsNullOrEmpty(p.RightCollection)
+                    ? p.RightPath
+                    : $"{p.RightCollection}.{p.RightPath}";
+            }
+        }
+        return (outers, inners);
+    }
+
+    /// <summary>Resolve a key from a doc using one or more paths. Returns
+    /// null if any single path yields a null value (a NULL component never
+    /// matches in SQL semantics). Single-path returns the BsonValue itself;
+    /// multi-path returns a string tuple key (cheap and equality-correct).
+    ///
+    /// <para>
+    /// Each path may be prefixed (<c>"orders.flightNumber"</c>) for chained
+    /// joins where the doc is combined, or bare (<c>"flightNumber"</c>) for
+    /// the first join's bare outer rows. We try the path as-given first;
+    /// if null, fall back to the suffix after the first dot. That handles
+    /// both shapes cleanly without the executor having to track which
+    /// position in the join chain it's at.
+    /// </para>
+    /// </summary>
+    private static object? ExtractKey(BsonDocument doc, string[] paths)
+    {
+        if (paths.Length == 1)
+            return ExtractOne(doc, paths[0]) ?? (object?)null;
+
+        var parts = new BsonValue[paths.Length];
+        for (int i = 0; i < paths.Length; i++)
+        {
+            var v = ExtractOne(doc, paths[i]);
+            if (v is null) return null;
+            parts[i] = v;
+        }
+        return string.Join("\x1f", parts.Select(p => p.ToString()));
+    }
+
+    private static BsonValue? ExtractOne(BsonDocument doc, string path)
+    {
+        var v = JsonPathExtractor.Extract(doc, path);
+        if (!v.IsNull) return v;
+
+        // Fall back: strip the first dotted segment. Handles "orders.x" on
+        // a bare orders row (where the bare path "x" is what's actually there).
+        int dot = path.IndexOf('.');
+        if (dot > 0 && dot < path.Length - 1)
+        {
+            var bare = path[(dot + 1)..];
+            var v2 = JsonPathExtractor.Extract(doc, bare);
+            if (!v2.IsNull) return v2;
+        }
+        return null;
+    }
+
+    private static Dictionary<object, List<BsonDocument>> BuildCompositeHashMap(
+        Collection collection, string[] paths)
+    {
+        var map = new Dictionary<object, List<BsonDocument>>();
+        foreach (var doc in collection.FindAll())
+        {
+            var key = ExtractKey(doc, paths);
+            if (key is null) continue;
+            if (!map.TryGetValue(key, out var list))
+            {
+                list = new List<BsonDocument>();
+                map[key] = list;
+            }
+            list.Add(doc);
+        }
+        return map;
+    }
+
+    private (List<BsonDocument> docs, string plan) ExecuteCrossJoin(SelectStatement stmt, JoinClause join, List<BsonDocument> outerDocs)
+    {
         var joinCollection = _catalog.GetCollection(join.Collection);
         if (joinCollection is null)
             return (new List<BsonDocument>(), $"CROSS_JOIN({join.Collection}:missing)");
@@ -729,8 +847,23 @@ public sealed class QueryExecutor
     private static BsonDocument CombineDocuments(BsonDocument outerDoc, BsonDocument innerDoc,
         string outerCollection, string innerCollection)
     {
+        // Chained joins (#44 Phase B): the second join's outer is already a
+        // combined doc {a: ..., b: ...} from join #1. We detect this by
+        // checking whether outerDoc already has outerCollection as a field —
+        // if yes, copy its existing fields through (preserving a, b, ...)
+        // and just add the new inner. If no, wrap both as before.
         var combined = new BsonDocument();
-        combined[outerCollection] = BsonValue.FromDocument(outerDoc);
+        if (outerDoc.ContainsKey(outerCollection))
+        {
+            // Already-combined outer: copy each top-level (collection-named)
+            // field through, then add the new inner collection alongside.
+            foreach (var key in outerDoc.Keys)
+                combined[key] = outerDoc[key];
+        }
+        else
+        {
+            combined[outerCollection] = BsonValue.FromDocument(outerDoc);
+        }
         combined[innerCollection] = BsonValue.FromDocument(innerDoc);
         return combined;
     }
