@@ -3248,6 +3248,104 @@ public class EngineTests : IDisposable
         Assert.Equal(0, r.Documents[0]["products"].AsDocument.Count);
     }
 
+    // --- Replication-aware transactions (issue #13) ---
+
+    [Fact]
+    public async System.Threading.Tasks.Task LogicalReplication_MultiDocTx_ReplicatesAsAtomicBatch()
+    {
+        // The whole reason for #13: pre-fix the leader broadcast each
+        // sub-op of a transaction as a separate logical op, so a follower
+        // applying them with separate write locks could be observed in a
+        // mid-tx state by a concurrent reader. Now the leader sends a
+        // single TxBatch op carrying every sub-op, and the follower
+        // applies them all under one write lock — atomic from any
+        // observer's perspective.
+        int port = 5900 + System.Random.Shared.Next(100);
+        var leaderPath = Path.Combine(Path.GetTempPath(), $"txrepleader_{Guid.NewGuid():N}.dfdb");
+        var followerPath = Path.Combine(Path.GetTempPath(), $"txrepfollower_{Guid.NewGuid():N}.dfdb");
+
+        try
+        {
+            using var leader = DocumentForgeDb.Create(leaderPath);
+            leader.StartLogicalReplicationServer(port);
+            await System.Threading.Tasks.Task.Delay(150);
+
+            using var follower = DocumentForgeDb.Create(followerPath);
+            follower.StartLogicalReplicationFollower("localhost", port);
+
+            for (int i = 0; i < 30 && leader.GetLogicalFollowerCount() < 1; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+            Assert.Equal(1, leader.GetLogicalFollowerCount());
+
+            // Run a multi-doc tx: 3 inserts in one transaction. Pre-fix this
+            // would broadcast as 3 separate ops; post-fix as 1 TxBatch.
+            using (var tx = leader.BeginTransaction())
+            {
+                tx.Insert("orders", """{"pnr":"A"}""");
+                tx.Insert("orders", """{"pnr":"B"}""");
+                tx.Insert("orders", """{"pnr":"C"}""");
+                tx.Commit();
+            }
+
+            // Wait for the follower to apply the batch. opsApplied counts
+            // INDIVIDUAL apply calls — pre-fix this would be 3; post-fix
+            // it's 1 (the TxBatch counts as one applied op even though it
+            // contains 3 sub-ops).
+            for (int i = 0; i < 30 && follower.LogicallyReplicatedOps() < 1; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+
+            // The actual data should be there — all 3 docs.
+            var rows = follower.Execute("SELECT * FROM orders").Documents;
+            Assert.Equal(3, rows.Count);
+
+            // Wire-level assertion: follower applied exactly ONE op (the batch),
+            // not three. Pre-fix would have been 3.
+            Assert.Equal(1, follower.LogicallyReplicatedOps());
+        }
+        finally
+        {
+            try { File.Delete(leaderPath); File.Delete(leaderPath + ".wal"); File.Delete(leaderPath + ".recovery"); File.Delete(leaderPath + ".lock"); } catch { }
+            try { File.Delete(followerPath); File.Delete(followerPath + ".wal"); File.Delete(followerPath + ".recovery"); File.Delete(followerPath + ".followerseq"); File.Delete(followerPath + ".lock"); } catch { }
+        }
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task LogicalReplication_NonTxInserts_StillBroadcastIndividually()
+    {
+        // Single-doc operations (non-tx) keep the per-op broadcast — TxBatch
+        // is opt-in via BeginTransaction. Verify a sequence of three plain
+        // db.Insert calls produces three follower ops.
+        int port = 6000 + System.Random.Shared.Next(100);
+        var leaderPath = Path.Combine(Path.GetTempPath(), $"singleleader_{Guid.NewGuid():N}.dfdb");
+        var followerPath = Path.Combine(Path.GetTempPath(), $"singlefollower_{Guid.NewGuid():N}.dfdb");
+
+        try
+        {
+            using var leader = DocumentForgeDb.Create(leaderPath);
+            leader.StartLogicalReplicationServer(port);
+            await System.Threading.Tasks.Task.Delay(150);
+            using var follower = DocumentForgeDb.Create(followerPath);
+            follower.StartLogicalReplicationFollower("localhost", port);
+            for (int i = 0; i < 30 && leader.GetLogicalFollowerCount() < 1; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+
+            leader.Insert("orders", """{"pnr":"X"}""");
+            leader.Insert("orders", """{"pnr":"Y"}""");
+            leader.Insert("orders", """{"pnr":"Z"}""");
+
+            for (int i = 0; i < 30 && follower.LogicallyReplicatedOps() < 3; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+
+            Assert.Equal(3, follower.Execute("SELECT * FROM orders").Documents.Count);
+            Assert.Equal(3, follower.LogicallyReplicatedOps());
+        }
+        finally
+        {
+            try { File.Delete(leaderPath); File.Delete(leaderPath + ".wal"); File.Delete(leaderPath + ".recovery"); File.Delete(leaderPath + ".lock"); } catch { }
+            try { File.Delete(followerPath); File.Delete(followerPath + ".wal"); File.Delete(followerPath + ".recovery"); File.Delete(followerPath + ".followerseq"); File.Delete(followerPath + ".lock"); } catch { }
+        }
+    }
+
     public void Dispose()
     {
         // Test fixtures occasionally call _db.Dispose() themselves (e.g. lock
