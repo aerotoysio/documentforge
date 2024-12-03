@@ -99,6 +99,13 @@ public sealed class HttpShardTransport : IShardTransport
         return response.IsSuccessStatusCode;
     }
 
+    public void ExecuteTransaction(IReadOnlyList<ShardTxOp> ops) =>
+        // Phase B will add the wire endpoint (POST /tx/single-shard) and the
+        // PREPARE/COMMIT handlers for cross-shard 2PC. Until then, cluster
+        // transactions only work with in-process shards.
+        throw new NotSupportedException(
+            $"[{ShardName}] HttpShardTransport.ExecuteTransaction is not implemented yet — cluster transactions over HTTP land in Phase B of issue #14.");
+
     public DatabaseStatistics GetStatistics()
     {
         var response = _client.GetAsync("/stats").GetAwaiter().GetResult();

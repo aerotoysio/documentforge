@@ -489,6 +489,34 @@ public sealed class DocumentForgeCluster : IDisposable
         return QueryResult.Affected(total, $"BROADCAST to {_shards.Count} shards");
     }
 
+    // --- Transactions (issue #14, Phase A: single-shard fast path) ---
+
+    /// <summary>
+    /// Open a multi-document transaction over the cluster. Stage writes via
+    /// the returned handle; commit applies them atomically on the participating
+    /// shard(s).
+    ///
+    /// <para>
+    /// Phase A: only single-shard transactions commit successfully. If staged
+    /// ops span more than one shard, <see cref="ClusterTransaction.Commit"/>
+    /// throws <see cref="NotImplementedException"/>. Cross-shard 2PC ships in
+    /// Phase B of issue #14.
+    /// </para>
+    /// </summary>
+    public ClusterTransaction BeginTransaction()
+    {
+        if (_shards.Count == 0)
+            throw new DocumentForgeException("Cluster has no shards configured; cannot open a transaction.");
+        return new ClusterTransaction(this);
+    }
+
+    // ClusterTransaction-only hooks. Kept internal so the public surface
+    // stays focused on the routing API.
+    internal CollectionShardingPolicy GetPolicyForTx(string collection) => GetPolicy(collection);
+    internal int PickShardForTx(BsonValue keyValue) => PickShard(keyValue);
+    internal void ExecuteOnShardForTx(int shardIndex, IReadOnlyList<ShardTxOp> ops) =>
+        _shards[shardIndex].ExecuteTransaction(ops);
+
     public void Dispose()
     {
         if (_disposed) return;

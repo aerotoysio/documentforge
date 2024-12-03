@@ -43,6 +43,27 @@ public sealed class InProcessShardTransport : IShardTransport
         return ok;
     }
 
+    public void ExecuteTransaction(IReadOnlyList<ShardTxOp> ops)
+    {
+        if (ops.Count == 0) return;
+        using var tx = _db.BeginTransaction();
+        foreach (var op in ops)
+        {
+            switch (op.Kind)
+            {
+                case ShardTxOpKind.Insert:
+                    tx.Insert(op.Collection, op.Doc!);
+                    break;
+                case ShardTxOpKind.DeleteByField:
+                    tx.DeleteByField(op.Collection, op.Field!, op.Value!);
+                    break;
+                default:
+                    throw new NotSupportedException($"ShardTxOpKind.{op.Kind} not supported in Phase A");
+            }
+        }
+        tx.Commit();
+    }
+
     public void Dispose()
     {
         if (_ownsDb) _db.Dispose();
