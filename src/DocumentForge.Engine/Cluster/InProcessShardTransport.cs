@@ -64,6 +64,13 @@ public sealed class InProcessShardTransport : IShardTransport
         tx.Commit();
     }
 
+    public PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops) =>
+        _db.PrepareTransaction(txId, coordinatorShardId, ops);
+
+    public void CommitPrepared(string txId) => _db.CommitPreparedTransaction(txId);
+
+    public void RollbackPrepared(string txId) => _db.RollbackPreparedTransaction(txId);
+
     public void Dispose()
     {
         if (_ownsDb) _db.Dispose();

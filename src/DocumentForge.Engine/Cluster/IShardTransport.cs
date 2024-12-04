@@ -26,8 +26,26 @@ public interface IShardTransport : IDisposable
     ///
     /// <para>
     /// Phase A: in-process transports implement this; HTTP throws
-    /// <see cref="NotSupportedException"/> until Phase B wires the endpoint.
+    /// <see cref="NotSupportedException"/> until the wire endpoint lands.
     /// </para>
     /// </summary>
     void ExecuteTransaction(IReadOnlyList<ShardTxOp> ops);
+
+    // --- 2PC participant wire ops (issue #14 Phase B) ---
+
+    /// <summary>
+    /// Phase 1 of 2PC. Validate <paramref name="ops"/> against the shard's
+    /// current state, persist them to the prepared-tx log, and hold the
+    /// write lock waiting for <see cref="CommitPrepared"/> or
+    /// <see cref="RollbackPrepared"/>. Returns
+    /// <see cref="PrepareVote.Prepared"/> on success or
+    /// <see cref="PrepareVote.Aborted"/> with a reason on conflict.
+    /// </summary>
+    PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops);
+
+    /// <summary>Phase 2 commit: apply the prepared ops on this shard and release the lock.</summary>
+    void CommitPrepared(string txId);
+
+    /// <summary>Phase 2 rollback: drop the prepared ops on this shard and release the lock.</summary>
+    void RollbackPrepared(string txId);
 }

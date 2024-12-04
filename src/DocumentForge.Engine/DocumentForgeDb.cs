@@ -1,5 +1,6 @@
 using DocumentForge.Core;
 using DocumentForge.Document;
+using DocumentForge.Engine.Cluster;
 using DocumentForge.Index;
 using DocumentForge.Query;
 using DocumentForge.Storage;
@@ -952,6 +953,100 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         return new Transaction(id, _transactionManager, this);
     }
 
+    // --- 2PC participant API (issue #14 Phase B) ---
+    //
+    // These are the wire-level operations the cluster coordinator drives:
+    // Prepare validates + stages + holds the write lock; CommitPrepared
+    // applies + releases; RollbackPrepared releases without applying. The
+    // hot non-tx paths above don't go through any of this — the worker
+    // thread that owns the lock during PREPARED state isn't even running
+    // unless something has called Prepare.
+
+    private PreparedTxLog? _preparedTxLog;
+    private PreparedTxCoordinator? _preparedTxCoordinator;
+    private readonly object _preparedTxInitLock = new();
+
+    private PreparedTxCoordinator EnsurePreparedTxCoordinator()
+    {
+        if (_preparedTxCoordinator is not null) return _preparedTxCoordinator;
+        lock (_preparedTxInitLock)
+        {
+            if (_preparedTxCoordinator is not null) return _preparedTxCoordinator;
+            ThrowIfReadOnly();
+            _preparedTxLog = new PreparedTxLog(FilePath + ".prepared.log");
+            _preparedTxCoordinator = new PreparedTxCoordinator(this, _transactionManager, _preparedTxLog);
+            return _preparedTxCoordinator;
+        }
+    }
+
+    /// <summary>
+    /// Phase 1 of 2PC. Validate the staged ops against the current state,
+    /// persist them to <c>{db}.prepared.log</c>, and hold the write lock
+    /// until <see cref="CommitPreparedTransaction"/> or
+    /// <see cref="RollbackPreparedTransaction"/> arrives. Returns
+    /// <see cref="PrepareVote.Prepared"/> on success or
+    /// <see cref="PrepareVote.Aborted"/> with a reason on conflict.
+    /// </summary>
+    public PrepareResult PrepareTransaction(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops)
+    {
+        ThrowIfReadOnly();
+        return EnsurePreparedTxCoordinator().Prepare(txId, coordinatorShardId, ops);
+    }
+
+    /// <summary>Phase 2 commit: apply the prepared ops and release the lock.</summary>
+    public void CommitPreparedTransaction(string txId)
+    {
+        ThrowIfReadOnly();
+        EnsurePreparedTxCoordinator().CommitPrepared(txId);
+    }
+
+    /// <summary>Phase 2 rollback: drop the prepared ops and release the lock.</summary>
+    public void RollbackPreparedTransaction(string txId)
+    {
+        ThrowIfReadOnly();
+        EnsurePreparedTxCoordinator().RollbackPrepared(txId);
+    }
+
+    /// <summary>
+    /// Convert wire-level <see cref="ShardTxOp"/>s into the working-set
+    /// shape the engine's apply/validate path consumes. Visible only to
+    /// <see cref="PreparedTxCoordinator"/>; called while it holds the
+    /// write lock so the per-collection scans for DeleteByField are safe.
+    /// </summary>
+    internal Dictionary<string, CollectionWorkingSet> BuildWorkingSetsFromShardTxOps(IReadOnlyList<ShardTxOp> ops)
+    {
+        var result = new Dictionary<string, CollectionWorkingSet>(StringComparer.OrdinalIgnoreCase);
+        foreach (var op in ops)
+        {
+            if (!result.TryGetValue(op.Collection, out var ws))
+            {
+                ws = new CollectionWorkingSet(op.Collection);
+                result[op.Collection] = ws;
+            }
+            switch (op.Kind)
+            {
+                case ShardTxOpKind.Insert:
+                    op.Doc!.EnsureId();
+                    ws.Inserts[op.Doc.GetId()] = op.Doc;
+                    break;
+                case ShardTxOpKind.DeleteByField:
+                    var coll = _catalog.GetCollection(op.Collection);
+                    if (coll is null) break;
+                    var target = BsonValue.FromString(op.Value!);
+                    foreach (var doc in coll.FindAll())
+                    {
+                        var actual = JsonPathExtractor.Extract(doc, op.Field!);
+                        if (!actual.IsNull && actual.CompareTo(target) == 0)
+                            ws.Deletes.Add(doc.GetId());
+                    }
+                    break;
+                default:
+                    throw new InvalidOperationException($"Unsupported ShardTxOpKind {op.Kind}");
+            }
+        }
+        return result;
+    }
+
     // --- ITransactionScope ---
     // Callbacks the Transaction handle uses to read live state and commit
     // a fully-staged batch under the engine's write lock.
@@ -1002,9 +1097,26 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     /// callers see the throw and can re-check the state. See the Phase-2
     /// crash-atomicity tracking issue for the durable rollback story.
     /// </summary>
-    private void ApplyTransactionLocked(Transaction tx)
+    private void ApplyTransactionLocked(Transaction tx) =>
+        ApplyWorkingSetsLocked(tx.WorkingSets);
+
+    /// <summary>
+    /// Apply a fully-staged set of per-collection working sets under the
+    /// caller-held write lock. Same atomicity contract as the public
+    /// <see cref="Transaction"/> path — validation runs first, the apply is
+    /// best-effort reversible on a non-uniqueness failure, and followers see
+    /// a single TxBatch broadcast at the end.
+    ///
+    /// <para>
+    /// Issue #14 Phase B factored this out of <c>ApplyTransactionLocked</c>
+    /// so the participant-side prepared-tx flow can call it with working
+    /// sets built from <see cref="ShardTxOp"/> instead of from a Transaction
+    /// handle. Both callers expect the lock to be held.
+    /// </para>
+    /// </summary>
+    internal void ApplyWorkingSetsLocked(IReadOnlyDictionary<string, CollectionWorkingSet> workingSets)
     {
-        ValidateUniqueIndexesForTx(tx);
+        ValidateUniqueIndexesForWorkingSets(workingSets);
 
         // Issue #23: snapshot every doc we touch so a non-uniqueness failure
         // mid-Apply (IOException, an unexpected throw from Collection.Insert,
@@ -1017,7 +1129,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
 
         try
         {
-            foreach (var (collectionName, ws) in tx.WorkingSets)
+            foreach (var (collectionName, ws) in workingSets)
             {
                 var collection = _catalog.GetCollection(collectionName);
                 if (collection is null)
@@ -1120,7 +1232,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         if (_logicalServer is not null)
         {
             var subOps = new List<TxBatchPayload.SubOp>();
-            foreach (var (collectionName, ws) in tx.WorkingSets)
+            foreach (var (collectionName, ws) in workingSets)
             {
                 // Order matches the apply order so followers see the same
                 // semantics: deletes, replaces, inserts.
@@ -1175,9 +1287,17 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     /// <see cref="DuplicateKeyException"/> on the first key that ends up
     /// pointing at two distinct doc ids.
     /// </summary>
-    private void ValidateUniqueIndexesForTx(Transaction tx)
+    private void ValidateUniqueIndexesForTx(Transaction tx) =>
+        ValidateUniqueIndexesForWorkingSets(tx.WorkingSets);
+
+    /// <summary>
+    /// Working-set-shaped overload so the Phase B prepared-tx path can
+    /// validate without holding a Transaction handle. Identical semantics
+    /// — just takes the working sets directly.
+    /// </summary>
+    internal void ValidateUniqueIndexesForWorkingSets(IReadOnlyDictionary<string, CollectionWorkingSet> workingSets)
     {
-        foreach (var (collectionName, ws) in tx.WorkingSets)
+        foreach (var (collectionName, ws) in workingSets)
         {
             var collection = _catalog.GetCollection(collectionName);
             foreach (var index in _indexManager.GetIndexes(collectionName))
@@ -1753,6 +1873,12 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             try { _replicationFollower?.Dispose(); } catch { }
             try { _logicalServer?.Dispose(); } catch { }
             try { _logicalFollower?.Dispose(); } catch { }
+            // Stop the prepared-tx worker thread + close its log before the
+            // page cache flush. Any in-flight prepared tx that hasn't been
+            // resolved gets its lock released by the worker on shutdown
+            // (Phase C will replay it on next Open).
+            try { _preparedTxCoordinator?.Dispose(); } catch { }
+            try { _preparedTxLog?.Dispose(); } catch { }
             try { _pageCache.FlushAll(); } // also truncates the recovery log
             catch (Exception ex) { deferredFlushError = ex; }
             try { _walWriter?.Dispose(); } catch { }

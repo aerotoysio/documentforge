@@ -100,11 +100,20 @@ public sealed class HttpShardTransport : IShardTransport
     }
 
     public void ExecuteTransaction(IReadOnlyList<ShardTxOp> ops) =>
-        // Phase B will add the wire endpoint (POST /tx/single-shard) and the
-        // PREPARE/COMMIT handlers for cross-shard 2PC. Until then, cluster
-        // transactions only work with in-process shards.
         throw new NotSupportedException(
-            $"[{ShardName}] HttpShardTransport.ExecuteTransaction is not implemented yet — cluster transactions over HTTP land in Phase B of issue #14.");
+            $"[{ShardName}] HttpShardTransport.ExecuteTransaction is not implemented yet — cluster transactions over HTTP need a wire endpoint that hasn't shipped (issue #14).");
+
+    public PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops) =>
+        throw new NotSupportedException(
+            $"[{ShardName}] HttpShardTransport.Prepare is not implemented yet — cross-shard 2PC over HTTP needs a wire endpoint that hasn't shipped (issue #14).");
+
+    public void CommitPrepared(string txId) =>
+        throw new NotSupportedException(
+            $"[{ShardName}] HttpShardTransport.CommitPrepared is not implemented yet (issue #14).");
+
+    public void RollbackPrepared(string txId) =>
+        throw new NotSupportedException(
+            $"[{ShardName}] HttpShardTransport.RollbackPrepared is not implemented yet (issue #14).");
 
     public DatabaseStatistics GetStatistics()
     {
