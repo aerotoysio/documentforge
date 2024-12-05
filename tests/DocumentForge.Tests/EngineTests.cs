@@ -2735,6 +2735,181 @@ public class EngineTests : IDisposable
         finally { CleanupClusterPaths(paths); }
     }
 
+    // --- Recovery sweep (issue #14, Phase C.2) ---
+    //
+    // After a crash, cluster.Recover() walks each shard's prepared.log;
+    // for every PREPARED slice it asks the named coordinator shard for
+    // the decision via the coord.log; commits or aborts accordingly.
+    // These tests simulate a crash by directly driving the participant /
+    // coordinator log writes (instead of going through cluster.Begin
+    // Transaction), then build a fresh cluster on the same files and
+    // call Recover.
+
+    [Fact]
+    public void ClusterRecover_PreparedWithCommitDecision_Commits()
+    {
+        // Coordinator decided COMMIT, then everything died before the
+        // broadcast hit the participant. Recovery must finalize COMMIT
+        // — that's the durability promise.
+        var pathA = Path.Combine(Path.GetTempPath(), $"rec_{Guid.NewGuid():N}.dfdb");
+        var pathB = Path.Combine(Path.GetTempPath(), $"rec_{Guid.NewGuid():N}.dfdb");
+        var paths = new[] { pathA, pathB };
+        try
+        {
+            const string txId = "tx-recover-commit";
+
+            // Pre-crash: stage the prepared tx on A; record COMMIT_DECISION on B.
+            using (var dbA = DocumentForgeDb.Create(pathA))
+            using (var dbB = DocumentForgeDb.Create(pathB))
+            {
+                var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+                {
+                    DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                        DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"RECOVERED","leg":1}""")),
+                };
+                var result = dbA.PrepareTransaction(txId, "B", ops);
+                Assert.Equal(PrepareVote.Prepared, result.Vote);
+
+                // Coordinator decision lands on B. The COMMIT broadcast was
+                // SUPPOSED to follow but we "crash" before it does.
+                dbB.RecordCoordinatorDecision(txId, commit: true);
+                // Dispose-without-resolving simulates the crash. The
+                // prepared-tx coordinator's worker releases the write
+                // lock on shutdown so dispose proceeds cleanly.
+            }
+
+            // Post-crash: rebuild the cluster on the same files and recover.
+            using var dbA2 = DocumentForgeDb.Open(pathA);
+            using var dbB2 = DocumentForgeDb.Open(pathB);
+            using var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster()
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("A", dbA2))
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("B", dbB2))
+                .ShardCollection("orders", "pnr");
+
+            var summary = cluster.Recover();
+            Assert.Equal(1, summary.Committed);
+            Assert.Equal(0, summary.Aborted);
+            Assert.Equal(0, summary.Skipped);
+
+            // The prepared insert is now applied on shard A.
+            Assert.Single(dbA2.Execute("SELECT * FROM orders WHERE pnr = 'RECOVERED'").Documents);
+
+            // Idempotent: a second Recover does nothing (the in-flight
+            // record was resolved by the first call).
+            var second = cluster.Recover();
+            Assert.Equal(0, second.Committed);
+            Assert.Equal(0, second.Aborted);
+        }
+        finally
+        {
+            foreach (var p in paths)
+                try { File.Delete(p); File.Delete(p + ".wal"); File.Delete(p + ".recovery"); File.Delete(p + ".prepared.log"); File.Delete(p + ".coord.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void ClusterRecover_PreparedWithoutDecision_Aborts()
+    {
+        // Coordinator died BEFORE deciding, leaving the participant
+        // PREPARED. The coord log has no record for this txId.
+        // Recovery must finalize ABORT — and crucially, must NOT
+        // apply the staged inserts.
+        var pathA = Path.Combine(Path.GetTempPath(), $"rec_{Guid.NewGuid():N}.dfdb");
+        var pathB = Path.Combine(Path.GetTempPath(), $"rec_{Guid.NewGuid():N}.dfdb");
+        var paths = new[] { pathA, pathB };
+        try
+        {
+            const string txId = "tx-recover-abort";
+
+            using (var dbA = DocumentForgeDb.Create(pathA))
+            using (var dbB = DocumentForgeDb.Create(pathB))
+            {
+                var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+                {
+                    DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                        DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"NEVER"}""")),
+                };
+                Assert.Equal(PrepareVote.Prepared, dbA.PrepareTransaction(txId, "B", ops).Vote);
+                // Note: no RecordCoordinatorDecision call. B's coord log stays empty.
+            }
+
+            using var dbA2 = DocumentForgeDb.Open(pathA);
+            using var dbB2 = DocumentForgeDb.Open(pathB);
+            using var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster()
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("A", dbA2))
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("B", dbB2))
+                .ShardCollection("orders", "pnr");
+
+            var summary = cluster.Recover();
+            Assert.Equal(0, summary.Committed);
+            Assert.Equal(1, summary.Aborted);
+
+            // The would-be insert never landed.
+            Assert.Empty(dbA2.Execute("SELECT * FROM orders").Documents);
+        }
+        finally
+        {
+            foreach (var p in paths)
+                try { File.Delete(p); File.Delete(p + ".wal"); File.Delete(p + ".recovery"); File.Delete(p + ".prepared.log"); File.Delete(p + ".coord.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void ClusterRecover_NoInFlightTxs_IsNoOp()
+    {
+        var (dbs, paths, cluster) = BuildClusterForTx(2, "orders", "pnr");
+        try
+        {
+            // Brand-new cluster — nothing prepared, nothing decided.
+            var summary = cluster.Recover();
+            Assert.Equal(0, summary.Committed);
+            Assert.Equal(0, summary.Aborted);
+            Assert.Equal(0, summary.Skipped);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterRecover_CoordinatorShardAbsent_Skips()
+    {
+        // Edge case: a participant's prepared.log names a coordinator
+        // shard that isn't in the current cluster (could happen during
+        // a rebalance or misconfiguration). Recovery should not
+        // arbitrarily commit or abort — surface it as Skipped so an
+        // operator can investigate.
+        var pathA = Path.Combine(Path.GetTempPath(), $"rec_{Guid.NewGuid():N}.dfdb");
+        var paths = new[] { pathA };
+        try
+        {
+            using (var dbA = DocumentForgeDb.Create(pathA))
+            {
+                var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+                {
+                    DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                        DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"X"}""")),
+                };
+                Assert.Equal(PrepareVote.Prepared,
+                    dbA.PrepareTransaction("tx-orphan", "GHOST_COORD", ops).Vote);
+            }
+
+            using var dbA2 = DocumentForgeDb.Open(pathA);
+            using var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster()
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("A", dbA2))
+                .ShardCollection("orders", "pnr");
+
+            var summary = cluster.Recover();
+            Assert.Equal(0, summary.Committed);
+            Assert.Equal(0, summary.Aborted);
+            Assert.Equal(1, summary.Skipped);
+        }
+        finally
+        {
+            foreach (var p in paths)
+                try { File.Delete(p); File.Delete(p + ".wal"); File.Delete(p + ".recovery"); File.Delete(p + ".prepared.log"); File.Delete(p + ".coord.log"); } catch { }
+        }
+    }
+
     [Fact]
     public void ClusterTx_UniqueIndexConflict_RollsBackAtomically()
     {

@@ -534,6 +534,99 @@ public sealed class DocumentForgeCluster : IDisposable
     internal void RecordCoordinatorDoneForTx(int coordinatorShardIndex, string txId) =>
         _shards[coordinatorShardIndex].RecordCoordinatorDone(txId);
 
+    /// <summary>
+    /// Result of a <see cref="Recover"/> sweep. <c>Committed</c> is the
+    /// count of in-flight prepared tx slices that the coordinator decided
+    /// COMMIT for and we successfully applied; <c>Aborted</c> is the count
+    /// we rolled back (coordinator either didn't decide or never saw the
+    /// tx). <c>Skipped</c> is the count we couldn't resolve because the
+    /// coordinator shard isn't in the current cluster (stale shard
+    /// configuration after a rebalance, say) — operator intervention
+    /// needed for those.
+    /// </summary>
+    public sealed record RecoverySummary(int Committed, int Aborted, int Skipped);
+
+    /// <summary>
+    /// Resolve every in-flight 2PC transaction left over from a prior
+    /// crash. For each shard, scan its prepared.log; for each PREPARED
+    /// slice, ask the coordinator shard for the decision. If the
+    /// coordinator decided COMMIT, finalize with COMMIT; otherwise
+    /// (no decision recorded, or coord shard absent), finalize with
+    /// ROLLBACK.
+    ///
+    /// <para>
+    /// Idempotent: calling this on a cluster with no in-flight tx
+    /// returns zero counts and does no work. Safe to call repeatedly,
+    /// e.g. after a network reconnect or as a cluster startup hook.
+    /// </para>
+    ///
+    /// <para>
+    /// Phase C.2 scope: handles the participant-restart-with-PREPARED
+    /// case. The "coordinator died after deciding but before broadcast"
+    /// scenario is also covered, because the participants whose
+    /// COMMIT message never arrived are still PREPARED — the sweep
+    /// finds them and pulls the decision from the coordinator's
+    /// log. The "coordinator died before deciding" scenario resolves
+    /// to ROLLBACK.
+    /// </para>
+    /// </summary>
+    public RecoverySummary Recover()
+    {
+        int committed = 0, aborted = 0, skipped = 0;
+
+        for (int shardIdx = 0; shardIdx < _shards.Count; shardIdx++)
+        {
+            IReadOnlyList<PreparedTxRecord> inFlight;
+            try { inFlight = _shards[shardIdx].ScanInFlightPrepared(); }
+            catch (NotSupportedException)
+            {
+                // HTTP transport doesn't yet implement scanning. Tracked
+                // alongside the other HTTP wire ops in the issue's later
+                // phases — for now we just can't recover over HTTP.
+                continue;
+            }
+
+            foreach (var rec in inFlight)
+            {
+                int coordIdx = FindShardIndexByName(rec.CoordinatorShardId);
+                if (coordIdx < 0)
+                {
+                    skipped++;
+                    continue;
+                }
+
+                CoordinatorTxState? state;
+                try { state = _shards[coordIdx].GetCoordinatorTxState(rec.TxId); }
+                catch (NotSupportedException)
+                {
+                    skipped++;
+                    continue;
+                }
+
+                if (state?.Decided == true)
+                {
+                    _shards[shardIdx].CommitPrepared(rec.TxId);
+                    committed++;
+                }
+                else
+                {
+                    _shards[shardIdx].RollbackPrepared(rec.TxId);
+                    aborted++;
+                }
+            }
+        }
+
+        return new RecoverySummary(committed, aborted, skipped);
+    }
+
+    private int FindShardIndexByName(string name)
+    {
+        for (int i = 0; i < _shardNames.Count; i++)
+            if (string.Equals(_shardNames[i], name, StringComparison.OrdinalIgnoreCase))
+                return i;
+        return -1;
+    }
+
     public void Dispose()
     {
         if (_disposed) return;

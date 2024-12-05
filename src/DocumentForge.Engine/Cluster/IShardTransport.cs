@@ -60,4 +60,21 @@ public interface IShardTransport : IDisposable
 
     /// <summary>Coordinator-shard call: every participant ACK'd COMMIT — record DONE.</summary>
     void RecordCoordinatorDone(string txId);
+
+    // --- Recovery (Phase C.2) ---
+
+    /// <summary>
+    /// Return every prepared-tx that has not yet been resolved on this
+    /// shard. The cluster's <c>Recover()</c> sweep calls this on each
+    /// participant after a crash so it can ask each tx's coordinator for
+    /// the decision and finalize.
+    /// </summary>
+    IReadOnlyList<PreparedTxRecord> ScanInFlightPrepared();
+
+    /// <summary>
+    /// Coordinator-shard call: what does this shard's coord.log say about
+    /// <paramref name="txId"/>? Returns null if the txId never appeared in
+    /// this shard's coord log (which, by convention, means ABORT).
+    /// </summary>
+    CoordinatorTxState? GetCoordinatorTxState(string txId);
 }

@@ -123,6 +123,14 @@ public sealed class HttpShardTransport : IShardTransport
         throw new NotSupportedException(
             $"[{ShardName}] HttpShardTransport.RecordCoordinatorDone is not implemented yet (issue #14).");
 
+    public IReadOnlyList<PreparedTxRecord> ScanInFlightPrepared() =>
+        throw new NotSupportedException(
+            $"[{ShardName}] HttpShardTransport.ScanInFlightPrepared is not implemented yet (issue #14).");
+
+    public CoordinatorTxState? GetCoordinatorTxState(string txId) =>
+        throw new NotSupportedException(
+            $"[{ShardName}] HttpShardTransport.GetCoordinatorTxState is not implemented yet (issue #14).");
+
     public DatabaseStatistics GetStatistics()
     {
         var response = _client.GetAsync("/stats").GetAwaiter().GetResult();

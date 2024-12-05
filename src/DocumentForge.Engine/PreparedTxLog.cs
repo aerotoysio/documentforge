@@ -271,4 +271,9 @@ internal sealed class PreparedTxLog : IDisposable
     }
 }
 
-internal sealed record PreparedTxRecord(string TxId, string CoordinatorShardId, IReadOnlyList<ShardTxOp> Ops);
+/// <summary>
+/// One in-flight prepared-tx entry on a participant. Returned by
+/// <see cref="IShardTransport.ScanInFlightPrepared"/> during recovery so
+/// the cluster can route the tx to its coordinator and resolve it.
+/// </summary>
+public sealed record PreparedTxRecord(string TxId, string CoordinatorShardId, IReadOnlyList<ShardTxOp> Ops);

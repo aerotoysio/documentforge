@@ -77,6 +77,12 @@ public sealed class InProcessShardTransport : IShardTransport
     public void RecordCoordinatorDone(string txId) =>
         _db.RecordCoordinatorDone(txId);
 
+    public IReadOnlyList<PreparedTxRecord> ScanInFlightPrepared() =>
+        _db.ScanInFlightPreparedTransactions();
+
+    public CoordinatorTxState? GetCoordinatorTxState(string txId) =>
+        _db.GetCoordinatorTxState(txId);
+
     public void Dispose()
     {
         if (_ownsDb) _db.Dispose();
