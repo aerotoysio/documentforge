@@ -115,6 +115,14 @@ public sealed class HttpShardTransport : IShardTransport
         throw new NotSupportedException(
             $"[{ShardName}] HttpShardTransport.RollbackPrepared is not implemented yet (issue #14).");
 
+    public void RecordCoordinatorDecision(string txId, bool commit) =>
+        throw new NotSupportedException(
+            $"[{ShardName}] HttpShardTransport.RecordCoordinatorDecision is not implemented yet (issue #14).");
+
+    public void RecordCoordinatorDone(string txId) =>
+        throw new NotSupportedException(
+            $"[{ShardName}] HttpShardTransport.RecordCoordinatorDone is not implemented yet (issue #14).");
+
     public DatabaseStatistics GetStatistics()
     {
         var response = _client.GetAsync("/stats").GetAwaiter().GetResult();

@@ -48,4 +48,16 @@ public interface IShardTransport : IDisposable
 
     /// <summary>Phase 2 rollback: drop the prepared ops on this shard and release the lock.</summary>
     void RollbackPrepared(string txId);
+
+    /// <summary>
+    /// Coordinator-shard call: durably record the COMMIT decision. The
+    /// cluster issues this once every participant voted PREPARED and before
+    /// it broadcasts COMMIT. After this call returns the decision is the
+    /// point of no return — recovery (Phase C.2) replays a COMMIT broadcast
+    /// for any txId in this log without a matching DONE.
+    /// </summary>
+    void RecordCoordinatorDecision(string txId, bool commit);
+
+    /// <summary>Coordinator-shard call: every participant ACK'd COMMIT — record DONE.</summary>
+    void RecordCoordinatorDone(string txId);
 }

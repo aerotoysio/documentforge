@@ -215,15 +215,31 @@ public sealed class ClusterTransaction : IDisposable
                 $"ClusterTransaction {Id} aborted on shard '{_cluster.GetShardNameForTx(abortShardIdx)}': {abortReason}");
         }
 
+        // The point of no return: durably record COMMIT_DECISION on the
+        // coordinator shard BEFORE broadcasting COMMIT. If we crash here
+        // without the record, recovery (Phase C.2) will see PREPARED txns
+        // on the participants and no decision in the coordinator log,
+        // and treat them as aborted. If we crash AFTER the record but
+        // before broadcasting, recovery replays the COMMIT broadcast.
+        var coordinatorShardIdx = shardIndices[0];
+        _cluster.RecordCoordinatorDecisionForTx(coordinatorShardIdx, txId, commit: true);
+
         // All voted PREPARED — commit each one. After this loop returns the
-        // tx is durable on every participant. If the coordinator dies in the
-        // middle of this loop (between two CommitPrepared calls), some
-        // participants are committed and some are still PREPARED — Phase C's
-        // recovery resolves them by querying the coordinator's decision.
+        // tx is applied on every participant. If the coordinator dies in
+        // the middle of this loop (between two CommitPrepared calls), some
+        // participants are committed and some still PREPARED — Phase C.2's
+        // recovery sees the COMMIT_DECISION and replays the broadcast.
         foreach (var preparedIdx in preparedShards)
         {
             _cluster.CommitOnShardForTx(preparedIdx, txId);
         }
+
+        // All participants ACK'd COMMIT — record DONE so recovery doesn't
+        // bother replaying the broadcast on a future restart. (DONE is an
+        // optimization, not a correctness requirement: replaying COMMIT
+        // for an already-committed tx is a no-op on each participant
+        // since the prepared.log RESOLVED record makes it not in-flight.)
+        _cluster.RecordCoordinatorDoneForTx(coordinatorShardIdx, txId);
     }
 
     public void Rollback()
