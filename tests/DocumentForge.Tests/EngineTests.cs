@@ -2472,45 +2472,156 @@ public class EngineTests : IDisposable
         finally { CleanupClusterPaths(paths); }
     }
 
-    [Fact]
-    public void ClusterTx_MultiShard_Commit_ThrowsNotImplemented()
+    /// <summary>
+    /// Probe pnr values until we find two that route to distinct shards.
+    /// Inserts the probe docs into the cluster as a side effect — caller is
+    /// expected to clean up via DELETE before the actual test work.
+    /// </summary>
+    private static (string pnrA, string pnrB, int shardA, int shardB) FindPnrsOnDistinctShards(
+        DocumentForge.Engine.Cluster.DocumentForgeCluster cluster, DocumentForgeDb[] dbs)
     {
-        // Phase A bails out cleanly when ops span more than one shard. The
-        // exception message should point the reader at issue #14 / Phase B.
+        string? pnrA = null, pnrB = null;
+        int aShard = -1, bShard = -1;
+        for (int i = 0; pnrA is null || pnrB is null; i++)
+        {
+            if (i > 200) throw new InvalidOperationException("Could not find two pnrs on distinct shards");
+            var pnr = $"PROBE{i:D4}";
+            cluster.Insert("orders", $$"""{"pnr":"{{pnr}}"}""");
+            int found = -1;
+            for (int s = 0; s < dbs.Length; s++)
+                if (dbs[s].Execute($"SELECT * FROM orders WHERE pnr = '{pnr}'").Documents.Count == 1)
+                    found = s;
+            if (pnrA is null) { pnrA = pnr; aShard = found; }
+            else if (found != aShard) { pnrB = pnr; bShard = found; }
+        }
+        return (pnrA!, pnrB!, aShard, bShard);
+    }
+
+    [Fact]
+    public void ClusterTx_MultiShard_Commit_AppliesToAllShards()
+    {
+        // Phase B.2: two pnrs routing to distinct shards; commit must apply
+        // to BOTH shards atomically. After commit each shard owns its slice.
         var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
         try
         {
-            // Find two pnr values that route to distinct shards by probing.
-            string? pnrA = null, pnrB = null;
-            int aShard = -1;
-            for (int i = 0; pnrA is null || pnrB is null; i++)
-            {
-                if (i > 200) throw new InvalidOperationException("Could not find two pnrs on distinct shards");
-                var pnr = $"PROBE{i:D4}";
-                cluster.Insert("orders", $$"""{"pnr":"{{pnr}}"}""");
-                int found = -1;
-                for (int s = 0; s < dbs.Length; s++)
-                    if (dbs[s].Execute($"SELECT * FROM orders WHERE pnr = '{pnr}'").Documents.Count == 1)
-                        found = s;
-                if (pnrA is null) { pnrA = pnr; aShard = found; }
-                else if (found != aShard) { pnrB = pnr; }
-            }
-
-            // Now clear seed data and run the actual cross-shard tx attempt.
+            var (pnrA, pnrB, shardA, shardB) = FindPnrsOnDistinctShards(cluster, dbs);
             cluster.Execute("DELETE FROM orders");
 
-            using var tx = cluster.BeginTransaction();
-            tx.Insert("orders", $$"""{"pnr":"{{pnrA}}"}""");
-            tx.Insert("orders", $$"""{"pnr":"{{pnrB}}"}""");
-            Assert.Equal(2, tx.ParticipantCount);
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("orders", $$"""{"pnr":"{{pnrA}}","leg":1}""");
+                tx.Insert("orders", $$"""{"pnr":"{{pnrB}}","leg":2}""");
+                Assert.Equal(2, tx.ParticipantCount);
+                tx.Commit();
+                Assert.Equal(TransactionState.Committed, tx.State);
+            }
 
-            var ex = Assert.Throws<NotImplementedException>(() => tx.Commit());
-            Assert.Contains("Phase B", ex.Message);
-            Assert.Equal(TransactionState.RolledBack, tx.State);
+            Assert.Single(dbs[shardA].Execute($"SELECT * FROM orders WHERE pnr = '{pnrA}'").Documents);
+            Assert.Single(dbs[shardB].Execute($"SELECT * FROM orders WHERE pnr = '{pnrB}'").Documents);
+            Assert.Equal(2, cluster.Execute("SELECT * FROM orders").Documents.Count);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
 
-            // Nothing got applied — neither shard has a doc with these pnrs.
-            Assert.Empty(cluster.Execute($"SELECT * FROM orders WHERE pnr = '{pnrA}'").Documents);
-            Assert.Empty(cluster.Execute($"SELECT * FROM orders WHERE pnr = '{pnrB}'").Documents);
+    [Fact]
+    public void ClusterTx_MultiShard_AbortOnPrepare_RollsBackAllShards()
+    {
+        // The first participant PREPAREs successfully; the second has a
+        // unique-index conflict and votes ABORT. The coordinator must
+        // ROLLBACK the prepared participant — neither shard ends up with
+        // any of the staged docs.
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "users", "tenant");
+        try
+        {
+            // Probe to find two tenant values on distinct shards. We use
+            // the orders/pnr collection just for the probe (it's faster
+            // than reasoning about the routing manually).
+            cluster.ShardCollection("orders", "pnr");
+            var (tenantA, tenantB, shardA, shardB) = FindPnrsOnDistinctShards(cluster, dbs);
+            cluster.Execute("DELETE FROM orders");
+
+            // Set up a unique index on the SECOND shard's users collection
+            // and pre-seed a doc that the tx's second insert will conflict
+            // with. The first shard has no such constraint, so it'll vote
+            // PREPARED — exercising the rollback path.
+            dbs[shardB].GetOrCreateCollection("users");
+            dbs[shardB].CreateIndex("users", "email", "idx_email", unique: true);
+            dbs[shardB].Insert("users", $$"""{"tenant":"{{tenantB}}","email":"clash@x.com"}""");
+
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("users", $$"""{"tenant":"{{tenantA}}","email":"a@x.com","v":1}""");
+                tx.Insert("users", $$"""{"tenant":"{{tenantB}}","email":"clash@x.com","v":2}""");
+                Assert.Equal(2, tx.ParticipantCount);
+
+                var ex = Assert.Throws<TransactionException>(() => tx.Commit());
+                Assert.Contains("aborted", ex.Message);
+                Assert.Equal(TransactionState.RolledBack, tx.State);
+            }
+
+            // First shard's tenantA insert was rolled back; it never landed.
+            Assert.Empty(dbs[shardA].Execute($"SELECT * FROM users WHERE tenant = '{tenantA}'").Documents);
+            // Second shard still only has the original clash doc — no v=2 row.
+            var bRows = dbs[shardB].Execute($"SELECT * FROM users WHERE tenant = '{tenantB}'").Documents;
+            Assert.Single(bRows);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_MultiShard_RollbackBeforeCommit_NoPrepareSent()
+    {
+        // Caller stages multi-shard ops then calls Rollback() instead of
+        // Commit(). PREPARE never goes out — the participants are untouched.
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            var (pnrA, pnrB, _, _) = FindPnrsOnDistinctShards(cluster, dbs);
+            cluster.Execute("DELETE FROM orders");
+
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("orders", $$"""{"pnr":"{{pnrA}}"}""");
+                tx.Insert("orders", $$"""{"pnr":"{{pnrB}}"}""");
+                tx.Rollback();
+                Assert.Equal(TransactionState.RolledBack, tx.State);
+            }
+
+            Assert.Empty(cluster.Execute("SELECT * FROM orders").Documents);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_MultiShard_PostCommit_AnotherTxCanRunImmediately()
+    {
+        // After a multi-shard commit, both participants' write locks are
+        // released. A second cluster tx must work without waiting.
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            var (pnrA, pnrB, shardA, shardB) = FindPnrsOnDistinctShards(cluster, dbs);
+            cluster.Execute("DELETE FROM orders");
+
+            using (var tx1 = cluster.BeginTransaction())
+            {
+                tx1.Insert("orders", $$"""{"pnr":"{{pnrA}}","round":1}""");
+                tx1.Insert("orders", $$"""{"pnr":"{{pnrB}}","round":1}""");
+                tx1.Commit();
+            }
+
+            using (var tx2 = cluster.BeginTransaction())
+            {
+                tx2.Insert("orders", $$"""{"pnr":"{{pnrA}}","round":2}""");
+                tx2.Insert("orders", $$"""{"pnr":"{{pnrB}}","round":2}""");
+                tx2.Commit();
+            }
+
+            Assert.Equal(4, cluster.Execute("SELECT * FROM orders").Documents.Count);
             cluster.Dispose();
         }
         finally { CleanupClusterPaths(paths); }
