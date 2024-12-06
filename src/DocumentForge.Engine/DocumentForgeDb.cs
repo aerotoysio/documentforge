@@ -1131,6 +1131,10 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                     op.Doc!.EnsureId();
                     ws.Inserts[op.Doc.GetId()] = op.Doc;
                     break;
+                case ShardTxOpKind.Replace:
+                    op.Doc!.SetId(op.DocId);
+                    ws.Replaces[op.DocId] = op.Doc;
+                    break;
                 case ShardTxOpKind.DeleteByField:
                     var coll = _catalog.GetCollection(op.Collection);
                     if (coll is null) break;
