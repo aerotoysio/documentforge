@@ -40,8 +40,24 @@ public interface IShardTransport : IDisposable
     /// <see cref="RollbackPrepared"/>. Returns
     /// <see cref="PrepareVote.Prepared"/> on success or
     /// <see cref="PrepareVote.Aborted"/> with a reason on conflict.
+    ///
+    /// <para>
+    /// If <paramref name="timeout"/> elapses before COMMIT or ROLLBACK
+    /// arrives, the participant self-aborts: it releases the write lock
+    /// and writes a RESOLVED-aborted record to the prepared-tx log. A
+    /// late <see cref="CommitPrepared"/> for that txId then throws.
+    /// This is the Phase D liveness fix — without it, a coordinator
+    /// crash before broadcasting COMMIT would freeze the participant
+    /// indefinitely.
+    /// </para>
     /// </summary>
-    PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops);
+    PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops, TimeSpan timeout);
+
+    /// <summary>
+    /// Convenience overload using the default 30-second prepare timeout.
+    /// </summary>
+    PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops) =>
+        Prepare(txId, coordinatorShardId, ops, TimeSpan.FromSeconds(30));
 
     /// <summary>Phase 2 commit: apply the prepared ops on this shard and release the lock.</summary>
     void CommitPrepared(string txId);
