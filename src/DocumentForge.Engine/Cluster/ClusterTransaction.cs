@@ -100,9 +100,90 @@ public sealed class ClusterTransaction : IDisposable
         Insert(collection, BsonDocument.FromJson(json));
 
     /// <summary>
-    /// Read by _id. Phase A returns staged inserts only — committed cluster
-    /// state isn't queried because it would mean a network round-trip
-    /// during staging. Phase B will layer staged state over a real lookup.
+    /// Stage a replace by _id. The new doc's shard key is extracted to
+    /// route the op — implicit constraint: the new doc must hash to the
+    /// same shard as the existing doc. Changing the shard-key value
+    /// would require a cross-shard delete-then-insert (a different
+    /// operation); we don't currently support that. The participant
+    /// validates at PREPARE time and throws if the doc doesn't exist.
+    /// </summary>
+    public bool Replace(string collection, DocumentId id, BsonDocument newDoc)
+    {
+        EnsureActive();
+        var policy = _cluster.GetPolicyForTx(collection);
+        if (policy.Strategy == ShardingStrategy.Replicated)
+            throw new NotImplementedException(
+                $"Cluster transactions on replicated collection '{collection}' aren't supported yet (issue #14).");
+        if (policy.ShardKeyPath is null)
+            throw new DocumentForgeException($"Collection '{collection}' has no shard key configured.");
+
+        newDoc.SetId(id);
+        var keyValue = JsonPathExtractor.Extract(newDoc, policy.ShardKeyPath);
+        if (keyValue.IsNull)
+            throw new DocumentForgeException(
+                $"Replacement doc missing shard key '{policy.ShardKeyPath}' for collection '{collection}'.");
+
+        var shardIdx = _cluster.PickShardForTx(keyValue);
+
+        // If we previously staged an Insert on this shard for the same id,
+        // overwrite it — same single-node Replace semantics.
+        if (_stagedInsertsById.TryGetValue(id, out _))
+        {
+            _stagedInsertsById[id] = newDoc;
+            // Replace the existing Insert op in the per-shard list. We
+            // could iterate, but for simplicity just append a Replace op
+            // — the participant's working-set logic merges them at apply
+            // time.
+        }
+
+        AddOp(shardIdx, ShardTxOp.ForReplace(collection, id, newDoc));
+        return true;
+    }
+
+    public bool Replace(string collection, DocumentId id, string json) =>
+        Replace(collection, id, BsonDocument.FromJson(json));
+
+    /// <summary>
+    /// Stage deletes by field=value. If <paramref name="field"/> is the
+    /// collection's shard key path, the op routes to the one shard that
+    /// owns that key value (single-shard tx). Otherwise the matching
+    /// docs could be on any shard, so the op fans out to all shards
+    /// (multi-shard 2PC tx). Each participant's PREPARE phase scans
+    /// its local data and stages the actual deletes.
+    /// </summary>
+    public int DeleteByField(string collection, string field, string value)
+    {
+        EnsureActive();
+        var policy = _cluster.GetPolicyForTx(collection);
+        if (policy.Strategy == ShardingStrategy.Replicated)
+            throw new NotImplementedException(
+                $"Cluster transactions on replicated collection '{collection}' aren't supported yet (issue #14).");
+
+        if (policy.ShardKeyPath is not null &&
+            string.Equals(field, policy.ShardKeyPath, StringComparison.OrdinalIgnoreCase))
+        {
+            // Single-shard fast path: the field IS the shard key, so we
+            // know exactly which shard owns the matching docs.
+            var keyValue = BsonValue.FromString(value);
+            var shardIdx = _cluster.PickShardForTx(keyValue);
+            AddOp(shardIdx, ShardTxOp.ForDeleteByField(collection, field, value));
+            return -1;  // staging-time count not known; reported at commit
+        }
+
+        // Scatter: any shard might have matching docs. Stage on every
+        // shard — participants with no matches no-op cleanly.
+        for (int i = 0; i < _cluster.ShardCount; i++)
+        {
+            AddOp(i, ShardTxOp.ForDeleteByField(collection, field, value));
+        }
+        return -1;
+    }
+
+    /// <summary>
+    /// Read by _id. Returns staged inserts/replaces from this transaction.
+    /// Cluster-wide reads of committed state aren't done at staging time
+    /// because they'd cost a network round-trip — call <c>cluster.Execute</c>
+    /// outside the transaction if you need to read committed state.
     /// </summary>
     public BsonDocument? Find(string collection, DocumentId id)
     {
