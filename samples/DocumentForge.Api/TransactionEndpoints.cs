@@ -110,5 +110,48 @@ public static class TransactionEndpoints
                 Done = state.Done
             });
         });
+
+        // ---- POST /tx/{txId}/abort ----
+        // Operator-driven manual abort (Phase E.2). For the rare case where
+        // a participant is stuck PREPARED past the timeout (or the timeout
+        // is disabled) and the operator wants to free the lock manually.
+        //
+        // Safety guard: if THIS shard recorded COMMIT_DECISION for the tx
+        // (i.e. it's the coordinator and decided), refuse with 409 Conflict.
+        // Aborting after a COMMIT decision would make the cluster
+        // inconsistent — the operator should let recovery complete.
+        app.MapPost("/tx/{txId}/abort", (string txId) =>
+        {
+            var coordState = db.GetCoordinatorTxState(txId);
+            if (coordState?.Decided == true)
+            {
+                return Results.Conflict(new
+                {
+                    error = $"Cannot abort {txId}: this shard recorded COMMIT_DECISION. Let recovery complete the broadcast."
+                });
+            }
+            try
+            {
+                db.RollbackPreparedTransaction(txId);
+                return Results.Ok(new { success = true });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        // ---- GET /tx/stats ----
+        // Operator-facing counters for participant-side 2PC activity.
+        app.MapGet("/tx/stats", () =>
+        {
+            var s = db.GetPreparedTxStats();
+            return Results.Ok(new
+            {
+                prepareTotal = s.PrepareTotal,
+                prepareAbortedTotal = s.PrepareAbortedTotal,
+                committedTotal = s.CommittedTotal,
+                rolledBackTotal = s.RolledBackTotal,
+                timedOutTotal = s.TimedOutTotal,
+                inFlightPrepared = s.InFlightPrepared
+            });
+        });
     }
 }
