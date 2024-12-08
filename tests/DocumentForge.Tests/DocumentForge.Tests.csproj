@@ -8,7 +8,12 @@
     <PackageReference Include="xunit" Version="2.*" />
     <PackageReference Include="xunit.runner.visualstudio" Version="2.*" />
   </ItemGroup>
+  <!-- ASP.NET Core for the HTTP-transport integration tests (issue #14 Phase E.1). -->
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+  </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\..\src\DocumentForge.Engine\DocumentForge.Engine.csproj" />
+    <ProjectReference Include="..\..\samples\DocumentForge.Api\DocumentForge.Api.csproj" />
   </ItemGroup>
 </Project>

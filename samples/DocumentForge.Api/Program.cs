@@ -1,5 +1,6 @@
 using System.Text.Json;
 using DocumentForge.Engine;
+using DocumentForge.Engine.Cluster;
 using DocumentForge.Document;
 using DocumentForge.Index;
 
@@ -289,6 +290,11 @@ app.MapPost("/index", (CreateIndexRequest request) =>
         return Results.BadRequest(new { error = ex.Message });
     }
 });
+
+// 2PC wire endpoints (issue #14 Phase E.1) — extracted into a static
+// helper so integration tests can spin up the same endpoints against a
+// temporary DB.
+DocumentForge.Api.TransactionEndpoints.Map(app, db);
 
 app.Lifetime.ApplicationStopping.Register(() => db.Dispose());
 

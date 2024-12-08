@@ -99,40 +99,96 @@ public sealed class HttpShardTransport : IShardTransport
         return response.IsSuccessStatusCode;
     }
 
-    public void ExecuteTransaction(IReadOnlyList<ShardTxOp> ops) =>
-        throw new NotSupportedException(
-            $"[{ShardName}] HttpShardTransport.ExecuteTransaction is not implemented yet — cluster transactions over HTTP need a wire endpoint that hasn't shipped (issue #14).");
+    // --- 2PC wire ops over HTTP (issue #14 Phase E.1) ---
+    //
+    // These mirror the participant-side methods on DocumentForgeDb, sending
+    // the same ops over the network instead of in-process. The cluster
+    // client doesn't care which transport it's talking to — both implement
+    // IShardTransport identically.
 
-    public PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops, TimeSpan timeout) =>
-        throw new NotSupportedException(
-            $"[{ShardName}] HttpShardTransport.Prepare is not implemented yet — cross-shard 2PC over HTTP needs a wire endpoint that hasn't shipped (issue #14).");
+    public void ExecuteTransaction(IReadOnlyList<ShardTxOp> ops)
+    {
+        var req = new ExecuteTransactionRequest { Ops = HttpWire.ToDtos(ops).ToList() };
+        var response = _client.PostAsJsonAsync("/tx/execute", req, HttpWire.JsonOptions).GetAwaiter().GetResult();
+        ThrowIfNotSuccess(response, nameof(ExecuteTransaction));
+    }
+
+    public PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops, TimeSpan timeout)
+    {
+        var req = new PrepareRequest
+        {
+            TxId = txId,
+            CoordinatorShardId = coordinatorShardId,
+            Ops = HttpWire.ToDtos(ops).ToList(),
+            TimeoutMs = (long)timeout.TotalMilliseconds
+        };
+        var response = _client.PostAsJsonAsync("/tx/prepare", req, HttpWire.JsonOptions).GetAwaiter().GetResult();
+        var body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        if (!response.IsSuccessStatusCode)
+            throw new DocumentForgeException($"[{ShardName}] Prepare failed: HTTP {(int)response.StatusCode}: {body}");
+        var dto = JsonSerializer.Deserialize<PrepareResponse>(body, HttpWire.JsonOptions)!;
+        var vote = dto.Vote == "Prepared" ? PrepareVote.Prepared : PrepareVote.Aborted;
+        return new PrepareResult(vote, dto.AbortReason);
+    }
 
     public PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops) =>
         Prepare(txId, coordinatorShardId, ops, TimeSpan.FromSeconds(30));
 
-    public void CommitPrepared(string txId) =>
-        throw new NotSupportedException(
-            $"[{ShardName}] HttpShardTransport.CommitPrepared is not implemented yet (issue #14).");
+    public void CommitPrepared(string txId)
+    {
+        var response = _client.PostAsync($"/tx/{txId}/commit", null).GetAwaiter().GetResult();
+        ThrowIfNotSuccess(response, nameof(CommitPrepared));
+    }
 
-    public void RollbackPrepared(string txId) =>
-        throw new NotSupportedException(
-            $"[{ShardName}] HttpShardTransport.RollbackPrepared is not implemented yet (issue #14).");
+    public void RollbackPrepared(string txId)
+    {
+        var response = _client.PostAsync($"/tx/{txId}/rollback", null).GetAwaiter().GetResult();
+        ThrowIfNotSuccess(response, nameof(RollbackPrepared));
+    }
 
-    public void RecordCoordinatorDecision(string txId, bool commit) =>
-        throw new NotSupportedException(
-            $"[{ShardName}] HttpShardTransport.RecordCoordinatorDecision is not implemented yet (issue #14).");
+    public void RecordCoordinatorDecision(string txId, bool commit)
+    {
+        var req = new CoordinatorDecisionRequest { Commit = commit };
+        var response = _client.PostAsJsonAsync($"/tx/{txId}/coord-decision", req, HttpWire.JsonOptions).GetAwaiter().GetResult();
+        ThrowIfNotSuccess(response, nameof(RecordCoordinatorDecision));
+    }
 
-    public void RecordCoordinatorDone(string txId) =>
-        throw new NotSupportedException(
-            $"[{ShardName}] HttpShardTransport.RecordCoordinatorDone is not implemented yet (issue #14).");
+    public void RecordCoordinatorDone(string txId)
+    {
+        var response = _client.PostAsync($"/tx/{txId}/coord-done", null).GetAwaiter().GetResult();
+        ThrowIfNotSuccess(response, nameof(RecordCoordinatorDone));
+    }
 
-    public IReadOnlyList<PreparedTxRecord> ScanInFlightPrepared() =>
-        throw new NotSupportedException(
-            $"[{ShardName}] HttpShardTransport.ScanInFlightPrepared is not implemented yet (issue #14).");
+    public IReadOnlyList<PreparedTxRecord> ScanInFlightPrepared()
+    {
+        var response = _client.GetAsync("/tx/in-flight").GetAwaiter().GetResult();
+        var body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        if (!response.IsSuccessStatusCode)
+            throw new DocumentForgeException($"[{ShardName}] ScanInFlightPrepared failed: HTTP {(int)response.StatusCode}: {body}");
+        var dto = JsonSerializer.Deserialize<InFlightPreparedResponse>(body, HttpWire.JsonOptions)!;
+        return dto.Records.Select(r => new PreparedTxRecord(
+            r.TxId,
+            r.CoordinatorShardId,
+            HttpWire.FromDtos(r.Ops))).ToList();
+    }
 
-    public CoordinatorTxState? GetCoordinatorTxState(string txId) =>
-        throw new NotSupportedException(
-            $"[{ShardName}] HttpShardTransport.GetCoordinatorTxState is not implemented yet (issue #14).");
+    public CoordinatorTxState? GetCoordinatorTxState(string txId)
+    {
+        var response = _client.GetAsync($"/tx/{txId}/coord-state").GetAwaiter().GetResult();
+        if (response.StatusCode == System.Net.HttpStatusCode.NotFound) return null;
+        var body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        if (!response.IsSuccessStatusCode)
+            throw new DocumentForgeException($"[{ShardName}] GetCoordinatorTxState failed: HTTP {(int)response.StatusCode}: {body}");
+        var dto = JsonSerializer.Deserialize<CoordinatorTxStateDto>(body, HttpWire.JsonOptions)!;
+        return new CoordinatorTxState(dto.TxId, dto.Decided, dto.Done);
+    }
+
+    private void ThrowIfNotSuccess(HttpResponseMessage response, string opName)
+    {
+        if (response.IsSuccessStatusCode) return;
+        var body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        throw new DocumentForgeException($"[{ShardName}] {opName} failed: HTTP {(int)response.StatusCode}: {body}");
+    }
 
     public DatabaseStatistics GetStatistics()
     {
