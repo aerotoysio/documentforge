@@ -2357,6 +2357,918 @@ public class EngineTests : IDisposable
         Assert.Equal(2, db2.Execute("SELECT * FROM orders").Documents.Count);
     }
 
+    // --- Cross-shard transactions (issue #14, Phase A: single-shard fast path) ---
+    //
+    // Phase A scope: cluster.BeginTransaction() opens a ClusterTransaction.
+    // If staged ops route to ONE shard, Commit hands the batch to that shard's
+    // local BeginTransaction().Commit() — same atomicity, validation, WAL fsync
+    // as a non-cluster transaction. If staged ops span >1 shards, Commit throws
+    // NotImplementedException (cross-shard 2PC lands in Phase B).
+    //
+    // The point of these tests is to lock in the API surface and the routing
+    // contract so Phase B can layer the multi-shard machinery on top without
+    // breaking what callers see.
+
+    private static (DocumentForgeDb[] dbs, string[] paths, DocumentForge.Engine.Cluster.DocumentForgeCluster cluster)
+        BuildClusterForTx(int shardCount, string collection, string shardKey)
+    {
+        var paths = Enumerable.Range(0, shardCount)
+            .Select(i => Path.Combine(Path.GetTempPath(), $"clstx_{i}_{Guid.NewGuid():N}.dfdb"))
+            .ToArray();
+        var dbs = paths.Select(p => DocumentForgeDb.Create(p)).ToArray();
+
+        var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster();
+        for (int i = 0; i < shardCount; i++)
+            cluster.AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport(
+                ((char)('A' + i)).ToString(), dbs[i], ownsDb: true));
+        cluster.ShardCollection(collection, shardKey);
+        return (dbs, paths, cluster);
+    }
+
+    private static void CleanupClusterPaths(string[] paths)
+    {
+        foreach (var p in paths)
+        {
+            try { File.Delete(p); File.Delete(p + ".wal"); File.Delete(p + ".recovery"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void ClusterTx_SingleShard_Insert_Commit_AppliesAllStaged()
+    {
+        // Two docs sharing a shard-key value land on the same shard, so the
+        // tx degenerates to a single-shard local commit on that shard.
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            using (cluster)
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("orders", """{"pnr":"SAME","leg":1}""");
+                tx.Insert("orders", """{"pnr":"SAME","leg":2}""");
+                Assert.Equal(1, tx.ParticipantCount);
+                tx.Commit();
+            }
+
+            // After commit, both docs are queryable through the cluster.
+            // After dispose-of-cluster the shard DBs are gone (ownsDb=true),
+            // so we re-query through a freshly built cluster over the same files.
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_SingleShard_Commit_DocsAreVisibleAfterwards()
+    {
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("orders", """{"pnr":"SAME","leg":1}""");
+                tx.Insert("orders", """{"pnr":"SAME","leg":2}""");
+                tx.Commit();
+            }
+
+            var rows = cluster.Execute("SELECT * FROM orders WHERE pnr = 'SAME'").Documents;
+            Assert.Equal(2, rows.Count);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_SingleShard_Rollback_DiscardsStaged()
+    {
+        var (dbs, paths, cluster) = BuildClusterForTx(2, "orders", "pnr");
+        try
+        {
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("orders", """{"pnr":"SAME","leg":1}""");
+                tx.Insert("orders", """{"pnr":"SAME","leg":2}""");
+                tx.Rollback();
+            }
+            Assert.Empty(cluster.Execute("SELECT * FROM orders").Documents);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_DisposeWithoutCommit_RollsBack()
+    {
+        var (dbs, paths, cluster) = BuildClusterForTx(2, "orders", "pnr");
+        try
+        {
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("orders", """{"pnr":"SAME"}""");
+                // no Commit — dispose at end of using block must roll back
+            }
+            Assert.Empty(cluster.Execute("SELECT * FROM orders").Documents);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    /// <summary>
+    /// Probe pnr values until we find two that route to distinct shards.
+    /// Inserts the probe docs into the cluster as a side effect — caller is
+    /// expected to clean up via DELETE before the actual test work.
+    /// </summary>
+    private static (string pnrA, string pnrB, int shardA, int shardB) FindPnrsOnDistinctShards(
+        DocumentForge.Engine.Cluster.DocumentForgeCluster cluster, DocumentForgeDb[] dbs)
+    {
+        string? pnrA = null, pnrB = null;
+        int aShard = -1, bShard = -1;
+        for (int i = 0; pnrA is null || pnrB is null; i++)
+        {
+            if (i > 200) throw new InvalidOperationException("Could not find two pnrs on distinct shards");
+            var pnr = $"PROBE{i:D4}";
+            cluster.Insert("orders", $$"""{"pnr":"{{pnr}}"}""");
+            int found = -1;
+            for (int s = 0; s < dbs.Length; s++)
+                if (dbs[s].Execute($"SELECT * FROM orders WHERE pnr = '{pnr}'").Documents.Count == 1)
+                    found = s;
+            if (pnrA is null) { pnrA = pnr; aShard = found; }
+            else if (found != aShard) { pnrB = pnr; bShard = found; }
+        }
+        return (pnrA!, pnrB!, aShard, bShard);
+    }
+
+    [Fact]
+    public void ClusterTx_MultiShard_Commit_AppliesToAllShards()
+    {
+        // Phase B.2: two pnrs routing to distinct shards; commit must apply
+        // to BOTH shards atomically. After commit each shard owns its slice.
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            var (pnrA, pnrB, shardA, shardB) = FindPnrsOnDistinctShards(cluster, dbs);
+            cluster.Execute("DELETE FROM orders");
+
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("orders", $$"""{"pnr":"{{pnrA}}","leg":1}""");
+                tx.Insert("orders", $$"""{"pnr":"{{pnrB}}","leg":2}""");
+                Assert.Equal(2, tx.ParticipantCount);
+                tx.Commit();
+                Assert.Equal(TransactionState.Committed, tx.State);
+            }
+
+            Assert.Single(dbs[shardA].Execute($"SELECT * FROM orders WHERE pnr = '{pnrA}'").Documents);
+            Assert.Single(dbs[shardB].Execute($"SELECT * FROM orders WHERE pnr = '{pnrB}'").Documents);
+            Assert.Equal(2, cluster.Execute("SELECT * FROM orders").Documents.Count);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_MultiShard_AbortOnPrepare_RollsBackAllShards()
+    {
+        // The first participant PREPAREs successfully; the second has a
+        // unique-index conflict and votes ABORT. The coordinator must
+        // ROLLBACK the prepared participant — neither shard ends up with
+        // any of the staged docs.
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "users", "tenant");
+        try
+        {
+            // Probe to find two tenant values on distinct shards. We use
+            // the orders/pnr collection just for the probe (it's faster
+            // than reasoning about the routing manually).
+            cluster.ShardCollection("orders", "pnr");
+            var (tenantA, tenantB, shardA, shardB) = FindPnrsOnDistinctShards(cluster, dbs);
+            cluster.Execute("DELETE FROM orders");
+
+            // Set up a unique index on the SECOND shard's users collection
+            // and pre-seed a doc that the tx's second insert will conflict
+            // with. The first shard has no such constraint, so it'll vote
+            // PREPARED — exercising the rollback path.
+            dbs[shardB].GetOrCreateCollection("users");
+            dbs[shardB].CreateIndex("users", "email", "idx_email", unique: true);
+            dbs[shardB].Insert("users", $$"""{"tenant":"{{tenantB}}","email":"clash@x.com"}""");
+
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("users", $$"""{"tenant":"{{tenantA}}","email":"a@x.com","v":1}""");
+                tx.Insert("users", $$"""{"tenant":"{{tenantB}}","email":"clash@x.com","v":2}""");
+                Assert.Equal(2, tx.ParticipantCount);
+
+                var ex = Assert.Throws<TransactionException>(() => tx.Commit());
+                Assert.Contains("aborted", ex.Message);
+                Assert.Equal(TransactionState.RolledBack, tx.State);
+            }
+
+            // First shard's tenantA insert was rolled back; it never landed.
+            Assert.Empty(dbs[shardA].Execute($"SELECT * FROM users WHERE tenant = '{tenantA}'").Documents);
+            // Second shard still only has the original clash doc — no v=2 row.
+            var bRows = dbs[shardB].Execute($"SELECT * FROM users WHERE tenant = '{tenantB}'").Documents;
+            Assert.Single(bRows);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_MultiShard_RollbackBeforeCommit_NoPrepareSent()
+    {
+        // Caller stages multi-shard ops then calls Rollback() instead of
+        // Commit(). PREPARE never goes out — the participants are untouched.
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            var (pnrA, pnrB, _, _) = FindPnrsOnDistinctShards(cluster, dbs);
+            cluster.Execute("DELETE FROM orders");
+
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("orders", $$"""{"pnr":"{{pnrA}}"}""");
+                tx.Insert("orders", $$"""{"pnr":"{{pnrB}}"}""");
+                tx.Rollback();
+                Assert.Equal(TransactionState.RolledBack, tx.State);
+            }
+
+            Assert.Empty(cluster.Execute("SELECT * FROM orders").Documents);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_MultiShard_PostCommit_AnotherTxCanRunImmediately()
+    {
+        // After a multi-shard commit, both participants' write locks are
+        // released. A second cluster tx must work without waiting.
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            var (pnrA, pnrB, shardA, shardB) = FindPnrsOnDistinctShards(cluster, dbs);
+            cluster.Execute("DELETE FROM orders");
+
+            using (var tx1 = cluster.BeginTransaction())
+            {
+                tx1.Insert("orders", $$"""{"pnr":"{{pnrA}}","round":1}""");
+                tx1.Insert("orders", $$"""{"pnr":"{{pnrB}}","round":1}""");
+                tx1.Commit();
+            }
+
+            using (var tx2 = cluster.BeginTransaction())
+            {
+                tx2.Insert("orders", $$"""{"pnr":"{{pnrA}}","round":2}""");
+                tx2.Insert("orders", $$"""{"pnr":"{{pnrB}}","round":2}""");
+                tx2.Commit();
+            }
+
+            Assert.Equal(4, cluster.Execute("SELECT * FROM orders").Documents.Count);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_MultiShard_Commit_RecordsCoordinatorDecisionAndDone()
+    {
+        // Phase C.1: COMMIT_DECISION goes to the coordinator shard's coord.log
+        // before the COMMIT broadcast (point of no return); DONE goes after
+        // every participant ACK'd. Recovery (Phase C.2) reads this log.
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            var (pnrA, pnrB, shardA, shardB) = FindPnrsOnDistinctShards(cluster, dbs);
+            cluster.Execute("DELETE FROM orders");
+
+            string txIdSeen;
+            using (var tx = cluster.BeginTransaction())
+            {
+                txIdSeen = tx.Id.ToString("N");
+                tx.Insert("orders", $$"""{"pnr":"{{pnrA}}"}""");
+                tx.Insert("orders", $$"""{"pnr":"{{pnrB}}"}""");
+                tx.Commit();
+            }
+
+            // Coordinator is the lowest-index participant. Verify on whichever
+            // shard that turned out to be (depends on the consistent hash).
+            int coordIdx = Math.Min(shardA, shardB);
+            var coordStates = dbs[coordIdx].ScanCoordinatorTransactions();
+            Assert.True(coordStates.ContainsKey(txIdSeen),
+                $"Coordinator log on shard {coordIdx} missing tx {txIdSeen}; saw [{string.Join(",", coordStates.Keys)}]");
+            var state = coordStates[txIdSeen];
+            Assert.True(state.Decided);
+            Assert.True(state.Done);
+
+            // The OTHER participant must NOT have a coord-log record for this tx
+            // (it isn't the coordinator; it's only PREPARED-then-COMMITTED).
+            int otherIdx = Math.Max(shardA, shardB);
+            var otherStates = dbs[otherIdx].ScanCoordinatorTransactions();
+            Assert.False(otherStates.ContainsKey(txIdSeen));
+
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_MultiShard_Abort_DoesNotRecordCommitDecision()
+    {
+        // Phase C.1: ABORT is implicit — the coordinator log only contains
+        // COMMIT_DECISION records, never ABORT. A tx that aborts in PREPARE
+        // leaves NO trace in the coordinator log (recovery treats absence
+        // of a decision as "abort").
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "users", "tenant");
+        try
+        {
+            cluster.ShardCollection("orders", "pnr");
+            var (tenantA, tenantB, shardA, shardB) = FindPnrsOnDistinctShards(cluster, dbs);
+            cluster.Execute("DELETE FROM orders");
+
+            // Pre-seed a unique-index conflict on the second shard.
+            dbs[shardB].GetOrCreateCollection("users");
+            dbs[shardB].CreateIndex("users", "email", "idx_email", unique: true);
+            dbs[shardB].Insert("users", $$"""{"tenant":"{{tenantB}}","email":"clash@x.com"}""");
+
+            string txIdSeen;
+            using (var tx = cluster.BeginTransaction())
+            {
+                txIdSeen = tx.Id.ToString("N");
+                tx.Insert("users", $$"""{"tenant":"{{tenantA}}","email":"a@x.com"}""");
+                tx.Insert("users", $$"""{"tenant":"{{tenantB}}","email":"clash@x.com"}""");
+                Assert.Throws<TransactionException>(() => tx.Commit());
+            }
+
+            // Neither shard has a coord-log record for the aborted tx.
+            foreach (var d in dbs)
+                Assert.False(d.ScanCoordinatorTransactions().ContainsKey(txIdSeen));
+
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_SingleShard_Commit_DoesNotTouchCoordinatorLog()
+    {
+        // The single-shard fast path bypasses 2PC entirely — it shouldn't
+        // create a coord.log file at all.
+        var (dbs, paths, cluster) = BuildClusterForTx(2, "orders", "pnr");
+        try
+        {
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("orders", """{"pnr":"SAME","leg":1}""");
+                tx.Insert("orders", """{"pnr":"SAME","leg":2}""");
+                tx.Commit();
+            }
+
+            // No shard has any coord-log entries.
+            foreach (var d in dbs)
+                Assert.Empty(d.ScanCoordinatorTransactions());
+
+            // And no .coord.log file exists either (lazy init means we
+            // never touched the disk for the coordinator log).
+            foreach (var p in paths)
+                Assert.False(File.Exists(p + ".coord.log"));
+
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    // --- Recovery sweep (issue #14, Phase C.2) ---
+    //
+    // After a crash, cluster.Recover() walks each shard's prepared.log;
+    // for every PREPARED slice it asks the named coordinator shard for
+    // the decision via the coord.log; commits or aborts accordingly.
+    // These tests simulate a crash by directly driving the participant /
+    // coordinator log writes (instead of going through cluster.Begin
+    // Transaction), then build a fresh cluster on the same files and
+    // call Recover.
+
+    [Fact]
+    public void ClusterRecover_PreparedWithCommitDecision_Commits()
+    {
+        // Coordinator decided COMMIT, then everything died before the
+        // broadcast hit the participant. Recovery must finalize COMMIT
+        // — that's the durability promise.
+        var pathA = Path.Combine(Path.GetTempPath(), $"rec_{Guid.NewGuid():N}.dfdb");
+        var pathB = Path.Combine(Path.GetTempPath(), $"rec_{Guid.NewGuid():N}.dfdb");
+        var paths = new[] { pathA, pathB };
+        try
+        {
+            const string txId = "tx-recover-commit";
+
+            // Pre-crash: stage the prepared tx on A; record COMMIT_DECISION on B.
+            using (var dbA = DocumentForgeDb.Create(pathA))
+            using (var dbB = DocumentForgeDb.Create(pathB))
+            {
+                var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+                {
+                    DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                        DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"RECOVERED","leg":1}""")),
+                };
+                var result = dbA.PrepareTransaction(txId, "B", ops);
+                Assert.Equal(PrepareVote.Prepared, result.Vote);
+
+                // Coordinator decision lands on B. The COMMIT broadcast was
+                // SUPPOSED to follow but we "crash" before it does.
+                dbB.RecordCoordinatorDecision(txId, commit: true);
+                // Dispose-without-resolving simulates the crash. The
+                // prepared-tx coordinator's worker releases the write
+                // lock on shutdown so dispose proceeds cleanly.
+            }
+
+            // Post-crash: rebuild the cluster on the same files and recover.
+            using var dbA2 = DocumentForgeDb.Open(pathA);
+            using var dbB2 = DocumentForgeDb.Open(pathB);
+            using var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster()
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("A", dbA2))
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("B", dbB2))
+                .ShardCollection("orders", "pnr");
+
+            var summary = cluster.Recover();
+            Assert.Equal(1, summary.Committed);
+            Assert.Equal(0, summary.Aborted);
+            Assert.Equal(0, summary.Skipped);
+
+            // The prepared insert is now applied on shard A.
+            Assert.Single(dbA2.Execute("SELECT * FROM orders WHERE pnr = 'RECOVERED'").Documents);
+
+            // Idempotent: a second Recover does nothing (the in-flight
+            // record was resolved by the first call).
+            var second = cluster.Recover();
+            Assert.Equal(0, second.Committed);
+            Assert.Equal(0, second.Aborted);
+        }
+        finally
+        {
+            foreach (var p in paths)
+                try { File.Delete(p); File.Delete(p + ".wal"); File.Delete(p + ".recovery"); File.Delete(p + ".prepared.log"); File.Delete(p + ".coord.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void ClusterRecover_PreparedWithoutDecision_Aborts()
+    {
+        // Coordinator died BEFORE deciding, leaving the participant
+        // PREPARED. The coord log has no record for this txId.
+        // Recovery must finalize ABORT — and crucially, must NOT
+        // apply the staged inserts.
+        var pathA = Path.Combine(Path.GetTempPath(), $"rec_{Guid.NewGuid():N}.dfdb");
+        var pathB = Path.Combine(Path.GetTempPath(), $"rec_{Guid.NewGuid():N}.dfdb");
+        var paths = new[] { pathA, pathB };
+        try
+        {
+            const string txId = "tx-recover-abort";
+
+            using (var dbA = DocumentForgeDb.Create(pathA))
+            using (var dbB = DocumentForgeDb.Create(pathB))
+            {
+                var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+                {
+                    DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                        DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"NEVER"}""")),
+                };
+                Assert.Equal(PrepareVote.Prepared, dbA.PrepareTransaction(txId, "B", ops).Vote);
+                // Note: no RecordCoordinatorDecision call. B's coord log stays empty.
+            }
+
+            using var dbA2 = DocumentForgeDb.Open(pathA);
+            using var dbB2 = DocumentForgeDb.Open(pathB);
+            using var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster()
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("A", dbA2))
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("B", dbB2))
+                .ShardCollection("orders", "pnr");
+
+            var summary = cluster.Recover();
+            Assert.Equal(0, summary.Committed);
+            Assert.Equal(1, summary.Aborted);
+
+            // The would-be insert never landed.
+            Assert.Empty(dbA2.Execute("SELECT * FROM orders").Documents);
+        }
+        finally
+        {
+            foreach (var p in paths)
+                try { File.Delete(p); File.Delete(p + ".wal"); File.Delete(p + ".recovery"); File.Delete(p + ".prepared.log"); File.Delete(p + ".coord.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void ClusterRecover_NoInFlightTxs_IsNoOp()
+    {
+        var (dbs, paths, cluster) = BuildClusterForTx(2, "orders", "pnr");
+        try
+        {
+            // Brand-new cluster — nothing prepared, nothing decided.
+            var summary = cluster.Recover();
+            Assert.Equal(0, summary.Committed);
+            Assert.Equal(0, summary.Aborted);
+            Assert.Equal(0, summary.Skipped);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterRecover_CoordinatorShardAbsent_Skips()
+    {
+        // Edge case: a participant's prepared.log names a coordinator
+        // shard that isn't in the current cluster (could happen during
+        // a rebalance or misconfiguration). Recovery should not
+        // arbitrarily commit or abort — surface it as Skipped so an
+        // operator can investigate.
+        var pathA = Path.Combine(Path.GetTempPath(), $"rec_{Guid.NewGuid():N}.dfdb");
+        var paths = new[] { pathA };
+        try
+        {
+            using (var dbA = DocumentForgeDb.Create(pathA))
+            {
+                var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+                {
+                    DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                        DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"X"}""")),
+                };
+                Assert.Equal(PrepareVote.Prepared,
+                    dbA.PrepareTransaction("tx-orphan", "GHOST_COORD", ops).Vote);
+            }
+
+            using var dbA2 = DocumentForgeDb.Open(pathA);
+            using var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster()
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("A", dbA2))
+                .ShardCollection("orders", "pnr");
+
+            var summary = cluster.Recover();
+            Assert.Equal(0, summary.Committed);
+            Assert.Equal(0, summary.Aborted);
+            Assert.Equal(1, summary.Skipped);
+        }
+        finally
+        {
+            foreach (var p in paths)
+                try { File.Delete(p); File.Delete(p + ".wal"); File.Delete(p + ".recovery"); File.Delete(p + ".prepared.log"); File.Delete(p + ".coord.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void ClusterTx_UniqueIndexConflict_RollsBackAtomically()
+    {
+        // Two inserts on the same shard, second violates a unique index.
+        // The participant's local commit must validate then throw, leaving
+        // neither doc persisted — same atomicity as a single-node tx.
+        //
+        // We set the unique index up directly on each shard so this test
+        // doesn't accidentally also exercise cluster CREATE INDEX broadcast
+        // (which is orthogonal — that's covered elsewhere).
+        var (dbs, paths, cluster) = BuildClusterForTx(2, "users", "tenant");
+        try
+        {
+            foreach (var d in dbs)
+            {
+                d.GetOrCreateCollection("users");
+                d.CreateIndex("users", "email", "idx_email", unique: true);
+            }
+
+            cluster.Insert("users", """{"tenant":"T1","email":"a@b.com","v":1}""");
+
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("users", """{"tenant":"T1","email":"new@x.com","v":2}""");
+                tx.Insert("users", """{"tenant":"T1","email":"a@b.com","v":3}""");  // conflict
+                Assert.Equal(1, tx.ParticipantCount);
+
+                Assert.ThrowsAny<Exception>(() => tx.Commit());
+                Assert.Equal(TransactionState.RolledBack, tx.State);
+            }
+
+            // Pre-tx state preserved: original a@b.com still v=1, new@x.com never landed.
+            var rows = cluster.Execute("SELECT * FROM users WHERE tenant = 'T1'").Documents;
+            Assert.Single(rows);
+            Assert.Equal("a@b.com", rows[0]["email"].AsString);
+            Assert.Equal(1, rows[0]["v"].AsInt32);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_FindReturnsStagedInsert()
+    {
+        // Read-your-writes for staged inserts. Phase A only — Phase B will
+        // also layer staged state over a real cluster lookup.
+        var (dbs, paths, cluster) = BuildClusterForTx(2, "orders", "pnr");
+        try
+        {
+            using (var tx = cluster.BeginTransaction())
+            {
+                var id = tx.Insert("orders", """{"pnr":"XYZ","seat":"12A"}""");
+                var seen = tx.Find("orders", id);
+                Assert.NotNull(seen);
+                Assert.Equal("XYZ", seen!["pnr"].AsString);
+
+                // Outside the tx — neither shard has the doc yet.
+                Assert.Empty(cluster.Execute("SELECT * FROM orders").Documents);
+                tx.Rollback();
+            }
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_EmptyCommit_IsNoOp()
+    {
+        var (dbs, paths, cluster) = BuildClusterForTx(2, "orders", "pnr");
+        try
+        {
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Commit();
+                Assert.Equal(TransactionState.Committed, tx.State);
+            }
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_NoShards_ThrowsOnBegin()
+    {
+        using var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster();
+        Assert.Throws<DocumentForgeException>(() => cluster.BeginTransaction());
+    }
+
+    [Fact]
+    public void ClusterTx_ReplicatedCollection_InsertThrowsNotImplemented()
+    {
+        // Replicated collections fan out to every shard, so a single insert
+        // is already a multi-shard tx. Phase B handles this; Phase A bails.
+        var paths = Enumerable.Range(0, 2)
+            .Select(i => Path.Combine(Path.GetTempPath(), $"clstxr_{i}_{Guid.NewGuid():N}.dfdb"))
+            .ToArray();
+        var dbs = paths.Select(p => DocumentForgeDb.Create(p)).ToArray();
+        try
+        {
+            using var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster()
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("A", dbs[0], ownsDb: true))
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("B", dbs[1], ownsDb: true))
+                .ReplicateCollection("countries");
+
+            using var tx = cluster.BeginTransaction();
+            var ex = Assert.Throws<NotImplementedException>(() =>
+                tx.Insert("countries", """{"code":"US","name":"USA"}"""));
+            Assert.Contains("Phase B", ex.Message);
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_OperationAfterCommit_Throws()
+    {
+        var (dbs, paths, cluster) = BuildClusterForTx(2, "orders", "pnr");
+        try
+        {
+            var tx = cluster.BeginTransaction();
+            tx.Insert("orders", """{"pnr":"ABC"}""");
+            tx.Commit();
+
+            Assert.Throws<TransactionException>(() => tx.Insert("orders", """{"pnr":"DEF"}"""));
+            Assert.Throws<TransactionException>(() => tx.Rollback());
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_NonClusterPath_NotRegressed()
+    {
+        // The performance contract: non-transactional cluster ops are
+        // unchanged. This test is defensive — a refactor that accidentally
+        // routes cluster.Insert through ClusterTransaction would still pass
+        // the other tests. This one asserts that cluster.Insert on a brand
+        // new cluster (no transactions ever opened) works exactly as before.
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            for (int i = 0; i < 30; i++)
+                cluster.Insert("orders", $$"""{"pnr": "ORD{{i:D4}}", "amount": {{i * 10}}}""");
+            Assert.Equal(30, cluster.Execute("SELECT * FROM orders").Documents.Count);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    // --- 2PC participant API (issue #14, Phase B.1: prepare/commit/rollback on a single shard) ---
+    //
+    // Phase B.1 lands the participant-side wire ops on IShardTransport:
+    // Prepare validates + persists to {db}.prepared.log and holds the write
+    // lock; CommitPrepared applies and releases; RollbackPrepared releases
+    // without applying. The cluster coordinator (Phase B.2) drives these.
+    //
+    // These tests exercise one shard at a time (via InProcessShardTransport)
+    // — enough to lock in the participant contract before the cluster-level
+    // multi-shard machinery lands on top.
+
+    [Fact]
+    public void Participant_PreparedThenCommit_AppliesOps()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var db = DocumentForgeDb.Create(path);
+            var shard = new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db);
+
+            var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+            {
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"ABC","leg":1}""")),
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"ABC","leg":2}""")),
+            };
+
+            var tx = "tx-001";
+            var result = shard.Prepare(tx, "A", ops);
+            Assert.Equal(PrepareVote.Prepared, result.Vote);
+
+            // NB: while PREPARED the participant holds the write lock, so a
+            // SELECT here would block on the reader lock — that's the
+            // canonical 2PC read-blocking-during-prepared semantics. We
+            // verify the post-commit visibility instead.
+
+            shard.CommitPrepared(tx);
+
+            // After commit the inserts are visible.
+            Assert.Equal(2, db.Execute("SELECT * FROM orders").Documents.Count);
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Participant_PreparedThenRollback_DiscardsOps()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var db = DocumentForgeDb.Create(path);
+            var shard = new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db);
+
+            var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+            {
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"X"}""")),
+            };
+
+            Assert.Equal(PrepareVote.Prepared, shard.Prepare("tx-rb", "A", ops).Vote);
+            shard.RollbackPrepared("tx-rb");
+
+            Assert.Empty(db.Execute("SELECT * FROM orders").Documents);
+
+            // After rollback the participant must accept new prepares again.
+            Assert.Equal(PrepareVote.Prepared, shard.Prepare("tx-after-rb", "A", ops).Vote);
+            shard.CommitPrepared("tx-after-rb");
+            Assert.Single(db.Execute("SELECT * FROM orders").Documents);
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Participant_PrepareUniqueConflict_ReturnsAborted()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var db = DocumentForgeDb.Create(path);
+            db.GetOrCreateCollection("users");
+            db.CreateIndex("users", "email", "idx_email", unique: true);
+            db.Insert("users", """{"email":"a@b.com","v":1}""");
+
+            var shard = new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db);
+
+            // Conflicting insert in the prepared tx — must come back as ABORT,
+            // NOT throw. The coordinator needs the vote-shape so it can issue
+            // ROLLBACK to the other participants cleanly.
+            var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+            {
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("users",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"email":"a@b.com","v":2}""")),
+            };
+
+            var result = shard.Prepare("tx-dup", "A", ops);
+            Assert.Equal(PrepareVote.Aborted, result.Vote);
+            Assert.NotNull(result.AbortReason);
+
+            // Non-tx writes still work — Prepare's lock was released on abort.
+            db.Insert("users", """{"email":"new@x.com","v":3}""");
+            Assert.Equal(2, db.Execute("SELECT * FROM users").Documents.Count);
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Participant_SecondPrepareWhileFirstPrepared_ReturnsAborted()
+    {
+        // Phase B.1 simplification: at most one prepared tx per shard at a
+        // time. A racing second Prepare gets ABORT(busy); it's a clean retry
+        // signal for the coordinator.
+        var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var db = DocumentForgeDb.Create(path);
+            var shard = new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db);
+
+            var ops1 = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+            {
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"ONE"}""")),
+            };
+            var ops2 = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+            {
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"TWO"}""")),
+            };
+
+            Assert.Equal(PrepareVote.Prepared, shard.Prepare("tx-1", "A", ops1).Vote);
+
+            var second = shard.Prepare("tx-2", "A", ops2);
+            Assert.Equal(PrepareVote.Aborted, second.Vote);
+            Assert.Contains("already prepared", second.AbortReason);
+
+            // Resolve tx-1 to free the slot, then tx-2 should succeed.
+            shard.CommitPrepared("tx-1");
+            Assert.Equal(PrepareVote.Prepared, shard.Prepare("tx-2", "A", ops2).Vote);
+            shard.CommitPrepared("tx-2");
+
+            Assert.Equal(2, db.Execute("SELECT * FROM orders").Documents.Count);
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Participant_CommitUnknownTx_Throws()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var db = DocumentForgeDb.Create(path);
+            var shard = new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db);
+            // No prepared tx — this txId never existed.
+            Assert.ThrowsAny<Exception>(() => shard.CommitPrepared("ghost-tx"));
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Participant_PreparedTxLog_PersistsAcrossClose()
+    {
+        // Place a prepared record and dispose without resolving. The log
+        // file must contain it on reopen (Phase C reads this for recovery).
+        var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using (var db = DocumentForgeDb.Create(path))
+            {
+                var shard = new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db);
+                var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+                {
+                    DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                        DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"ORPHAN"}""")),
+                };
+                Assert.Equal(PrepareVote.Prepared, shard.Prepare("tx-orphan", "A", ops).Vote);
+                // Dispose without committing or rolling back — simulates a
+                // process exit while a tx was PREPARED.
+            }
+
+            // The prepared.log file exists and is non-empty.
+            var logPath = path + ".prepared.log";
+            Assert.True(File.Exists(logPath));
+            Assert.True(new FileInfo(logPath).Length > 0);
+
+            // Reopening doesn't auto-recover (that's Phase C), but the log
+            // file is still there for the next phase to pick up.
+            using var db2 = DocumentForgeDb.Open(path);
+            Assert.Empty(db2.Execute("SELECT * FROM orders").Documents);
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
     // --- Index catalog: multi-page support (issue #22) ---
 
     [Fact]

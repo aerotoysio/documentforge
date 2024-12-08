@@ -99,6 +99,38 @@ public sealed class HttpShardTransport : IShardTransport
         return response.IsSuccessStatusCode;
     }
 
+    public void ExecuteTransaction(IReadOnlyList<ShardTxOp> ops) =>
+        throw new NotSupportedException(
+            $"[{ShardName}] HttpShardTransport.ExecuteTransaction is not implemented yet — cluster transactions over HTTP need a wire endpoint that hasn't shipped (issue #14).");
+
+    public PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops) =>
+        throw new NotSupportedException(
+            $"[{ShardName}] HttpShardTransport.Prepare is not implemented yet — cross-shard 2PC over HTTP needs a wire endpoint that hasn't shipped (issue #14).");
+
+    public void CommitPrepared(string txId) =>
+        throw new NotSupportedException(
+            $"[{ShardName}] HttpShardTransport.CommitPrepared is not implemented yet (issue #14).");
+
+    public void RollbackPrepared(string txId) =>
+        throw new NotSupportedException(
+            $"[{ShardName}] HttpShardTransport.RollbackPrepared is not implemented yet (issue #14).");
+
+    public void RecordCoordinatorDecision(string txId, bool commit) =>
+        throw new NotSupportedException(
+            $"[{ShardName}] HttpShardTransport.RecordCoordinatorDecision is not implemented yet (issue #14).");
+
+    public void RecordCoordinatorDone(string txId) =>
+        throw new NotSupportedException(
+            $"[{ShardName}] HttpShardTransport.RecordCoordinatorDone is not implemented yet (issue #14).");
+
+    public IReadOnlyList<PreparedTxRecord> ScanInFlightPrepared() =>
+        throw new NotSupportedException(
+            $"[{ShardName}] HttpShardTransport.ScanInFlightPrepared is not implemented yet (issue #14).");
+
+    public CoordinatorTxState? GetCoordinatorTxState(string txId) =>
+        throw new NotSupportedException(
+            $"[{ShardName}] HttpShardTransport.GetCoordinatorTxState is not implemented yet (issue #14).");
+
     public DatabaseStatistics GetStatistics()
     {
         var response = _client.GetAsync("/stats").GetAwaiter().GetResult();
