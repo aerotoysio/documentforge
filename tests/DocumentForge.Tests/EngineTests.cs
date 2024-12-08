@@ -3690,6 +3690,108 @@ public class EngineTests : IDisposable
         }
     }
 
+    // --- Replication HTTP-endpoint exchange (issue #51) ---
+    //
+    // Followers advertise their HTTP base URL during the replication
+    // handshake so the leader can surface it on /replication/status. The
+    // admin-UI's "Discover network" button uses this to walk peers
+    // without guessing port/scheme.
+
+    [Fact]
+    public async System.Threading.Tasks.Task LogicalReplication_LeaderSeesFollowerHttpEndpoint()
+    {
+        int port = 5950 + System.Random.Shared.Next(40);
+        var leaderPath = Path.Combine(Path.GetTempPath(), $"http_ep_leader_{Guid.NewGuid():N}.dfdb");
+        var follower1Path = Path.Combine(Path.GetTempPath(), $"http_ep_fol1_{Guid.NewGuid():N}.dfdb");
+        var follower2Path = Path.Combine(Path.GetTempPath(), $"http_ep_fol2_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var leader = DocumentForgeDb.Create(leaderPath);
+            leader.StartLogicalReplicationServer(port);
+            await System.Threading.Tasks.Task.Delay(150);
+
+            using var follower1 = DocumentForgeDb.Create(follower1Path);
+            follower1.StartLogicalReplicationFollower("localhost", port,
+                ownHttpEndpoint: "http://10.0.0.5:5001");
+
+            using var follower2 = DocumentForgeDb.Create(follower2Path);
+            follower2.StartLogicalReplicationFollower("localhost", port,
+                ownHttpEndpoint: "https://node-2.cluster.local");
+
+            for (int i = 0; i < 30 && leader.GetLogicalFollowerCount() < 2; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+
+            var followers = leader.GetLogicalFollowers();
+            Assert.Equal(2, followers.Count);
+
+            // Both followers' HTTP endpoints are surfaced. Order isn't
+            // guaranteed (depends on connect timing), so collect into a set.
+            var endpoints = followers.Select(f => f.HttpEndpoint).ToHashSet();
+            Assert.Contains("http://10.0.0.5:5001", endpoints);
+            Assert.Contains("https://node-2.cluster.local", endpoints);
+        }
+        finally
+        {
+            try { File.Delete(leaderPath); File.Delete(leaderPath + ".wal"); File.Delete(leaderPath + ".recovery"); } catch { }
+            try { File.Delete(follower1Path); File.Delete(follower1Path + ".wal"); File.Delete(follower1Path + ".recovery"); File.Delete(follower1Path + ".followerseq"); } catch { }
+            try { File.Delete(follower2Path); File.Delete(follower2Path + ".wal"); File.Delete(follower2Path + ".recovery"); File.Delete(follower2Path + ".followerseq"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void NodeConfig_ResolveHttpEndpoint_PublicBaseUrlWinsWhenSet()
+    {
+        var c = new DocumentForge.Cli.NodeConfig
+        {
+            Port = 5005,
+            Network = new DocumentForge.Cli.NetworkConfig { PublicBaseUrl = "https://node-1.example.com" }
+        };
+        Assert.Equal("https://node-1.example.com", c.ResolveHttpEndpoint());
+
+        // Trailing slash is normalized away.
+        c.Network.PublicBaseUrl = "https://example.com/";
+        Assert.Equal("https://example.com", c.ResolveHttpEndpoint());
+    }
+
+    [Fact]
+    public void NodeConfig_ResolveHttpEndpoint_DerivesFromPortWhenNoOverride()
+    {
+        var c = new DocumentForge.Cli.NodeConfig { Port = 5050 };
+        Assert.Equal("http://localhost:5050", c.ResolveHttpEndpoint());
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task LogicalReplication_FollowerWithoutHttpEndpoint_LeaderReportsNull()
+    {
+        // A follower with ownHttpEndpoint=null (default — the legacy
+        // behaviour) writes an empty endpoint suffix; the leader stores
+        // null and the admin-UI falls back to its port-guess.
+        int port = 5990 + System.Random.Shared.Next(10);
+        var leaderPath = Path.Combine(Path.GetTempPath(), $"http_ep_legacy_l_{Guid.NewGuid():N}.dfdb");
+        var followerPath = Path.Combine(Path.GetTempPath(), $"http_ep_legacy_f_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var leader = DocumentForgeDb.Create(leaderPath);
+            leader.StartLogicalReplicationServer(port);
+            await System.Threading.Tasks.Task.Delay(150);
+
+            using var follower = DocumentForgeDb.Create(followerPath);
+            follower.StartLogicalReplicationFollower("localhost", port);  // no ownHttpEndpoint
+
+            for (int i = 0; i < 30 && leader.GetLogicalFollowerCount() < 1; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+
+            var followers = leader.GetLogicalFollowers();
+            Assert.Single(followers);
+            Assert.Null(followers[0].HttpEndpoint);
+        }
+        finally
+        {
+            try { File.Delete(leaderPath); File.Delete(leaderPath + ".wal"); File.Delete(leaderPath + ".recovery"); } catch { }
+            try { File.Delete(followerPath); File.Delete(followerPath + ".wal"); File.Delete(followerPath + ".recovery"); File.Delete(followerPath + ".followerseq"); } catch { }
+        }
+    }
+
     // --- Snapshot / backup API (issue #27) ---
 
     [Fact]
