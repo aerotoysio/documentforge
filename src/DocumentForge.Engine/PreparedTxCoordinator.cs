@@ -92,11 +92,11 @@ internal sealed class PreparedTxCoordinator : IDisposable
         }
     }
 
-    public PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops)
+    public PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops, TimeSpan timeout)
     {
         if (_disposed) throw new ObjectDisposedException(nameof(PreparedTxCoordinator));
         EnsureWorker();
-        var cmd = new PrepareCommand(txId, coordinatorShardId, ops);
+        var cmd = new PrepareCommand(txId, coordinatorShardId, ops, timeout);
         if (!_queue.Writer.TryWrite(cmd))
             throw new InvalidOperationException("Could not enqueue prepare command");
         return cmd.Result.Task.GetAwaiter().GetResult();
@@ -142,6 +142,9 @@ internal sealed class PreparedTxCoordinator : IDisposable
                             case ResolveCommand r:
                                 HandleResolve(r);
                                 break;
+                            case TimeoutCommand t:
+                                HandleTimeout(t);
+                                break;
                         }
                     }
                     catch (Exception ex)
@@ -155,10 +158,13 @@ internal sealed class PreparedTxCoordinator : IDisposable
         finally
         {
             // If we're shutting down with an active prepared tx, release its
-            // lock so the engine can dispose cleanly. The on-disk record stays
-            // (recovery in Phase C decides what to do with it).
+            // lock + cancel its timeout so the engine can dispose cleanly.
+            // The on-disk PREPARED record stays (Recover decides what to
+            // do with it on the next Open).
             if (_active is not null)
             {
+                try { _active.TimeoutCts?.Cancel(); } catch { }
+                try { _active.TimeoutCts?.Dispose(); } catch { }
                 try { _txManager.ReleaseWriteLock(); } catch { }
                 _active = null;
             }
@@ -193,10 +199,25 @@ internal sealed class PreparedTxCoordinator : IDisposable
             // point of the durability fence.
             _log.AppendPrepared(cmd.TxId, cmd.CoordinatorShardId, cmd.Ops);
 
-            _active = new InFlightTx(cmd.TxId, cmd.CoordinatorShardId, cmd.Ops, workingSets);
+            // Set up the Phase D self-abort timer. The CTS is canceled by
+            // HandleResolve on a clean commit/rollback so we don't leak the
+            // pending Task.Delay. If the deadline fires first, the
+            // continuation enqueues a TimeoutCommand that the worker reads
+            // and self-aborts on.
+            var timeoutCts = new CancellationTokenSource();
+            _active = new InFlightTx(cmd.TxId, cmd.CoordinatorShardId, cmd.Ops, workingSets, timeoutCts);
             cmd.Result.SetResult(PrepareResult.Yes());
-            // Lock stays held — released by HandleResolve.
+            // Lock stays held — released by HandleResolve or HandleTimeout.
             lockHeld = false; // mark to avoid release in catch
+
+            var capturedTxId = cmd.TxId;
+            var capturedTimeout = cmd.Timeout;
+            _ = Task.Delay(capturedTimeout, timeoutCts.Token).ContinueWith(t =>
+            {
+                if (t.IsCanceled) return;
+                if (_disposed) return;
+                _queue.Writer.TryWrite(new TimeoutCommand(capturedTxId));
+            }, TaskScheduler.Default);
         }
         catch (Exception ex)
         {
@@ -265,6 +286,45 @@ internal sealed class PreparedTxCoordinator : IDisposable
         }
         finally
         {
+            // Cancel the pending timeout so we don't leak a Task.Delay or
+            // process a stale TimeoutCommand for a tx that's already
+            // resolved.
+            try { _active?.TimeoutCts?.Cancel(); } catch { }
+            try { _active?.TimeoutCts?.Dispose(); } catch { }
+            try { _txManager.ReleaseWriteLock(); } catch { }
+            _active = null;
+        }
+    }
+
+    /// <summary>
+    /// Phase D self-abort: the prepare timeout fired before COMMIT or
+    /// ROLLBACK arrived. Treat as ABORT — release the lock, write a
+    /// RESOLVED-aborted record, drop _active. A late CommitPrepared for
+    /// this txId then throws "no prepared tx" (the log scan won't find an
+    /// in-flight record because we just RESOLVED it).
+    /// </summary>
+    private void HandleTimeout(TimeoutCommand cmd)
+    {
+        if (_active is null || _active.TxId != cmd.TxId)
+        {
+            // Resolve raced and won; nothing to do.
+            return;
+        }
+
+        try
+        {
+            _log.AppendResolved(_active.TxId, committed: false);
+        }
+        catch
+        {
+            // Log write failed; we still have to release the lock to avoid
+            // wedging the participant. Recovery on next open will scan the
+            // log and notice the PREPARED-without-RESOLVED — and either
+            // resolve correctly via the coord log or abort.
+        }
+        finally
+        {
+            try { _active?.TimeoutCts?.Dispose(); } catch { }
             try { _txManager.ReleaseWriteLock(); } catch { }
             _active = null;
         }
@@ -288,17 +348,26 @@ internal sealed class PreparedTxCoordinator : IDisposable
         public string TxId { get; }
         public string CoordinatorShardId { get; }
         public IReadOnlyList<ShardTxOp> Ops { get; }
+        public TimeSpan Timeout { get; }
         public TaskCompletionSource<PrepareResult> Result { get; } =
             new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        public PrepareCommand(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops)
+        public PrepareCommand(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops, TimeSpan timeout)
         {
             TxId = txId;
             CoordinatorShardId = coordinatorShardId;
             Ops = ops;
+            Timeout = timeout;
         }
 
         public override void Fail(Exception ex) => Result.TrySetException(ex);
+    }
+
+    private sealed class TimeoutCommand : PreparedTxCommand
+    {
+        public string TxId { get; }
+        public TimeoutCommand(string txId) { TxId = txId; }
+        public override void Fail(Exception ex) { /* internal — nobody waiting on this */ }
     }
 
     private sealed class ResolveCommand : PreparedTxCommand
@@ -321,5 +390,8 @@ internal sealed class PreparedTxCoordinator : IDisposable
         string TxId,
         string CoordinatorShardId,
         IReadOnlyList<ShardTxOp> Ops,
-        IReadOnlyDictionary<string, DocumentForge.Transactions.CollectionWorkingSet> WorkingSets);
+        IReadOnlyDictionary<string, DocumentForge.Transactions.CollectionWorkingSet> WorkingSets,
+        // Null when this in-flight state was rebuilt during a Recover sweep
+        // — recovery resolves immediately so no timer is set.
+        CancellationTokenSource? TimeoutCts = null);
 }
