@@ -162,7 +162,10 @@ public static class ServeCommand
                 throw new InvalidOperationException(
                     "Follower role requires --leader-host and --leader-port (or the matching node.json fields).");
 
-            db.StartLogicalReplicationFollower(rep.LeaderHost!, rep.LeaderPort!.Value, secret);
+            // Issue #51 — advertise our own HTTP base URL so the leader can
+            // expose it in /replication/status. Falls back to a derived
+            // host:port pair when Network.PublicBaseUrl isn't set.
+            db.StartLogicalReplicationFollower(rep.LeaderHost!, rep.LeaderPort!.Value, secret, ownHttpEndpoint: config.ResolveHttpEndpoint());
 
             var detail = $"following {rep.LeaderHost}:{rep.LeaderPort}";
 
@@ -899,6 +902,12 @@ public static class ServeCommand
                 node = config.NodeName,
                 role = rep?.NormalizedRole ?? "none",
                 readOnly = db.IsReadOnly,
+                // Issue #51 — this node's own HTTP base URL. The admin-UI's
+                // "Discover network" walk uses this to find peers without
+                // having to guess the HTTP port from the replication
+                // endpoint. Sourced from Network.PublicBaseUrl when set,
+                // else derived from the bind address + port.
+                httpEndpoint = config.ResolveHttpEndpoint(),
                 leader = new
                 {
                     currentSeq,
@@ -906,6 +915,11 @@ public static class ServeCommand
                     followers = followers.Select(f => new
                     {
                         endpoint = f.Endpoint,
+                        // Issue #51 — null when the follower runs an older
+                        // build that doesn't advertise its HTTP endpoint.
+                        // Admin-UI falls back to its existing port-guess in
+                        // that case.
+                        httpEndpoint = f.HttpEndpoint,
                         connectedAt = f.ConnectedAtUtc,
                         handshakeSeq = f.HandshakeSeq,
                         // Worst-case lag: how far behind the follower was when it
@@ -923,7 +937,11 @@ public static class ServeCommand
                     autoFailoverPromoted = db.WasAutoFailoverPromoted,
                     leader = db.LogicalFollowerLeaderEndpoint is null
                         ? null
-                        : (object)new { endpoint = db.LogicalFollowerLeaderEndpoint },
+                        // Issue #51 — leader.httpEndpoint is null until the
+                        // bidirectional handshake exchange ships in a
+                        // follow-up. For now the admin-UI falls back to
+                        // probing the leader's HTTP port directly.
+                        : (object)new { endpoint = db.LogicalFollowerLeaderEndpoint, httpEndpoint = (string?)null },
                 }
             });
         });
@@ -943,7 +961,8 @@ public static class ServeCommand
             try
             {
                 db.StartLogicalReplicationFollower(req.Host, req.Port,
-                    req.SharedSecret ?? config.Security?.ReplicationSecret);
+                    req.SharedSecret ?? config.Security?.ReplicationSecret,
+                    ownHttpEndpoint: config.ResolveHttpEndpoint());
                 return Results.Ok(new { success = true, role = "follower", leader = $"{req.Host}:{req.Port}" });
             }
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
