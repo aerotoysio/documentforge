@@ -2,9 +2,10 @@
 
 import { useState } from 'react';
 import { query as runQuery } from '@/lib/api';
+import type { Connection } from '@/lib/connections';
 import type { TabContext } from '../studio-types';
 
-export function QueryTab({ tab, ctx }: { tab: any; ctx: TabContext }) {
+export function QueryTab({ tab, ctx, connection }: { tab: any; ctx: TabContext; connection: Connection | null }) {
   const [sql, setSql] = useState<string>(tab.initialSql ?? 'SELECT * FROM orders LIMIT 50');
   const [result, setResult] = useState<any | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -14,7 +15,7 @@ export function QueryTab({ tab, ctx }: { tab: any; ctx: TabContext }) {
     setRunning(true);
     setError(null);
     try {
-      const r = await runQuery(sql);
+      const r = await runQuery(sql, { connection });
       setResult(r);
       ctx.setStatus({
         plan: r.plan,

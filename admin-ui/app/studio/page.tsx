@@ -9,6 +9,7 @@ import { InspectorTab } from './tabs/InspectorTab';
 import { IndexesTab } from './tabs/IndexesTab';
 import { flushDb } from '@/lib/api';
 import { useConnections } from '@/lib/connections-context';
+import type { Connection } from '@/lib/connections';
 import type { Tab, StatusInfo, TabContext } from './studio-types';
 
 export default function StudioPage() {
@@ -20,14 +21,26 @@ export default function StudioPage() {
   const [status, setStatus] = useState<StatusInfo>({});
   const [explorerKey, setExplorerKey] = useState(0);
   const tabSeq = useRef(1);
+  const [connSwitcherOpen, setConnSwitcherOpen] = useState(false);
 
-  // When the active CONNECTION changes, force the explorer + every tab to refresh.
+  // When the global active connection changes, only the Explorer re-fetches.
+  // Existing tabs stay pinned to whatever connection they were opened against
+  // (see openTab() — every new tab is stamped with active?.id at creation
+  // time). Per-tab retargeting goes through setTabConnection().
   useEffect(() => {
     setExplorerKey(k => k + 1);
-    setTabs(prev => prev.map(t => ({ ...t, refreshKey: (t.refreshKey ?? 0) + 1 })));
   }, [active?.id]);
 
   const newTabId = () => `t${tabSeq.current++}`;
+
+  // Resolve a tab's pinned connection back to a real Connection object.
+  // Falls back to the global active connection when the tab has no pin
+  // (legacy tabs from before this change) or when the pinned connection has
+  // since been deleted.
+  function resolveConnection(tab: Tab | undefined): Connection | null {
+    if (!tab?.connectionId) return active;
+    return connections.find(c => c.id === tab.connectionId) ?? active;
+  }
 
   // ----- Tab management -----
   const setTabStatus = useCallback((s: Partial<StatusInfo>) => {
@@ -41,11 +54,14 @@ export default function StudioPage() {
   const openTab = useCallback((tab: Tab, focus = true) => {
     setTabs(prev => {
       const existing = prev.find(t => t.id === tab.id);
-      if (existing) return prev.map(t => t.id === tab.id ? tab : t);
-      return [...prev, tab];
+      // Newly created tabs inherit the global active connection. Existing
+      // tabs keep whatever they were already pinned to.
+      const stamped: Tab = { ...tab, connectionId: tab.connectionId ?? active?.id };
+      if (existing) return prev.map(t => t.id === tab.id ? stamped : t);
+      return [...prev, stamped];
     });
     if (focus) setActiveId(tab.id);
-  }, []);
+  }, [active?.id]);
 
   const closeTab = useCallback((id: string) => {
     setTabs(prev => {
@@ -60,6 +76,12 @@ export default function StudioPage() {
 
   const refreshTab = useCallback((id: string) => {
     setTabs(prev => prev.map(t => t.id === id ? { ...t, refreshKey: (t.refreshKey ?? 0) + 1 } : t));
+  }, []);
+
+  const setTabConnection = useCallback((tabId: string, connectionId: string) => {
+    setTabs(prev => prev.map(t => t.id === tabId
+      ? { ...t, connectionId, refreshKey: (t.refreshKey ?? 0) + 1 }
+      : t));
   }, []);
 
   const notifyChanged = useCallback((collection: string) => {
@@ -103,10 +125,14 @@ export default function StudioPage() {
     openInspector,
     closeTab,
     refreshTab,
+    setTabConnection,
     notifyChanged,
-  }), [setTabStatus, openInspector, closeTab, refreshTab, notifyChanged]);
+  }), [setTabStatus, openInspector, closeTab, refreshTab, setTabConnection, notifyChanged]);
 
   const activeTab = tabs.find(t => t.id === activeId);
+  const activeTabConn = resolveConnection(activeTab);
+  const activeTabConnDangling = !!activeTab?.connectionId
+    && !connections.find(c => c.id === activeTab.connectionId);
 
   async function onFlush() {
     try { await flushDb(); refreshExplorer(); } catch (e) { /* swallow */ }
@@ -162,20 +188,101 @@ export default function StudioPage() {
         ) : (
           <>
             <div className="tab-strip">
-              {tabs.map(t => (
-                <div
-                  key={t.id}
-                  className={`tab ${t.id === activeId ? 'active' : ''}`}
-                  onClick={() => setActiveId(t.id)}
-                >
-                  <span className="icon">{tabIcon(t.kind)}</span>
-                  <span>{t.title}</span>
-                  <span className="close" onClick={e => { e.stopPropagation(); closeTab(t.id); }} title="Close">×</span>
-                </div>
-              ))}
+              {tabs.map(t => {
+                const tabConn = resolveConnection(t);
+                const dot = tabConn?.color || 'var(--gray-200)';
+                return (
+                  <div
+                    key={t.id}
+                    className={`tab ${t.id === activeId ? 'active' : ''}`}
+                    onClick={() => setActiveId(t.id)}
+                    title={tabConn ? `Connected to ${tabConn.name} · ${tabConn.baseUrl}` : 'No connection'}
+                  >
+                    <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: dot, marginRight: 6 }} />
+                    <span className="icon">{tabIcon(t.kind)}</span>
+                    <span>{t.title}</span>
+                    <span className="close" onClick={e => { e.stopPropagation(); closeTab(t.id); }} title="Close">×</span>
+                  </div>
+                );
+              })}
             </div>
+
+            {/* Per-tab connection badge: shows what the active tab is talking
+                to, and lets you retarget it without affecting other tabs. */}
+            {activeTab && (
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 10,
+                padding: '6px 12px',
+                borderBottom: '1px solid var(--studio-line)',
+                background: 'var(--studio-panel)',
+                fontSize: 12, position: 'relative',
+              }}>
+                <span style={{ color: 'var(--gray-500)', fontFamily: 'var(--mono)', fontSize: 10, letterSpacing: '0.08em' }}>
+                  THIS TAB →
+                </span>
+                <span style={{
+                  display: 'inline-block', width: 10, height: 10, borderRadius: '50%',
+                  background: activeTabConn?.color || 'var(--gray-200)',
+                }} />
+                <strong style={{ fontSize: 12 }}>{activeTabConn?.name ?? 'No connection'}</strong>
+                <span style={{ color: 'var(--gray-500)', fontFamily: 'var(--mono)', fontSize: 11 }}>
+                  {activeTabConn ? activeTabConn.baseUrl.replace(/^https?:\/\//, '') : ''}
+                </span>
+                {activeTabConnDangling && (
+                  <span className="pill red" style={{ fontSize: 10 }}>
+                    pinned connection deleted — using global active
+                  </span>
+                )}
+                <span className="spacer" />
+                {connections.length > 1 && (
+                  <>
+                    <button
+                      onClick={() => setConnSwitcherOpen(o => !o)}
+                      style={{
+                        background: 'transparent', border: '1px solid var(--studio-line-strong)',
+                        padding: '3px 10px', cursor: 'pointer', fontSize: 11, borderRadius: 3,
+                      }}
+                      title="Retarget this tab to a different connection"
+                    >
+                      Switch ▾
+                    </button>
+                    {connSwitcherOpen && (
+                      <div style={{
+                        position: 'absolute', right: 12, top: 'calc(100% + 2px)',
+                        background: 'white', border: '1px solid var(--studio-line-strong)',
+                        boxShadow: '0 4px 12px rgba(0,0,0,0.08)',
+                        zIndex: 10, minWidth: 240,
+                      }}>
+                        {connections.map(c => (
+                          <div
+                            key={c.id}
+                            onClick={() => {
+                              setTabConnection(activeTab.id, c.id);
+                              setConnSwitcherOpen(false);
+                            }}
+                            style={{
+                              display: 'flex', alignItems: 'center', gap: 8,
+                              padding: '8px 12px', cursor: 'pointer',
+                              background: c.id === activeTab.connectionId ? 'var(--studio-panel)' : 'transparent',
+                              fontSize: 12,
+                            }}
+                          >
+                            <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', background: c.color || 'var(--red)' }} />
+                            <strong>{c.name}</strong>
+                            <span style={{ color: 'var(--gray-500)', fontFamily: 'var(--mono)', fontSize: 10, marginLeft: 'auto' }}>
+                              {c.baseUrl.replace(/^https?:\/\//, '')}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </>
+                )}
+              </div>
+            )}
+
             <div className="tab-body" key={activeTab?.id}>
-              {activeTab && renderTab(activeTab, tabCtx)}
+              {activeTab && renderTab(activeTab, tabCtx, activeTabConn)}
             </div>
           </>
         )}
@@ -215,11 +322,11 @@ function tabIcon(k: string) {
   }
 }
 
-function renderTab(t: Tab, ctx: TabContext) {
+function renderTab(t: Tab, ctx: TabContext, connection: Connection | null) {
   switch (t.kind) {
-    case 'query':     return <QueryTab tab={t} ctx={ctx} />;
-    case 'browse':    return <BrowseTab tab={t} ctx={ctx} />;
-    case 'inspector': return <InspectorTab tab={t} ctx={ctx} />;
-    case 'indexes':   return <IndexesTab tab={t} ctx={ctx} />;
+    case 'query':     return <QueryTab tab={t} ctx={ctx} connection={connection} />;
+    case 'browse':    return <BrowseTab tab={t} ctx={ctx} connection={connection} />;
+    case 'inspector': return <InspectorTab tab={t} ctx={ctx} connection={connection} />;
+    case 'indexes':   return <IndexesTab tab={t} ctx={ctx} connection={connection} />;
   }
 }
