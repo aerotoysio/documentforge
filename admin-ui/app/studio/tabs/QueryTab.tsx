@@ -1,15 +1,54 @@
 'use client';
 
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { query as runQuery } from '@/lib/api';
 import type { Connection } from '@/lib/connections';
 import type { TabContext } from '../studio-types';
+
+const SQL_HEIGHT_KEY = 'dfdb_studio_query_sql_height';
 
 export function QueryTab({ tab, ctx, connection }: { tab: any; ctx: TabContext; connection: Connection | null }) {
   const [sql, setSql] = useState<string>(tab.initialSql ?? 'SELECT * FROM orders LIMIT 50');
   const [result, setResult] = useState<any | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+
+  // Resizable SQL/results split — value stored in pixels, persisted globally
+  // (all QueryTabs share the same default split so muscle memory holds across tabs).
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [sqlHeight, setSqlHeight] = useState<number | null>(null);
+  useEffect(() => {
+    const saved = window.localStorage.getItem(SQL_HEIGHT_KEY);
+    if (saved) {
+      const n = parseInt(saved, 10);
+      if (Number.isFinite(n) && n >= 60) setSqlHeight(n);
+    }
+  }, []);
+
+  function startRowResize(e: React.MouseEvent) {
+    if (!containerRef.current) return;
+    e.preventDefault();
+    const handle = e.currentTarget as HTMLElement;
+    handle.classList.add('dragging');
+    const rect = containerRef.current.getBoundingClientRect();
+    const startY = e.clientY;
+    const startHeight = sqlHeight ?? Math.round(rect.height * 0.35);
+    function onMove(ev: MouseEvent) {
+      const max = (containerRef.current?.getBoundingClientRect().height ?? 600) - 100;
+      const next = Math.max(60, Math.min(max, startHeight + (ev.clientY - startY)));
+      setSqlHeight(next);
+    }
+    function onUp() {
+      handle.classList.remove('dragging');
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      // Read final height from state via ref-trick: read from inline style.
+      const styleVal = containerRef.current?.style.getPropertyValue('--query-sql-height');
+      if (styleVal) window.localStorage.setItem(SQL_HEIGHT_KEY, styleVal.replace('px', ''));
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
 
   async function execute() {
     setRunning(true);
@@ -51,7 +90,11 @@ export function QueryTab({ tab, ctx, connection }: { tab: any; ctx: TabContext; 
   const columns = docs.length ? Object.keys(docs[0]) : [];
 
   return (
-    <div className="query-tab">
+    <div
+      className="query-tab"
+      ref={containerRef}
+      style={sqlHeight ? { ['--query-sql-height' as any]: sqlHeight + 'px' } : undefined}
+    >
       <textarea
         className="sql-editor"
         value={sql}
@@ -60,6 +103,7 @@ export function QueryTab({ tab, ctx, connection }: { tab: any; ctx: TabContext; 
         spellCheck={false}
         placeholder="SELECT * FROM orders LIMIT 100"
       />
+      <div className="splitter-row" onMouseDown={startRowResize} title="Drag to resize" />
       <div>
         <div className="query-toolbar">
           <button className="run-btn" onClick={execute} disabled={running}>

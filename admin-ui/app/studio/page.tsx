@@ -96,9 +96,18 @@ export default function StudioPage() {
   }, []);
 
   // ----- Explorer actions -----
+  // Double-clicking a collection (or its "📄 Documents" sub-node) opens a
+  // QueryTab pre-filled with `SELECT * FROM <coll> LIMIT 100` rather than a
+  // BrowseTab. This keeps the SQL editor visible so the user can tweak the
+  // query (add WHERE / ORDER BY / etc.) without losing the results pane.
   const openBrowse = useCallback((collection: string) => {
-    const id = `browse:${collection}`;
-    openTab({ id, kind: 'browse', title: collection, collection } as Tab);
+    const id = `query:${collection}`;
+    openTab({
+      id,
+      kind: 'query',
+      title: collection,
+      initialSql: `SELECT * FROM ${collection} LIMIT 100`,
+    } as Tab);
   }, [openTab]);
 
   const openIndexes = useCallback((collection: string) => {
@@ -134,12 +143,48 @@ export default function StudioPage() {
   const activeTabConnDangling = !!activeTab?.connectionId
     && !connections.find(c => c.id === activeTab.connectionId);
 
+  // Persisted Explorer column width (resizable via splitter)
+  const studioRef = useRef<HTMLDivElement>(null);
+  const [explorerWidth, setExplorerWidth] = useState<number>(260);
+  useEffect(() => {
+    const saved = window.localStorage.getItem('dfdb_studio_explorer_width');
+    if (saved) {
+      const n = parseInt(saved, 10);
+      if (Number.isFinite(n) && n >= 180 && n <= 600) setExplorerWidth(n);
+    }
+  }, []);
+  useEffect(() => {
+    if (studioRef.current) studioRef.current.style.setProperty('--studio-explorer-width', explorerWidth + 'px');
+  }, [explorerWidth]);
+
+  function startColResize(e: React.MouseEvent) {
+    e.preventDefault();
+    const target = e.currentTarget as HTMLElement;
+    target.classList.add('dragging');
+    const startX = e.clientX;
+    const startWidth = explorerWidth;
+    function onMove(ev: MouseEvent) {
+      const next = Math.max(180, Math.min(600, startWidth + (ev.clientX - startX)));
+      setExplorerWidth(next);
+    }
+    function onUp() {
+      target.classList.remove('dragging');
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+      // Persist final value (avoid hammering localStorage on every mousemove).
+      const w = (studioRef.current?.style.getPropertyValue('--studio-explorer-width') ?? '').replace('px', '');
+      if (w) window.localStorage.setItem('dfdb_studio_explorer_width', w);
+    }
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  }
+
   async function onFlush() {
     try { await flushDb(); refreshExplorer(); } catch (e) { /* swallow */ }
   }
 
   return (
-    <div className="studio">
+    <div className="studio" ref={studioRef}>
       {/* Toolbar */}
       <div className="studio-toolbar">
         <button onClick={newQuery} title="New SQL query tab">＋ New Query</button>
@@ -177,6 +222,9 @@ export default function StudioPage() {
         onOpenIndexes={openIndexes}
         onSetStatusMeta={setStatusMeta}
       />
+
+      {/* Vertical splitter between Explorer and Workspace */}
+      <div className="studio-splitter-col" onMouseDown={startColResize} title="Drag to resize" />
 
       {/* Workspace (center) */}
       <div className="studio-workspace">
