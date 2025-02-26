@@ -886,9 +886,12 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     {
         indexName ??= $"idx_{collectionName}_{jsonPath.Replace('.', '_').Replace('[', '_').Replace("]", "")}";
 
-        var collection = _catalog.GetCollection(collectionName);
-        if (collection is null)
-            throw new CollectionNotFoundException(collectionName);
+        // Auto-create the collection if it doesn't exist yet — matches Insert /
+        // BulkInsert / BulkInsertTracked, which all go through GetOrCreateCollection.
+        // Issue #59: pre-fix CreateIndex was the odd one out, forcing the bootstrap
+        // pattern to call GetOrCreateCollection on every collection just to satisfy
+        // the index DDL that follows.
+        var collection = _catalog.GetOrCreateCollection(collectionName);
 
         var definition = new IndexDefinition
         {
