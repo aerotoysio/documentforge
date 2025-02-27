@@ -49,9 +49,18 @@ public sealed class Collection
         _locationMap.Clear();
         _documentCount = 0;
 
+        // Issue #57: track visited PageIds so a corrupt NextPageId — e.g. a
+        // partial flush from a hard kill that leaves zeros at offset 11-14 —
+        // can't steer this walker into an infinite cycle. Cycles return as
+        // typed PageCorruptionException instead of hanging the host process.
+        var visited = new HashSet<uint>();
         var currentPageId = _firstDataPage;
         while (currentPageId.IsValid)
         {
+            if (!visited.Add(currentPageId.Value))
+                throw new PageCorruptionException(currentPageId,
+                    $"cycle detected in collection '{_name.Value}' page chain after {visited.Count} pages.");
+
             var pageData = _cache.GetPage(currentPageId);
             var page = new DataPage(pageData);
 
@@ -150,8 +159,18 @@ public sealed class Collection
         // Track if we already tried a freshly allocated page.
         bool triedFreshPage = false;
 
+        // Issue #57: bound the walk against a corrupt NextPageId loop. Without
+        // this, a torn page header that cycles back into the chain prevents
+        // triedFreshPage from ever flipping (we never reach an Invalid tail),
+        // and Insert hangs forever instead of failing fast.
+        var visited = new HashSet<uint>();
+
         while (true)
         {
+            if (!visited.Add(currentPageId.Value))
+                throw new PageCorruptionException(currentPageId,
+                    $"cycle detected in collection '{_name.Value}' page chain during insert.");
+
             var pageData = _cache.GetPage(currentPageId);
             var page = new DataPage(pageData);
 
@@ -324,8 +343,17 @@ public sealed class Collection
         int written = 0;
         var currentPage = firstPage;
 
+        // Issue #57: cycle guard. A corrupt overflow header with ItemCount=0
+        // would not advance `written`; combined with a NextPageId that loops,
+        // this walk hangs without bound. Throw on revisit instead.
+        var visited = new HashSet<uint>();
+
         while (currentPage.IsValid && written < totalLen)
         {
+            if (!visited.Add(currentPage.Value))
+                throw new PageCorruptionException(currentPage,
+                    $"cycle detected in overflow chain in collection '{_name.Value}'.");
+
             var pageData = _cache.GetPage(currentPage);
             var header = PageHeader.ReadFrom(pageData);
             int chunkSize = Math.Min(header.ItemCount, totalLen - written);
@@ -343,8 +371,15 @@ public sealed class Collection
     private void FreeOverflowChain(PageId firstPage)
     {
         var current = firstPage;
+        // Issue #57: cycle guard — a corrupt cycle would otherwise re-free the
+        // same page repeatedly, leading to allocator-state divergence on disk.
+        var visited = new HashSet<uint>();
         while (current.IsValid)
         {
+            if (!visited.Add(current.Value))
+                throw new PageCorruptionException(current,
+                    $"cycle detected in overflow chain during free in collection '{_name.Value}'.");
+
             var pageData = _cache.GetPage(current);
             var header = PageHeader.ReadFrom(pageData);
             var next = header.NextPageId;
@@ -378,8 +413,14 @@ public sealed class Collection
 
         // Slow path: scan
         var currentPageId = _firstDataPage;
+        // Issue #57: cycle guard for the scan path — same hang risk as BuildLocationMap.
+        var visited = new HashSet<uint>();
         while (currentPageId.IsValid)
         {
+            if (!visited.Add(currentPageId.Value))
+                throw new PageCorruptionException(currentPageId,
+                    $"cycle detected in collection '{_name.Value}' page chain during delete scan.");
+
             var pageData = _cache.GetPage(currentPageId);
             var page = new DataPage(pageData);
 
@@ -426,8 +467,14 @@ public sealed class Collection
     public IEnumerable<(BsonDocument Doc, PageId PageId, int SlotIndex)> IterateDocuments()
     {
         var currentPageId = _firstDataPage;
+        // Issue #57: cycle guard for the iterator path.
+        var visited = new HashSet<uint>();
         while (currentPageId.IsValid)
         {
+            if (!visited.Add(currentPageId.Value))
+                throw new PageCorruptionException(currentPageId,
+                    $"cycle detected in collection '{_name.Value}' page chain during iteration.");
+
             var pageData = _cache.GetPage(currentPageId);
             var page = new DataPage(pageData);
 
