@@ -13,6 +13,35 @@ export interface CallOptions {
   connection?: Connection | null;
 }
 
+// Shape of GET /replication/status (engine: ServeCommand.cs:895). Field
+// nullability matches the engine — read it before assuming non-null.
+export interface ReplicationStatus {
+  node: string;
+  role: 'leader' | 'follower' | 'none';
+  readOnly: boolean;
+  httpEndpoint: string | null;     // this node's own HTTP base URL (issue #51)
+  leader: {
+    currentSeq: number;
+    followerCount: number;
+    followers: ReplicationFollowerInfo[];
+  };
+  follower: {
+    lastAppliedSeq: number;
+    opsApplied: number;
+    gapsDetected: number;
+    autoFailoverPromoted: boolean;
+    leader: { endpoint: string; httpEndpoint: string | null } | null;
+  };
+}
+
+export interface ReplicationFollowerInfo {
+  endpoint: string;                // replication endpoint (host:port), always set
+  httpEndpoint: string | null;     // null when follower runs a pre-#51 build
+  connectedAt: string;
+  handshakeSeq: number;
+  worstCaseLagSeq: number;
+}
+
 function isBrowser() { return typeof window !== 'undefined'; }
 
 function resolveConn(opts?: CallOptions): { baseUrl: string; apiKey?: string } {
@@ -87,7 +116,7 @@ export async function getCollections(opts?: CallOptions) {
   return handle(r);
 }
 
-export async function getReplicationStatus(opts?: CallOptions) {
+export async function getReplicationStatus(opts?: CallOptions): Promise<ReplicationStatus> {
   const r = await fetch(urlFor('/replication/status', opts), { headers: authHeaders(opts) });
   return handle(r);
 }

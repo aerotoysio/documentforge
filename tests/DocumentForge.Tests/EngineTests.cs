@@ -4687,6 +4687,37 @@ public class EngineTests : IDisposable
         }
     }
 
+    [Fact]
+    public void CreateIndex_OnFreshCollection_AutoCreates_Issue59()
+    {
+        // Issue #59: CreateIndex used to throw CollectionNotFoundException on a
+        // collection that didn't exist yet, even though Insert / BulkInsert /
+        // BulkInsertTracked all auto-create. The bootstrap-pattern caller had to
+        // remember to call GetOrCreateCollection for every collection before
+        // declaring its indexes — easy to forget, ugly when forgotten.
+        _db.CreateIndex("flights", "flightNumber", "idx_flights_number");
+
+        // Index is usable immediately and the collection is real:
+        _db.Insert("flights", """{"flightNumber":"AA123","origin":"JFK"}""");
+        _db.Insert("flights", """{"flightNumber":"AA456","origin":"LAX"}""");
+        var result = _db.Execute("SELECT * FROM flights WHERE flightNumber = 'AA123'");
+        Assert.True(result.Success);
+        Assert.Single(result.Documents);
+        Assert.Contains("INDEX_SCAN", result.QueryPlan!);
+    }
+
+    [Fact]
+    public void CreateIndex_UniqueOnFreshCollection_AutoCreates_Issue59()
+    {
+        // Same path under unique=true — the unique-validator runs against a
+        // freshly created (and therefore empty) collection, no rows to validate.
+        _db.CreateIndex("widgets", "sku", "idx_widget_sku", unique: true);
+
+        _db.Insert("widgets", """{"sku":"W-001"}""");
+        Assert.Throws<DuplicateKeyException>(() =>
+            _db.Insert("widgets", """{"sku":"W-001"}"""));
+    }
+
     // ---------------------------------------------------------------------
     //  Issue #57 regression suite — header validation + page-chain hang fix
     // ---------------------------------------------------------------------

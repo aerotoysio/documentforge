@@ -1,7 +1,8 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { getStats, getReplicationStatus, API_URL } from '@/lib/api';
+import { getStats, getReplicationStatus } from '@/lib/api';
+import { useActiveConnection } from '@/lib/connections-context';
 
 export interface ExplorerProps {
   refreshKey: number;
@@ -20,6 +21,8 @@ interface CollNode {
 }
 
 export function Explorer({ refreshKey, onRefresh, onOpenBrowse, onOpenIndexes, onSetStatusMeta }: ExplorerProps) {
+  const active = useActiveConnection();
+  const endpointLabel = active?.baseUrl ?? '—';
   const [colls, setColls] = useState<CollNode[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [serverExpanded, setServerExpanded] = useState(true);
@@ -50,14 +53,14 @@ export function Explorer({ refreshKey, onRefresh, onOpenBrowse, onOpenIndexes, o
           node: replication?.node,
           role: replication?.role,
           readOnly: replication?.readOnly,
-          endpoint: API_URL,
+          endpoint: endpointLabel,
         });
       })
       .catch(e => { if (!cancelled) setError(e.message || String(e)); });
 
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [refreshKey]);
+  }, [refreshKey, endpointLabel]);
 
   function toggle(idx: number, key: 'expanded' | 'indexesExpanded') {
     setColls(prev => prev.map((c, i) => i === idx ? { ...c, [key]: !c[key] } : c));
@@ -74,7 +77,7 @@ export function Explorer({ refreshKey, onRefresh, onOpenBrowse, onOpenIndexes, o
       <div className={`tree-node depth-0`} onClick={() => setServerExpanded(s => !s)}>
         <span className="twisty">{serverExpanded ? '▼' : '▶'}</span>
         <span className="icon">▣</span>
-        <span className="label">{API_URL.replace(/^https?:\/\//, '')}</span>
+        <span className="label">{endpointLabel.replace(/^https?:\/\//, '')}</span>
       </div>
 
       {serverExpanded && (

@@ -2,9 +2,10 @@
 
 import { useEffect, useState } from 'react';
 import { listDocs } from '@/lib/api';
+import type { Connection } from '@/lib/connections';
 import type { TabContext } from '../studio-types';
 
-export function BrowseTab({ tab, ctx }: { tab: any; ctx: TabContext }) {
+export function BrowseTab({ tab, ctx, connection }: { tab: any; ctx: TabContext; connection: Connection | null }) {
   const [docs, setDocs] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -16,13 +17,13 @@ export function BrowseTab({ tab, ctx }: { tab: any; ctx: TabContext }) {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    listDocs(collection, limit)
+    listDocs(collection, limit, { connection })
       .then(r => { if (!cancelled) { setDocs(r.documents ?? []); ctx.setStatus({ rows: r.count ?? 0, plan: 'COLLECTION_SCAN', executionMs: undefined }); } })
       .catch(e => { if (!cancelled) setError(e.message || String(e)); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [collection, limit, tab.refreshKey]);
+  }, [collection, limit, tab.refreshKey, connection?.id]);
 
   const visible = filter
     ? docs.filter(d => JSON.stringify(d).toLowerCase().includes(filter.toLowerCase()))
