@@ -13,6 +13,32 @@ public class PageCorruptionException : DocumentForgeException
         : base($"Page {pageId} corruption: {message}") => PageId = pageId;
 }
 
+/// <summary>
+/// Thrown by <see cref="Storage.DataFile.Open"/> when the data file's
+/// header (page 0) is missing, truncated, has wrong magic bytes, or has an
+/// unsupported format version. Distinct from <see cref="PageCorruptionException"/>
+/// (which fires on a single page mid-operation) because a corrupt header
+/// means the database itself is unsafe to open at all — the right operator
+/// response is restore-from-backup, not retry.
+///
+/// <para>
+/// Issue #57: pre-fix, header corruption silently fell through to the catalog
+/// loader, which followed corrupt page-chain pointers into a cycle and hung
+/// the whole process indefinitely. SQL-Server-grade behaviour is to refuse
+/// the open with a clear, typed exception so the operator sees the problem
+/// instantly rather than waiting on a deadlock.
+/// </para>
+/// </summary>
+public class DatabaseCorruptedException : DocumentForgeException
+{
+    public string FilePath { get; }
+    public DatabaseCorruptedException(string filePath, string message)
+        : base($"Database file '{filePath}' is corrupted: {message}")
+    {
+        FilePath = filePath;
+    }
+}
+
 public class DuplicateKeyException : DocumentForgeException
 {
     public string IndexName { get; }
