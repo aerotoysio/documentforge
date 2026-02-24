@@ -453,6 +453,68 @@ public sealed class CrashInjectionTests
     }
 
     [Fact]
+    public void IndexCatalog_CycleOnDisk_SelfHealsAndOpens()
+    {
+        // Issue #64: a corrupt index-catalog page chain that survives crash
+        // recovery (the original failure was a torn NextPageId write where
+        // the new tail page was never persisted before the link was stamped)
+        // used to make the database un-openable — PageCorruptionException
+        // propagated out of Open. The self-heal path detects the cycle,
+        // logs a warning, and opens with no indexes. Document data lives
+        // in a separate page chain and is unaffected.
+        var path = FreshPath("idxcatcycle");
+        try
+        {
+            // Phase 1: build a normal DB with documents and an index, then
+            // close cleanly so the recovery log is empty for phase 3.
+            using (var db = DocumentForgeDb.OpenOrCreate(path))
+            {
+                db.Insert("orders", """{"pnr":"PNR1"}""");
+                db.Insert("orders", """{"pnr":"PNR2"}""");
+                db.CreateIndex("orders", "pnr", "idx_orders_pnr", unique: true);
+            }
+
+            // Phase 2: synthesise the disk cycle. We point the single
+            // catalog page's NextPageId at itself — the simplest 1-cycle.
+            // The on-disk shape is identical to what a torn write of a
+            // stale-allocated tail page would produce; only the mechanism
+            // differs. WritePage restamps the page checksum so the page
+            // is byte-consistent (i.e. survives the CRC32 check on read)
+            // while being structurally cyclic.
+            using (var data = DataFile.Open(path))
+            {
+                var catalogPageId = data.GetIndexCatalogPage();
+                Assert.True(catalogPageId.IsValid,
+                    "Test precondition: CreateIndex should have set a catalog page.");
+
+                var pageBytes = data.ReadPage(catalogPageId);
+                // PageHeader.NextPageId is at byte offset 11, 4 bytes.
+                BitConverter.TryWriteBytes(
+                    pageBytes.AsSpan(11, 4), catalogPageId.Value);
+                data.WritePage(catalogPageId, pageBytes);
+                data.Flush();
+            }
+
+            // Phase 3: reopen via the production path. Pre-fix this threw
+            // PageCorruptionException out of LoadFromCatalog and the host
+            // could never open this file again. Post-fix it self-heals.
+            using var reopened = DocumentForgeDb.Open(path);
+
+            // Indexes were dropped from the catalog. Document data survived.
+            Assert.Empty(reopened.GetIndexes("orders"));
+            var rows = reopened.Execute("SELECT * FROM orders").Documents;
+            Assert.Equal(2, rows.Count);
+
+            // The engine is writeable — re-creating the index proves the
+            // catalog head pointer was reset cleanly (not just nulled in
+            // memory while leaving Save to trip on the same cycle).
+            reopened.CreateIndex("orders", "pnr", "idx_orders_pnr", unique: true);
+            Assert.Single(reopened.GetIndexes("orders"));
+        }
+        finally { Cleanup(path); }
+    }
+
+    [Fact]
     public void FaultyDataFile_RecordsInjectedFaultForAssertions()
     {
         // Smoke test on the harness itself — confirms the test infrastructure
