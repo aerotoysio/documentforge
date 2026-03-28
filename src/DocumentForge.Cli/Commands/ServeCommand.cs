@@ -54,7 +54,15 @@ public static class ServeCommand
 
         Directory.CreateDirectory(config.DataDir);
         var dbPath = Path.Combine(config.DataDir, "data.dfdb");
-        var db = DocumentForgeDb.OpenOrCreate(dbPath);
+
+        // Issue #66 Phase 1: every database now lives inside a registry, so
+        // future phases (Studio "+" button, /databases CRUD, lazy open) can
+        // grow without touching the route map. For Phase 1 the registry
+        // holds exactly one entry — "default" — pointed at data.dfdb. All
+        // existing flat routes resolve through registry.GetDefault(), so
+        // single-DB clients written before this change see zero difference.
+        var registry = new DatabaseRegistry();
+        var db = registry.AttachOrCreate("default", dbPath);
 
         // Optional replication wiring - leader / follower / none
         var replicationSummary = StartReplication(db, config);
@@ -94,7 +102,9 @@ public static class ServeCommand
         MapAdminEndpoints(app, db, config);
         MapReplicationEndpoints(app, db, config);
 
-        app.Lifetime.ApplicationStopping.Register(() => db.Dispose());
+        // Dispose the registry on shutdown — it cascades to every attached
+        // database, including the Phase 1 single "default" one.
+        app.Lifetime.ApplicationStopping.Register(() => registry.Dispose());
         app.Run();
         return 0;
     }
