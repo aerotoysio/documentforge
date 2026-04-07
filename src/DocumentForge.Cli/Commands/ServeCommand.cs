@@ -101,6 +101,11 @@ public static class ServeCommand
         MapEndpoints(app, db);
         MapAdminEndpoints(app, db, config);
         MapReplicationEndpoints(app, db, config);
+        // Issue #66 Phase 2: multi-database admin verbs (list/attach/create/
+        // detach/drop/set-default). The registry holds the engines; flat
+        // data-plane routes still resolve to registry.GetDefault() so
+        // single-DB clients see no change.
+        DatabaseEndpoints.Map(app, registry, config.DataDir);
 
         // Dispose the registry on shutdown — it cascades to every attached
         // database, including the Phase 1 single "default" one.
@@ -128,6 +133,8 @@ public static class ServeCommand
         Console.WriteLine("             DELETE /collections/{name} | GET /indexes/{collection} | POST /index");
         Console.WriteLine("             POST /tx/batch                  (atomic multi-doc transaction)");
         Console.WriteLine("             POST /seed | GET /health | GET /version");
+        Console.WriteLine("  databases: GET  /databases | POST /databases | DELETE /databases/{name}");
+        Console.WriteLine("             POST /databases/{name}/set-default");
         Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint | POST /admin/snapshot");
         Console.WriteLine("             POST /admin/compact/{collection}");
         Console.WriteLine("             POST /admin/rebuild-indexes/{collection}");

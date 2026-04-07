@@ -168,6 +168,47 @@ textarea:focus, input:focus { outline: none; border-color: var(--red); }
   letter-spacing: 0.02em;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+/* Issue #66 Phase 2: active-database indicator below the connection picker. */
+.db-indicator {
+  display: block;
+  margin: 0 12px 16px;
+  padding: 8px 10px;
+  background: rgba(255,255,255,0.04);
+  border-left: 2px solid var(--red);
+  text-decoration: none;
+  color: inherit;
+  transition: background 120ms ease;
+}
+.db-indicator:hover { background: rgba(255,255,255,0.08); }
+.db-indicator-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  color: rgba(255,255,255,0.4);
+  margin-bottom: 4px;
+}
+.db-indicator-row { display: flex; align-items: center; gap: 8px; }
+.db-indicator-dot {
+  display: inline-block;
+  width: 6px; height: 6px;
+  border-radius: 50%;
+  background: var(--red);
+}
+.db-indicator-name {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+  color: rgba(255,255,255,0.92);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.db-indicator-count {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: rgba(255,255,255,0.45);
+  background: rgba(255,255,255,0.06);
+  padding: 1px 6px;
+  border-radius: 8px;
+}
 .conn-picker-menu {
   position: absolute;
   left: 12px; right: 12px; top: 100%;

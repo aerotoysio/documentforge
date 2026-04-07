@@ -256,6 +256,65 @@ export async function rebuildIndex(collection: string, indexName: string, opts?:
   return handle(r);
 }
 
+// ---------- Databases (Issue #66 Phase 2) ----------
+// One service can now host N attached databases. These verbs drive Studio's
+// "+ Add Database" UX and the per-connection database picker. Until Phase 4
+// lands per-request auth scoping, set-default is how the UI tells the
+// service "all subsequent flat-route calls should target DB X."
+
+export interface DatabaseEntry {
+  name: string;
+  filePath: string;
+  isDefault: boolean;
+}
+
+export interface DatabasesListResponse {
+  default: string | null;
+  count: number;
+  databases: DatabaseEntry[];
+}
+
+export async function listDatabases(opts?: CallOptions): Promise<DatabasesListResponse> {
+  const r = await fetch(urlFor('/databases', opts), { headers: authHeaders(opts) });
+  return handle(r);
+}
+
+export async function createDatabase(
+  name: string,
+  options?: { path?: string; createIfMissing?: boolean } & CallOptions,
+): Promise<DatabaseEntry> {
+  const r = await fetch(urlFor('/databases', options), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(options) },
+    body: JSON.stringify({
+      name,
+      path: options?.path,
+      createIfMissing: options?.createIfMissing ?? true,
+    }),
+  });
+  return handle(r);
+}
+
+export async function deleteDatabase(
+  name: string,
+  options?: { deleteFiles?: boolean } & CallOptions,
+) {
+  const qs = options?.deleteFiles ? '?deleteFiles=true' : '';
+  const r = await fetch(urlFor(`/databases/${encodeURIComponent(name)}${qs}`, options), {
+    method: 'DELETE',
+    headers: authHeaders(options),
+  });
+  return handle(r);
+}
+
+export async function setDefaultDatabase(name: string, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/databases/${encodeURIComponent(name)}/set-default`, opts), {
+    method: 'POST',
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+
 // ---------- Replication control ----------
 export async function startLeader(port: number, sharedSecret?: string, opts?: CallOptions) {
   const r = await fetch(urlFor('/replication/start-leader', opts), {

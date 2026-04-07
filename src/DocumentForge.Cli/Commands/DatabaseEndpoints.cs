@@ -1,0 +1,128 @@
+using DocumentForge.Core;
+using DocumentForge.Engine;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
+
+namespace DocumentForge.Cli.Commands;
+
+/// <summary>
+/// Issue #66 Phase 2: multi-database admin REST surface. Lives in its own
+/// class (rather than buried in <see cref="ServeCommand"/>) so it can be
+/// mounted on test fixtures that boot a minimal Kestrel host and assert
+/// against the wire shape directly. The data plane keeps its current flat
+/// routes; these endpoints just manage which databases are attached and
+/// which one is the default that flat routes resolve to.
+///
+/// <para>
+/// Wire shape mirrors the engine API verbatim — Attach for existing files,
+/// Create for new ones, Detach for unregister-but-keep, Drop for delete-files.
+/// The convenience verb <see cref="DatabaseRegistry.AttachOrCreate"/> powers
+/// <c>POST /databases</c> by default so a Studio "+" button works without the
+/// caller knowing whether the file pre-existed.
+/// </para>
+/// </summary>
+public static class DatabaseEndpoints
+{
+    /// <summary>
+    /// Mount the verbs on the supplied route builder. <paramref name="defaultDataDir"/>
+    /// is where a path-less <c>POST /databases</c> drops the new <c>.dfdb</c>
+    /// (defaults to <c>{dataDir}/{name}.dfdb</c>).
+    /// </summary>
+    public static void Map(IEndpointRouteBuilder app, DatabaseRegistry registry, string defaultDataDir)
+    {
+        // List every attached database. Stable shape across phases.
+        app.MapGet("/databases", () =>
+        {
+            var entries = registry.List();
+            return Results.Ok(new
+            {
+                @default = registry.DefaultDatabaseName,
+                count = entries.Count,
+                databases = entries.Select(e => new
+                {
+                    name = e.Name,
+                    filePath = e.FilePath,
+                    isDefault = e.IsDefault,
+                })
+            });
+        });
+
+        // Create-or-attach (Studio "+ Add Database").
+        //   { "name": "acme" }                            -> {dataDir}/acme.dfdb, create-or-attach
+        //   { "name": "acme", "path": "/abs/p.dfdb" }     -> use the supplied path, create-or-attach
+        //   { "name": "acme", "createIfMissing": false }  -> Attach (existing file only)
+        app.MapPost("/databases", (CreateDatabaseRequest req) =>
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(req.Name))
+                    return Results.BadRequest(new { error = "Missing 'name' field." });
+
+                var path = string.IsNullOrWhiteSpace(req.Path)
+                    ? Path.Combine(defaultDataDir, $"{req.Name}.dfdb")
+                    : req.Path!;
+
+                var createIfMissing = req.CreateIfMissing ?? true;
+                if (createIfMissing)
+                    registry.AttachOrCreate(req.Name, path);
+                else
+                    registry.Attach(req.Name, path);
+
+                // Resolve the entry we just registered so we return the
+                // canonical casing + canonical path back to the caller.
+                var info = registry.List().First(e =>
+                    string.Equals(e.Name, req.Name, StringComparison.OrdinalIgnoreCase));
+                return Results.Created($"/databases/{info.Name}", new
+                {
+                    name = info.Name,
+                    filePath = info.FilePath,
+                    isDefault = info.IsDefault,
+                });
+            }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            catch (DocumentForgeException ex) { return Results.Conflict(new { error = ex.Message }); }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        // Detach (default) or Drop (delete-files=true). 404 when not
+        // registered so Studio's idempotent retries get a clear signal.
+        app.MapDelete("/databases/{name}", (string name, bool? deleteFiles) =>
+        {
+            try
+            {
+                var drop = deleteFiles == true;
+                var removed = drop ? registry.Drop(name) : registry.Detach(name);
+                if (!removed)
+                    return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+                return Results.Ok(new
+                {
+                    name,
+                    action = drop ? "dropped" : "detached",
+                    defaultAfter = registry.DefaultDatabaseName,
+                });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        // Phase 2 stopgap for "I'm working on DB X now" — Phase 4 will
+        // replace this with auth-scoped Bearer tokens.
+        app.MapPost("/databases/{name}/set-default", (string name) =>
+        {
+            try
+            {
+                registry.SetDefault(name);
+                return Results.Ok(new { name, isDefault = true });
+            }
+            catch (DocumentForgeException ex) { return Results.NotFound(new { error = ex.Message }); }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+    }
+}
+
+/// <summary>
+/// Issue #66: payload for POST /databases. Path optional — if absent we
+/// derive <c>{dataDir}/{name}.dfdb</c>. CreateIfMissing defaults to true so
+/// the Studio "+ Add" UX works without a file existing yet.
+/// </summary>
+public record CreateDatabaseRequest(string Name, string? Path = null, bool? CreateIfMissing = null);
