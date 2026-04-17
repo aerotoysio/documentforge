@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>DocumentForge.Engine</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\DocumentForge.Query\DocumentForge.Query.csproj" />
+    <ProjectReference Include="..\DocumentForge.Transactions\DocumentForge.Transactions.csproj" />
+  </ItemGroup>
+</Project>

@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\DocumentForge.Engine\DocumentForge.Engine.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="..\DocumentForge.AirlineDemo\SeedData.cs" Link="SeedData.cs" />
+  </ItemGroup>
+</Project>

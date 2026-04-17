@@ -1,0 +1,519 @@
+using Xunit;
+using DocumentForge.Core;
+using DocumentForge.Document;
+using DocumentForge.Engine;
+using DocumentForge.Index;
+
+namespace DocumentForge.Tests;
+
+public class EngineTests : IDisposable
+{
+    private readonly string _dbPath;
+    private readonly DocumentForgeDb _db;
+
+    public EngineTests()
+    {
+        _dbPath = Path.Combine(Path.GetTempPath(), $"test_{Guid.NewGuid():N}.dfdb");
+        _db = DocumentForgeDb.Create(_dbPath);
+    }
+
+    [Fact]
+    public void InsertAndRetrieve_SingleDocument()
+    {
+        var id = _db.Insert("users", """{"name": "Alice", "age": 30}""");
+        var collection = _db.GetCollection("users");
+        Assert.NotNull(collection);
+        var doc = collection!.FindById(id);
+        Assert.NotNull(doc);
+        Assert.Equal("Alice", doc!["name"].AsString);
+        Assert.Equal(30, doc["age"].AsInt32);
+    }
+
+    [Fact]
+    public void Query_SelectAll()
+    {
+        _db.Insert("users", """{"name": "Alice", "age": 30}""");
+        _db.Insert("users", """{"name": "Bob", "age": 25}""");
+
+        var result = _db.Execute("SELECT * FROM users");
+        Assert.True(result.Success);
+        Assert.Equal(2, result.Documents.Count);
+    }
+
+    [Fact]
+    public void Query_WhereEquals()
+    {
+        _db.Insert("users", """{"name": "Alice", "age": 30}""");
+        _db.Insert("users", """{"name": "Bob", "age": 25}""");
+        _db.Insert("users", """{"name": "Charlie", "age": 30}""");
+
+        var result = _db.Execute("SELECT * FROM users WHERE age = 30");
+        Assert.True(result.Success);
+        Assert.Equal(2, result.Documents.Count);
+    }
+
+    [Fact]
+    public void Query_WithIndex()
+    {
+        _db.Insert("users", """{"name": "Alice", "age": 30}""");
+        _db.Insert("users", """{"name": "Bob", "age": 25}""");
+        _db.CreateIndex("users", "name", "idx_name");
+
+        var result = _db.Execute("SELECT * FROM users WHERE name = 'Bob'");
+        Assert.True(result.Success);
+        Assert.Single(result.Documents);
+        Assert.Equal("Bob", result.Documents[0]["name"].AsString);
+        Assert.Contains("INDEX_SCAN", result.QueryPlan!);
+    }
+
+    [Fact]
+    public void Query_NestedField()
+    {
+        _db.Insert("orders", """{"pnr": "ABC123", "passenger": {"lastName": "Smith"}}""");
+        _db.Insert("orders", """{"pnr": "DEF456", "passenger": {"lastName": "Jones"}}""");
+        _db.CreateIndex("orders", "passenger.lastName", "idx_lastname");
+
+        var result = _db.Execute("SELECT * FROM orders WHERE passenger.lastName = 'Smith'");
+        Assert.True(result.Success);
+        Assert.Single(result.Documents);
+        Assert.Contains("INDEX_SCAN", result.QueryPlan!);
+    }
+
+    [Fact]
+    public void Query_OrderByAndLimit()
+    {
+        _db.Insert("users", """{"name": "Charlie", "age": 35}""");
+        _db.Insert("users", """{"name": "Alice", "age": 30}""");
+        _db.Insert("users", """{"name": "Bob", "age": 25}""");
+
+        var result = _db.Execute("SELECT * FROM users ORDER BY name LIMIT 2");
+        Assert.True(result.Success);
+        Assert.Equal(2, result.Documents.Count);
+        Assert.Equal("Alice", result.Documents[0]["name"].AsString);
+        Assert.Equal("Bob", result.Documents[1]["name"].AsString);
+    }
+
+    [Fact]
+    public void Query_Update()
+    {
+        _db.Insert("users", """{"name": "Alice", "age": 30}""");
+
+        var result = _db.Execute("UPDATE users SET age = 31 WHERE name = 'Alice'");
+        Assert.True(result.Success);
+        Assert.Equal(1, result.AffectedCount);
+
+        result = _db.Execute("SELECT * FROM users WHERE name = 'Alice'");
+        Assert.Equal(31, result.Documents[0]["age"].AsDouble);
+    }
+
+    [Fact]
+    public void Query_Delete()
+    {
+        _db.Insert("users", """{"name": "Alice", "age": 30}""");
+        _db.Insert("users", """{"name": "Bob", "age": 25}""");
+
+        var result = _db.Execute("DELETE FROM users WHERE name = 'Alice'");
+        Assert.True(result.Success);
+        Assert.Equal(1, result.AffectedCount);
+
+        result = _db.Execute("SELECT * FROM users");
+        Assert.Single(result.Documents);
+        Assert.Equal("Bob", result.Documents[0]["name"].AsString);
+    }
+
+    [Fact]
+    public void Query_Count()
+    {
+        _db.Insert("users", """{"name": "Alice"}""");
+        _db.Insert("users", """{"name": "Bob"}""");
+        _db.Insert("users", """{"name": "Charlie"}""");
+
+        var result = _db.Execute("SELECT COUNT(*) FROM users");
+        Assert.True(result.Success);
+        Assert.Equal(3, result.Documents[0]["count"].AsInt64);
+    }
+
+    [Fact]
+    public void BsonSerializer_RoundTrip()
+    {
+        var doc = BsonDocument.FromJson("""
+        {
+            "name": "Test",
+            "age": 42,
+            "active": true,
+            "tags": ["a", "b"],
+            "address": { "city": "London", "zip": "SW1" }
+        }
+        """);
+
+        var bytes = BsonSerializer.Serialize(doc);
+        var restored = BsonSerializer.Deserialize(bytes);
+
+        Assert.Equal("Test", restored["name"].AsString);
+        Assert.Equal(42, restored["age"].AsInt32);
+        Assert.Equal(true, restored["active"].AsBoolean);
+        Assert.Equal(2, restored["tags"].AsArray.Count);
+        Assert.Equal("London", JsonPathExtractor.Extract(restored, "address.city").AsString);
+    }
+
+    [Fact]
+    public void JsonPathExtractor_NestedPaths()
+    {
+        var doc = BsonDocument.FromJson("""
+        {
+            "passenger": {
+                "firstName": "John",
+                "lastName": "Smith"
+            },
+            "flights": [
+                { "code": "AA100", "from": "JFK" },
+                { "code": "AA200", "from": "LAX" }
+            ]
+        }
+        """);
+
+        Assert.Equal("Smith", JsonPathExtractor.Extract(doc, "passenger.lastName").AsString);
+        Assert.Equal("AA100", JsonPathExtractor.Extract(doc, "flights[0].code").AsString);
+        Assert.Equal("LAX", JsonPathExtractor.Extract(doc, "flights[1].from").AsString);
+
+        var allCodes = JsonPathExtractor.ExtractAll(doc, "flights[*].code").ToList();
+        Assert.Equal(2, allCodes.Count);
+        Assert.Equal("AA100", allCodes[0].AsString);
+        Assert.Equal("AA200", allCodes[1].AsString);
+    }
+
+    [Fact]
+    public void DatabaseStatistics()
+    {
+        _db.Insert("users", """{"name": "Alice"}""");
+        _db.CreateIndex("users", "name", "idx_name");
+
+        var stats = _db.GetStatistics();
+        Assert.Single(stats.Collections);
+        Assert.Equal("users", stats.Collections[0].Name);
+        Assert.Equal(1, stats.Collections[0].DocumentCount);
+        Assert.Equal(1, stats.Collections[0].IndexCount);
+    }
+
+    [Fact]
+    public void Insert_ImmediatelyQueryableByIndex()
+    {
+        // Create index FIRST, before any data
+        _db.Insert("orders", """{"pnr": "SEED01", "passenger": {"lastName": "Nobody"}}""");
+        _db.CreateIndex("orders", "passenger.lastName", "idx_ln");
+
+        // Now insert a new document
+        _db.Insert("orders", """{"pnr": "NEW001", "passenger": {"lastName": "Henderson"}}""");
+
+        // Query it IMMEDIATELY - no delay, no background sync
+        var result = _db.Execute("SELECT * FROM orders WHERE passenger.lastName = 'Henderson'");
+
+        Assert.True(result.Success);
+        Assert.Single(result.Documents);
+        Assert.Equal("NEW001", result.Documents[0]["pnr"].AsString);
+        Assert.Contains("INDEX_SCAN", result.QueryPlan!); // Proves it used the index
+    }
+
+    [Fact]
+    public void CrashRecovery_ReplaysWalOnReopen()
+    {
+        // Insert data normally - this leaves the DB in a clean state
+        _db.Insert("orders", """{"pnr": "SAFE01", "amount": 100}""");
+        _db.Insert("orders", """{"pnr": "SAFE02", "amount": 200}""");
+        _db.Flush();
+
+        // Simulate a crash: write directly to the recovery log a page that
+        // wasn't flushed to the data file. This mimics "WAL written, data file crashed".
+        // The easiest way to prove the recovery replay works is to:
+        //   1. Close cleanly
+        //   2. Synthesize a recovery log with a fake page entry pointing to page 0 (header)
+        //   3. Reopen and verify the recovery happens without corruption
+
+        _db.Dispose();
+
+        // Read the actual header page from disk
+        var headerBytes = new byte[Constants.PageSize];
+        using (var fs = new FileStream(_dbPath, FileMode.Open, FileAccess.Read))
+        {
+            fs.Read(headerBytes, 0, Constants.PageSize);
+        }
+
+        // Create a recovery log with that page (simulating a mid-flush crash)
+        var recoveryPath = _dbPath + ".recovery";
+        using (var rl = new DocumentForge.Transactions.RecoveryLog(recoveryPath))
+        {
+            rl.LogPageWrite(PageId.Header, headerBytes);
+            rl.Flush();
+        }
+
+        // Reopen - recovery should trigger
+        using var reopened = DocumentForgeDb.Open(_dbPath);
+        var result = reopened.Execute("SELECT * FROM orders");
+        Assert.True(result.Success);
+        Assert.Equal(2, result.Documents.Count);
+
+        // Recovery log may be recreated (empty) by the new DB instance, but must be empty
+        if (File.Exists(recoveryPath))
+            Assert.Equal(0, new FileInfo(recoveryPath).Length);
+    }
+
+    [Fact]
+    public void Aggregation_SumAvgMinMax()
+    {
+        _db.Insert("sales", """{"product": "A", "price": 10}""");
+        _db.Insert("sales", """{"product": "B", "price": 20}""");
+        _db.Insert("sales", """{"product": "C", "price": 30}""");
+
+        var result = _db.Execute("SELECT SUM(price), AVG(price), MIN(price), MAX(price), COUNT(*) FROM sales");
+        Assert.True(result.Success);
+        Assert.Single(result.Documents);
+        var row = result.Documents[0];
+        Assert.Equal(60.0, row["SUM(price)"].AsDouble);
+        Assert.Equal(20.0, row["AVG(price)"].AsDouble);
+        Assert.Equal(10.0, row["MIN(price)"].AsDouble);
+        Assert.Equal(30.0, row["MAX(price)"].AsDouble);
+        Assert.Equal(3, row["COUNT(*)"].AsInt64);
+    }
+
+    [Fact]
+    public void Aggregation_GroupBy()
+    {
+        _db.Insert("sales", """{"category": "food", "price": 10}""");
+        _db.Insert("sales", """{"category": "food", "price": 20}""");
+        _db.Insert("sales", """{"category": "tech", "price": 100}""");
+        _db.Insert("sales", """{"category": "tech", "price": 200}""");
+        _db.Insert("sales", """{"category": "tech", "price": 300}""");
+
+        var result = _db.Execute("SELECT category, SUM(price), COUNT(*) FROM sales GROUP BY category");
+        Assert.True(result.Success);
+        Assert.Equal(2, result.Documents.Count);
+
+        var food = result.Documents.First(d => d["category"].AsString == "food");
+        Assert.Equal(30.0, food["SUM(price)"].AsDouble);
+        Assert.Equal(2, food["COUNT(*)"].AsInt64);
+
+        var tech = result.Documents.First(d => d["category"].AsString == "tech");
+        Assert.Equal(600.0, tech["SUM(price)"].AsDouble);
+        Assert.Equal(3, tech["COUNT(*)"].AsInt64);
+    }
+
+    [Fact]
+    public void Aggregation_WithWhere()
+    {
+        _db.Insert("orders", """{"status": "CONFIRMED", "amount": 100}""");
+        _db.Insert("orders", """{"status": "CONFIRMED", "amount": 200}""");
+        _db.Insert("orders", """{"status": "CANCELLED", "amount": 50}""");
+
+        var result = _db.Execute("SELECT SUM(amount) FROM orders WHERE status = 'CONFIRMED'");
+        Assert.True(result.Success);
+        Assert.Single(result.Documents);
+        Assert.Equal(300.0, result.Documents[0]["SUM(amount)"].AsDouble);
+    }
+
+    [Fact]
+    public void OverflowPages_LargeDocumentRoundTrip()
+    {
+        // Build a doc larger than 8156 bytes (single page max)
+        var largeString = new string('X', 20_000);  // 20KB of X's
+        var json = $$"""{"name": "big doc", "payload": "{{largeString}}", "tag": "A"}""";
+
+        var id = _db.Insert("bigdocs", json);
+        var collection = _db.GetCollection("bigdocs");
+        Assert.NotNull(collection);
+
+        // Round-trip
+        var doc = collection!.FindById(id);
+        Assert.NotNull(doc);
+        Assert.Equal("big doc", doc!["name"].AsString);
+        Assert.Equal("A", doc["tag"].AsString);
+        Assert.Equal(20_000, doc["payload"].AsString.Length);
+        Assert.Equal(new string('X', 20_000), doc["payload"].AsString);
+    }
+
+    [Fact]
+    public void OverflowPages_MultipleBigDocs()
+    {
+        // Insert a few large docs + some small ones, mixed
+        var bigPayload = new string('A', 15_000);
+        _db.Insert("mixed", """{"type": "small", "n": 1}""");
+        _db.Insert("mixed", $$"""{"type": "big", "payload": "{{bigPayload}}"}""");
+        _db.Insert("mixed", """{"type": "small", "n": 2}""");
+
+        var results = _db.Execute("SELECT * FROM mixed");
+        Assert.True(results.Success);
+        Assert.Equal(3, results.Documents.Count);
+
+        var big = results.Documents.First(d => d["type"].AsString == "big");
+        Assert.Equal(15_000, big["payload"].AsString.Length);
+    }
+
+    [Fact]
+    public void OverflowPages_DeletedDocFreesChain()
+    {
+        var big = new string('Z', 25_000);
+        var id1 = _db.Insert("items", $$"""{"big": "{{big}}", "n": 1}""");
+        _db.Insert("items", """{"n": 2}""");
+
+        var collection = _db.GetCollection("items")!;
+        Assert.NotNull(collection.FindById(id1));
+
+        var result = _db.Execute($"DELETE FROM items WHERE n = 1");
+        Assert.Equal(1, result.AffectedCount);
+
+        // After delete, the big doc should be gone
+        Assert.Null(collection.FindById(id1));
+
+        // Small doc still there
+        var remaining = _db.Execute("SELECT * FROM items");
+        Assert.Single(remaining.Documents);
+        Assert.Equal(2, remaining.Documents[0]["n"].AsInt32);
+    }
+
+    [Fact]
+    public void Join_BasicEqualityJoin()
+    {
+        _db.Insert("orders", """{"pnr": "ABC123", "flightNumber": "AA100"}""");
+        _db.Insert("orders", """{"pnr": "DEF456", "flightNumber": "UA200"}""");
+        _db.Insert("orders", """{"pnr": "GHI789", "flightNumber": "AA100"}""");
+
+        _db.Insert("flights", """{"flightNumber": "AA100", "departureAirport": "JFK"}""");
+        _db.Insert("flights", """{"flightNumber": "UA200", "departureAirport": "LAX"}""");
+        _db.Insert("flights", """{"flightNumber": "BA300", "departureAirport": "LHR"}""");
+
+        var result = _db.Execute(
+            "SELECT * FROM orders JOIN flights ON orders.flightNumber = flights.flightNumber");
+
+        Assert.True(result.Success);
+        Assert.Equal(3, result.Documents.Count); // 2 orders match AA100, 1 matches UA200
+        Assert.Contains("HASH_JOIN", result.QueryPlan!);
+
+        // Verify combined structure: should have both "orders" and "flights" sub-documents
+        var first = result.Documents[0];
+        Assert.NotNull(first["orders"]);
+        Assert.NotNull(first["flights"]);
+        // The joined flight should match - JFK or LAX
+        var depAirport = JsonPathExtractor.Extract(first, "flights.departureAirport").AsString;
+        Assert.True(depAirport is "JFK" or "LAX");
+    }
+
+    [Fact]
+    public void Join_WithWhereClause()
+    {
+        _db.Insert("orders", """{"pnr": "ABC123", "flightNumber": "AA100", "status": "CONFIRMED"}""");
+        _db.Insert("orders", """{"pnr": "DEF456", "flightNumber": "AA100", "status": "CANCELLED"}""");
+        _db.Insert("flights", """{"flightNumber": "AA100", "departureAirport": "JFK"}""");
+
+        var result = _db.Execute(
+            "SELECT * FROM orders JOIN flights ON orders.flightNumber = flights.flightNumber WHERE orders.status = 'CONFIRMED'");
+
+        Assert.True(result.Success);
+        Assert.Single(result.Documents);
+        Assert.Equal("ABC123", JsonPathExtractor.Extract(result.Documents[0], "orders.pnr").AsString);
+    }
+
+    [Fact]
+    public void RangeQuery_UsesIndex()
+    {
+        _db.Insert("products", """{"name": "Apple", "price": 1.50}""");
+        _db.Insert("products", """{"name": "Bread", "price": 3.00}""");
+        _db.Insert("products", """{"name": "Cheese", "price": 8.50}""");
+        _db.Insert("products", """{"name": "Donut", "price": 2.25}""");
+        _db.Insert("products", """{"name": "Egg", "price": 0.50}""");
+        _db.CreateIndex("products", "price", "idx_price");
+
+        // WHERE price > 2 should find Bread, Cheese, Donut
+        var result = _db.Execute("SELECT * FROM products WHERE price > 2");
+        Assert.True(result.Success);
+        Assert.Equal(3, result.Documents.Count);
+        Assert.Contains("INDEX_RANGE_SCAN", result.QueryPlan!);
+
+        // WHERE price >= 2.25 should find Bread, Cheese, Donut
+        result = _db.Execute("SELECT * FROM products WHERE price >= 2.25");
+        Assert.Equal(3, result.Documents.Count);
+
+        // WHERE price < 2 should find Apple, Egg
+        result = _db.Execute("SELECT * FROM products WHERE price < 2");
+        Assert.Equal(2, result.Documents.Count);
+
+        // WHERE price <= 1.50 should find Apple, Egg
+        result = _db.Execute("SELECT * FROM products WHERE price <= 1.50");
+        Assert.Equal(2, result.Documents.Count);
+    }
+
+    [Fact]
+    public void PersistentIndex_SurvivesRestart()
+    {
+        // Insert some documents and create an index
+        _db.Insert("orders", """{"pnr": "ABC123", "passenger": {"lastName": "Smith"}}""");
+        _db.Insert("orders", """{"pnr": "DEF456", "passenger": {"lastName": "Jones"}}""");
+        _db.Insert("orders", """{"pnr": "GHI789", "passenger": {"lastName": "Smith"}}""");
+        _db.CreateIndex("orders", "passenger.lastName", "idx_ln");
+        _db.CreateIndex("orders", "pnr", "idx_pnr", unique: true);
+        _db.Flush();
+        _db.Dispose();
+
+        // Reopen and verify indexes exist WITHOUT rebuilding from data
+        using var reopened = DocumentForgeDb.Open(_dbPath);
+
+        // Check index metadata
+        var indexes = reopened.GetIndexes("orders");
+        Assert.Equal(2, indexes.Count);
+        Assert.Contains(indexes, i => i.Name == "idx_ln");
+        Assert.Contains(indexes, i => i.Name == "idx_pnr" && i.IsUnique);
+
+        // Verify the index actually WORKS (not just metadata) - should hit INDEX_SCAN plan
+        var result = reopened.Execute("SELECT * FROM orders WHERE passenger.lastName = 'Smith'");
+        Assert.True(result.Success);
+        Assert.Equal(2, result.Documents.Count);
+        Assert.Contains("INDEX_SCAN", result.QueryPlan!);
+
+        var result2 = reopened.Execute("SELECT * FROM orders WHERE pnr = 'ABC123'");
+        Assert.Single(result2.Documents);
+        Assert.Contains("INDEX_SCAN", result2.QueryPlan!);
+    }
+
+    [Fact]
+    public void PersistentIndex_UpdatesPersistAcrossRestart()
+    {
+        // Set up with index
+        _db.Insert("orders", """{"pnr": "ABC123", "status": "CONFIRMED"}""");
+        _db.CreateIndex("orders", "status", "idx_status");
+
+        // Insert more docs AFTER index exists
+        _db.Insert("orders", """{"pnr": "DEF456", "status": "CANCELLED"}""");
+        _db.Insert("orders", """{"pnr": "GHI789", "status": "CONFIRMED"}""");
+
+        _db.Flush();
+        _db.Dispose();
+
+        // Reopen - post-index inserts should be findable
+        using var reopened = DocumentForgeDb.Open(_dbPath);
+        var result = reopened.Execute("SELECT * FROM orders WHERE status = 'CONFIRMED'");
+
+        Assert.True(result.Success);
+        Assert.Equal(2, result.Documents.Count);
+        Assert.Contains("INDEX_SCAN", result.QueryPlan!);
+    }
+
+    [Fact]
+    public void OpenExistingDatabase()
+    {
+        _db.Insert("users", """{"name": "Alice"}""");
+        _db.Flush();
+        _db.Dispose();
+
+        using var reopened = DocumentForgeDb.Open(_dbPath);
+        var result = reopened.Execute("SELECT * FROM users");
+        Assert.True(result.Success);
+        Assert.Single(result.Documents);
+        Assert.Equal("Alice", result.Documents[0]["name"].AsString);
+    }
+
+    public void Dispose()
+    {
+        _db.Dispose();
+        try { File.Delete(_dbPath); } catch { }
+        try { File.Delete(_dbPath + ".wal"); } catch { }
+        try { File.Delete(_dbPath + ".recovery"); } catch { }
+    }
+}
