@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Replication — DocumentForge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="index.html" class="brand"><span class="brand-dot"></span>DocumentForge</a>
+    <div class="nav-links">
+      <a href="getting-started.html">Getting Started</a>
+      <a href="query-language.html">Query Language</a>
+      <a href="data-modeling.html">Data Modeling</a>
+      <a href="replication.html" class="active">Replication</a>
+      <a href="deployment.html">Deployment</a>
+      <a href="performance.html">Performance</a>
+    </div>
+  </div>
+</nav>
+
+<section class="page-title">
+  <div class="container">
+    <div class="eyebrow">Chapter 04</div>
+    <h1>Replication &amp; Handover</h1>
+    <p>Read scaling with coherent followers. Zero-downtime leader handover for datacenter moves.</p>
+  </div>
+</section>
+
+<div class="doc-layout">
+  <aside class="toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#concept">Concepts</a></li>
+      <li><a href="#logical">Logical replication</a></li>
+      <li><a href="#physical">Physical replication</a></li>
+      <li><a href="#setup">Setting it up</a></li>
+      <li><a href="#reconnect">Catchup on reconnect</a></li>
+      <li><a href="#handover">Planned handover</a></li>
+      <li><a href="#dc-move">Datacenter move runbook</a></li>
+      <li><a href="#caveats">Caveats</a></li>
+    </ul>
+  </aside>
+
+  <article>
+    <h2 id="concept">Concepts</h2>
+    <p>DocumentForge supports two replication modes. They solve different problems and can be used together.</p>
+
+    <table>
+      <thead><tr><th></th><th>Logical</th><th>Physical</th></tr></thead>
+      <tbody>
+        <tr><td>Stream contents</td><td>Operations (Insert / Delete / Index)</td><td>Raw page bytes</td></tr>
+        <tr><td>Follower can serve queries</td><td>✓ — indexes stay coherent</td><td>✗ — indexes are stale</td></tr>
+        <tr><td>Follower file byte-identical</td><td>No (layout may differ)</td><td>Yes (byte-for-byte)</td></tr>
+        <tr><td>Best for</td><td>Read scale, planned handover</td><td>Hot backup, disaster recovery</td></tr>
+        <tr><td>Sequence numbers</td><td>Yes — guaranteed ordering</td><td>No</td></tr>
+        <tr><td>Catchup on reconnect</td><td>Yes — from last-seen seq</td><td>No (manual resync)</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="logical">Logical replication</h2>
+    <p>On a write, the leader broadcasts an operation record to every connected follower. The follower runs the operation through its own engine, so indexes, location maps, and cached state all stay consistent with the data file.</p>
+
+    <pre>           Leader                           Follower
+       ┌──────────┐                      ┌──────────┐
+  write│  Insert  │ ──(seq 42, Insert)──▶│  Insert  │
+       │  ↓       │ ──(seq 43, Insert)──▶│  ↓       │
+       │  engine  │ ──(seq 44, CreIdx)──▶│  engine  │
+       │  ↓       │ ───(heartbeat)──────▶│          │
+       │  disk    │                      │  disk    │
+       └──────────┘                      └──────────┘</pre>
+
+    <p>Each op carries a monotonic <code>seq</code>. Followers persist the last-applied seq to a sidecar file. On reconnect, they tell the leader their position and get replayed everything after.</p>
+
+    <h2 id="physical">Physical replication</h2>
+    <p>Page-level byte streaming. The follower ends up with a byte-identical data file. Use this when you want a hot backup or plan to manually promote the follower as a new leader without any engine warmup.</p>
+
+    <p>Physical replication doesn't solve the "can the follower serve reads" problem — its in-memory structures (indexes, location map) were built from the original data and aren't updated by page writes. Close and reopen the follower to rebuild them.</p>
+
+    <h2 id="setup">Setting it up</h2>
+    <p>Start with logical replication — it's what you want for most cases.</p>
+
+    <h4>Leader</h4>
+    <pre><span class="hl-kw">using var</span> leader = DocumentForgeDb.OpenOrCreate(<span class="hl-str">"prod.dfdb"</span>);
+leader.StartLogicalReplicationServer(port: <span class="hl-num">5500</span>);
+
+<span class="hl-com">// Normal writes broadcast automatically</span>
+leader.Insert(<span class="hl-str">"orders"</span>, <span class="hl-str">@"{""pnr"": ""ABC123""}"</span>);</pre>
+
+    <h4>Follower (read replica)</h4>
+    <pre><span class="hl-kw">using var</span> follower = DocumentForgeDb.OpenOrCreate(<span class="hl-str">"replica.dfdb"</span>);
+follower.StartLogicalReplicationFollower(<span class="hl-str">"leader-host"</span>, <span class="hl-num">5500</span>);
+
+<span class="hl-com">// Reads work correctly, with live indexes</span>
+<span class="hl-kw">var</span> r = follower.Execute(<span class="hl-str">"SELECT * FROM orders WHERE pnr = 'ABC123'"</span>);</pre>
+
+    <h4>Observability</h4>
+    <pre>leader.LeaderCurrentSeq       <span class="hl-com">// latest seq assigned</span>
+leader.GetLogicalFollowerCount() <span class="hl-com">// how many followers are connected</span>
+
+follower.FollowerLastSeq         <span class="hl-com">// last applied op</span>
+follower.LogicallyReplicatedOps  <span class="hl-com">// running total</span>
+follower.GapsDetected            <span class="hl-com">// non-zero means lost ops — investigate!</span></pre>
+
+    <h2 id="reconnect">Catchup on reconnect</h2>
+    <p>When a follower disconnects and reconnects:</p>
+
+    <ol>
+      <li>Follower loads its last-applied seq from disk (the <code>.followerseq</code> sidecar file)</li>
+      <li>Follower sends a handshake to the leader: <em>"I'm at seq N, please bring me up to date"</em></li>
+      <li>Leader replays all ops with seq &gt; N from its in-memory ring buffer</li>
+      <li>Leader adds the follower to its live broadcast list</li>
+    </ol>
+
+    <div class="callout">
+      <strong>Ring buffer limit:</strong> the leader keeps the last 10,000 ops by default. If a follower is further behind than that, it cannot catch up from the buffer alone. For MVP, you should resync manually (copy the leader's data file to the follower). A future version will handle this by sending a full snapshot.
+    </div>
+
+    <h2 id="handover">Planned handover</h2>
+    <p>When you need to move the leader role — typically for maintenance or a datacenter move — use the planned-handover flow. It guarantees zero data loss because the new leader catches up fully <em>before</em> the old one releases the role.</p>
+
+    <pre><span class="hl-com">// 1. Old leader enters read-only and waits for new leader to catch up</span>
+<span class="hl-kw">ulong</span> finalSeq = oldLeader.BeginPlannedHandover(
+    followerLastSeqProbe: () =&gt; newLeader.FollowerLastSeq,
+    timeout: TimeSpan.FromMinutes(<span class="hl-num">5</span>));
+
+<span class="hl-com">// 2. Old leader is now read-only. New leader is caught up.
+//    Promote new leader.</span>
+newLeader.PromoteToLeader(port: <span class="hl-num">5500</span>);
+
+<span class="hl-com">// 3. Direct clients to new leader's address.
+//    Old leader can be shut down or repurposed as a follower.</span></pre>
+
+    <p>Between steps 1 and 2, writes to <code>oldLeader</code> throw <code>DocumentForgeException("Database is in read-only mode...")</code>. After step 2, <code>newLeader</code> accepts writes.</p>
+
+    <h2 id="dc-move">Datacenter move runbook</h2>
+    <p>A concrete recipe for moving a production database from <em>Datacenter A</em> to <em>Datacenter B</em>:</p>
+
+    <ol>
+      <li><strong>Week before:</strong> provision the new DocumentForge instance in DC-B. Have it run as a logical follower of the DC-A leader. Verify <code>FollowerLastSeq</code> matches <code>LeaderCurrentSeq</code> (or is within seconds).</li>
+      <li><strong>Maintenance window (15 min):</strong> inform clients of brief write unavailability.</li>
+      <li><strong>T+0:</strong> call <code>oldLeader.BeginPlannedHandover(...)</code>. Writes on DC-A now fail with a clear error.</li>
+      <li><strong>T+seconds:</strong> the call returns the <code>finalSeq</code> once DC-B is fully caught up.</li>
+      <li><strong>T+immediately:</strong> call <code>newLeader.PromoteToLeader(port)</code>. DC-B is now the writable leader.</li>
+      <li><strong>T+now:</strong> flip your load-balancer / DNS / connection string to point at DC-B.</li>
+      <li><strong>Optional:</strong> reconfigure DC-A as a follower of DC-B for ongoing disaster recovery.</li>
+    </ol>
+
+    <div class="callout">
+      <strong>What could go wrong, and how you'd detect it:</strong><br>
+      1) If DC-B doesn't catch up within the timeout, <code>BeginPlannedHandover</code> throws and re-enables writes on DC-A. Abort the handover, investigate the network, retry.<br>
+      2) If DC-B promotes while DC-A is still accepting writes, you'd have split-brain. The protocol prevents this: DC-A is read-only <em>before</em> DC-B is promoted. Never bypass that order.<br>
+      3) Clients writing to DC-A during the window see an error — make sure your client code has retry logic that can fail over to DC-B.
+    </div>
+
+    <h2 id="caveats">Caveats and current limits</h2>
+    <ul>
+      <li><strong>No auto-failover.</strong> Planned handover is manual. For crash failover (leader died), you'd need to promote a follower yourself and accept some data loss (the last few ops after the crash may not have reached the follower).</li>
+      <li><strong>No multi-master.</strong> Writes go to the leader only. You cannot write to two nodes simultaneously.</li>
+      <li><strong>Ring-buffered catchup.</strong> A follower that's been offline for a very long time may need a fresh snapshot (manual file copy) to catch up.</li>
+      <li><strong>Client-side failover.</strong> DocumentForge doesn't include a client-side load balancer or discovery service. Your application knows which host is the current leader.</li>
+    </ul>
+  </article>
+</div>
+
+<footer>
+  <div class="container">
+    <p><strong>DocumentForge</strong> — built with care, zero dependencies.</p>
+    <p class="meta">MIT License · Open Source · Version 0.1.0</p>
+  </div>
+</footer>
+
+</body>
+</html>

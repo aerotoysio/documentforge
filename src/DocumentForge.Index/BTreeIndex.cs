@@ -4,12 +4,14 @@ namespace DocumentForge.Index;
 
 /// <summary>
 /// In-memory B-tree index. Provides O(log n) lookups and range scans.
-/// Rebuilt from collection data on database open. Phase 2 will persist to pages.
+/// Backed by SortedDictionary (red-black tree) so Insert/Delete are O(log n)
+/// at any scale — SortedList would be O(n) because of array shifts.
 /// </summary>
 public sealed class BTreeIndex
 {
-    private readonly SortedList<IndexKey, List<DocumentId>> _tree;
-    private IndexStorage? _storage; // null during bulk rebuild, set for normal operations
+    private readonly SortedDictionary<IndexKey, List<DocumentId>> _tree;
+    private IndexStorage? _storage;
+    private bool _bulkMode;  // when true, Insert/Delete skip disk writes
 
     public IndexDefinition Definition { get; }
 
@@ -19,17 +21,35 @@ public sealed class BTreeIndex
     public BTreeIndex(IndexDefinition definition)
     {
         Definition = definition;
-        _tree = new SortedList<IndexKey, List<DocumentId>>(Comparer<IndexKey>.Default);
+        _tree = new SortedDictionary<IndexKey, List<DocumentId>>(Comparer<IndexKey>.Default);
     }
 
-    /// <summary>
-    /// Attach persistent storage. All subsequent Insert/Delete calls will be written to disk.
-    /// </summary>
     public void AttachStorage(IndexStorage storage) => _storage = storage;
+
+    /// <summary>
+    /// Put the index in bulk-load mode. Insert/Delete skip per-entry disk writes.
+    /// Call PersistBulk() after the bulk load completes to write everything at once.
+    /// </summary>
+    public void BeginBulkLoad() => _bulkMode = true;
+
+    /// <summary>
+    /// Ends bulk-load mode and writes ALL current in-memory entries to storage in one pass.
+    /// </summary>
+    public void EndBulkLoad()
+    {
+        _bulkMode = false;
+        if (_storage is null) return;
+        // Persist every entry currently in memory
+        foreach (var (key, docIds) in _tree)
+        {
+            foreach (var docId in docIds)
+                _storage.AppendEntry(key, docId, isDeleted: false);
+        }
+    }
 
     public void Insert(IndexKey key, DocumentId docId)
     {
-        if (key.Value.IsNull) return; // don't index null values
+        if (key.Value.IsNull) return;
 
         if (Definition.IsUnique && _tree.TryGetValue(key, out var existing) && existing.Count > 0)
         {
@@ -43,8 +63,8 @@ public sealed class BTreeIndex
         }
         list.Add(docId);
 
-        // Persist to disk if storage is attached
-        _storage?.AppendEntry(key, docId, isDeleted: false);
+        if (!_bulkMode)
+            _storage?.AppendEntry(key, docId, isDeleted: false);
     }
 
     public void Delete(IndexKey key, DocumentId docId)
@@ -56,8 +76,8 @@ public sealed class BTreeIndex
                 _tree.Remove(key);
         }
 
-        // Persist deletion tombstone
-        _storage?.AppendEntry(key, docId, isDeleted: true);
+        if (!_bulkMode)
+            _storage?.AppendEntry(key, docId, isDeleted: true);
     }
 
     /// <summary>
@@ -114,8 +134,5 @@ public sealed class BTreeIndex
         }
     }
 
-    public void Clear()
-    {
-        _tree.Clear();
-    }
+    public void Clear() => _tree.Clear();
 }

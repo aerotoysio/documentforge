@@ -258,6 +258,72 @@ public class EngineTests : IDisposable
     }
 
     [Fact]
+    public async System.Threading.Tasks.Task AutoFailover_PromotesOnLeaderSilence()
+    {
+        int leaderPort = 6000 + System.Random.Shared.Next(50);
+        int newLeaderPort = leaderPort + 1;
+
+        var leaderPath = Path.Combine(Path.GetTempPath(), $"af_leader_{Guid.NewGuid():N}.dfdb");
+        var followerPath = Path.Combine(Path.GetTempPath(), $"af_follower_{Guid.NewGuid():N}.dfdb");
+
+        try
+        {
+            // Start leader + follower
+            var leader = DocumentForgeDb.Create(leaderPath);
+            leader.StartLogicalReplicationServer(leaderPort);
+            await System.Threading.Tasks.Task.Delay(200);
+
+            using var follower = DocumentForgeDb.Create(followerPath);
+            follower.StartLogicalReplicationFollower("localhost", leaderPort);
+
+            // Wait for connection
+            for (int i = 0; i < 30 && leader.GetLogicalFollowerCount() == 0; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+            Assert.Equal(1, leader.GetLogicalFollowerCount());
+
+            // Insert on leader, replicate
+            leader.Insert("orders", """{"pnr": "AF001"}""");
+            for (int i = 0; i < 20 && follower.LogicallyReplicatedOps() == 0; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+            Assert.True(follower.LogicallyReplicatedOps() >= 1);
+
+            // Enable auto-failover on the follower with a short silence timeout
+            bool promotedCallbackFired = false;
+            int promotedPort = 0;
+            follower.EnableAutoFailover(
+                newLeaderPort: newLeaderPort,
+                silenceTimeout: TimeSpan.FromSeconds(3),
+                onPromoted: port => { promotedCallbackFired = true; promotedPort = port; });
+
+            // KILL the leader (simulates crash)
+            leader.Dispose();
+
+            // Wait for auto-failover to kick in (silence timeout + checks)
+            for (int i = 0; i < 50 && !follower.WasAutoFailoverPromoted; i++)
+                await System.Threading.Tasks.Task.Delay(200);
+
+            Assert.True(follower.WasAutoFailoverPromoted, "Follower should have auto-promoted after leader silence");
+            Assert.True(promotedCallbackFired, "onPromoted callback should have fired");
+            Assert.Equal(newLeaderPort, promotedPort);
+
+            // New leader can accept writes
+            Assert.False(follower.IsReadOnly);
+            follower.Insert("orders", """{"pnr": "AF002_POST_FAILOVER"}""");
+
+            var result = follower.Execute("SELECT * FROM orders");
+            Assert.Equal(2, result.Documents.Count);
+        }
+        finally
+        {
+            try { File.Delete(leaderPath); File.Delete(leaderPath + ".wal"); File.Delete(leaderPath + ".recovery"); } catch { }
+            try {
+                File.Delete(followerPath); File.Delete(followerPath + ".wal");
+                File.Delete(followerPath + ".recovery"); File.Delete(followerPath + ".followerseq");
+            } catch { }
+        }
+    }
+
+    [Fact]
     public async System.Threading.Tasks.Task PlannedHandover_ZeroDataLoss()
     {
         // Simulate a datacenter move: old_leader (DC1) hands off to new_leader (DC2)

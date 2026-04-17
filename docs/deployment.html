@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Deployment — DocumentForge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="index.html" class="brand"><span class="brand-dot"></span>DocumentForge</a>
+    <div class="nav-links">
+      <a href="getting-started.html">Getting Started</a>
+      <a href="query-language.html">Query Language</a>
+      <a href="data-modeling.html">Data Modeling</a>
+      <a href="replication.html">Replication</a>
+      <a href="deployment.html" class="active">Deployment</a>
+      <a href="performance.html">Performance</a>
+    </div>
+  </div>
+</nav>
+
+<section class="page-title">
+  <div class="container">
+    <div class="eyebrow">Chapter 05</div>
+    <h1>Deployment</h1>
+    <p>From local file to multi-region topology. What to configure, what to back up, and how to run across datacenters.</p>
+  </div>
+</section>
+
+<div class="doc-layout">
+  <aside class="toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#modes">Deployment modes</a></li>
+      <li><a href="#embedded">Embedded</a></li>
+      <li><a href="#api">API tier</a></li>
+      <li><a href="#leader-follower">Leader + Follower(s)</a></li>
+      <li><a href="#multi-region">Multi-region</a></li>
+      <li><a href="#files">Files on disk</a></li>
+      <li><a href="#config">Configuration</a></li>
+      <li><a href="#backup">Backups</a></li>
+      <li><a href="#monitor">Monitoring</a></li>
+      <li><a href="#checklist">Production checklist</a></li>
+    </ul>
+  </aside>
+
+  <article>
+    <h2 id="modes">Deployment modes</h2>
+    <p>DocumentForge is a library — there's no daemon to install. You deploy it <em>inside</em> your application. There are three common shapes:</p>
+
+    <table>
+      <thead><tr><th>Mode</th><th>Who uses it</th><th>Replication</th></tr></thead>
+      <tbody>
+        <tr><td>Embedded</td><td>One process, one file</td><td>None needed</td></tr>
+        <tr><td>API tier</td><td>Multiple app servers → one DB process</td><td>Optional followers</td></tr>
+        <tr><td>Leader + followers</td><td>High availability / read scale</td><td>Required</td></tr>
+        <tr><td>Multi-region</td><td>Global deployment</td><td>Cross-region async</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="embedded">Embedded</h2>
+    <p>The simplest mode. Your app opens the database file directly. Perfect for desktop apps, CLI tools, single-node services, tests, and demos.</p>
+
+    <pre><span class="hl-kw">using var</span> db = DocumentForgeDb.OpenOrCreate(<span class="hl-str">"app.dfdb"</span>);</pre>
+
+    <p>No network, no auth, no config. The file moves with your app. One process holds the write lock; other processes see a <em>FileShare.Read</em> lock and should either open their own file or connect via a network API layer.</p>
+
+    <h2 id="api">API tier</h2>
+    <p>When multiple application servers need to share data, run a single API process that owns the database file. Other services talk to it over HTTP (or your protocol of choice).</p>
+
+    <pre><span class="hl-com">// One DocumentForge.Api process owns the file</span>
+dotnet run --project samples/DocumentForge.Api --urls "http://0.0.0.0:5000"
+
+<span class="hl-com">// App servers send queries over HTTP</span>
+POST /query  {"sql": "SELECT * FROM orders WHERE pnr = 'ABC123'"}</pre>
+
+    <p>This is the classic "dedicated DB process" pattern, except the process is just a small .NET API in front of the embedded DB. A single machine with a decent CPU handles tens of thousands of QPS comfortably.</p>
+
+    <h2 id="leader-follower">Leader + Follower(s)</h2>
+    <p>For read scaling and standby capability, run one leader and N followers. Writes go to the leader; reads can go to any node.</p>
+
+    <pre>┌───────────────────┐
+│  Leader (writes)  │ ──logical replication──┐
+│  app.dfdb         │                        │
+└───────────────────┘                        ▼
+                                   ┌─────────────────┐
+                                   │ Follower (read) │
+                                   │ replica.dfdb    │
+                                   └─────────────────┘</pre>
+
+    <p>Setup (each process):</p>
+
+    <pre><span class="hl-com">// On the leader host</span>
+<span class="hl-kw">using var</span> db = DocumentForgeDb.OpenOrCreate(<span class="hl-str">"app.dfdb"</span>);
+db.StartLogicalReplicationServer(<span class="hl-num">5500</span>);
+
+<span class="hl-com">// On each follower host</span>
+<span class="hl-kw">using var</span> db = DocumentForgeDb.OpenOrCreate(<span class="hl-str">"replica.dfdb"</span>);
+db.StartLogicalReplicationFollower(<span class="hl-str">"leader-host.internal"</span>, <span class="hl-num">5500</span>);</pre>
+
+    <p>Point your read-heavy queries at any follower. Writes always go to the leader.</p>
+
+    <div class="callout">
+      <strong>Network:</strong> replication uses a raw TCP connection. Open firewall rules for the replication port between your nodes. There's no auth or encryption at the protocol level yet — run it on a trusted internal network or tunnel over VPN / WireGuard / service mesh mTLS.
+    </div>
+
+    <h2 id="multi-region">Multi-region</h2>
+    <p>For a global deployment — e.g. writes in Dubai, reads in Singapore and London — run followers in each region. Logical replication is asynchronous and handles cross-continental latency gracefully.</p>
+
+    <pre>                          ┌────────────┐
+                          │  Dubai     │
+                          │  LEADER    │
+                          └─────┬──────┘
+                 ┌──────────────┼──────────────┐
+                 │              │              │
+        ┌────────▼──────┐  ┌────▼────────┐  ┌──▼─────────┐
+        │  Singapore    │  │  Frankfurt  │  │  New York  │
+        │  Follower     │  │  Follower   │  │  Follower  │
+        └───────────────┘  └─────────────┘  └────────────┘</pre>
+
+    <p>Read requests are routed to the nearest follower by your load balancer or client logic. Writes hit the Dubai leader; followers catch up in seconds.</p>
+
+    <p>To migrate the leader role between regions (e.g. rotating for planned maintenance), see the <a href="replication.html#dc-move">datacenter move runbook</a>.</p>
+
+    <h2 id="files">Files on disk</h2>
+    <p>A DocumentForge database is up to four files. Keep them together.</p>
+
+    <table>
+      <thead><tr><th>File</th><th>Purpose</th><th>Safe to delete?</th></tr></thead>
+      <tbody>
+        <tr><td><code>app.dfdb</code></td><td>The database itself</td><td>Never (it's your data)</td></tr>
+        <tr><td><code>app.dfdb.wal</code></td><td>Write-ahead log</td><td>Only when DB is cleanly closed</td></tr>
+        <tr><td><code>app.dfdb.recovery</code></td><td>Crash recovery log</td><td>Only when DB is cleanly closed</td></tr>
+        <tr><td><code>app.dfdb.followerseq</code></td><td>Follower's last-applied seq</td><td>Yes, but triggers full catchup</td></tr>
+      </tbody>
+    </table>
+
+    <h2 id="config">Configuration</h2>
+    <p>Most tuning is via <code>DatabaseOptions</code>:</p>
+
+    <pre><span class="hl-kw">var</span> options = <span class="hl-kw">new</span> DatabaseOptions
+{
+    CacheSizeInPages = <span class="hl-num">10_000</span>,   <span class="hl-com">// 10K pages × 8KB = 80MB cache</span>
+    EnableWal        = <span class="hl-kw">true</span>      <span class="hl-com">// WAL + recovery + replication</span>
+};
+
+<span class="hl-kw">using var</span> db = DocumentForgeDb.OpenOrCreate(<span class="hl-str">"app.dfdb"</span>, options);</pre>
+
+    <h4>Cache sizing rule of thumb</h4>
+    <ul>
+      <li>Target ~20% of your data size in cache for a well-performing system</li>
+      <li>1M docs ~ 500MB data → 10K pages (80MB) is fine</li>
+      <li>10M docs ~ 5GB data → 100K pages (800MB) recommended</li>
+      <li>100M docs ~ 50GB data → you want 200K–500K pages and a machine with &gt; 32GB RAM</li>
+    </ul>
+
+    <h2 id="backup">Backups</h2>
+    <p>Because the database is a file, backup is file copy. But don't just <code>cp</code> a live database — you might get a torn page mid-write.</p>
+
+    <h4>Cold backup (simplest, downtime required)</h4>
+    <pre>dotnet my-app.dll --shutdown       <span class="hl-com"># stop the process</span>
+cp app.dfdb /backup/app.$(date).dfdb
+cp app.dfdb.wal /backup/app.$(date).dfdb.wal
+dotnet my-app.dll                  <span class="hl-com"># start again</span></pre>
+
+    <h4>Warm backup (no downtime, uses a follower)</h4>
+    <p>Much better approach for production: spin up a follower for the purpose of backup. Let it catch up. Pause replication. Copy the follower's file. Resume.</p>
+
+    <h4>Streaming backup (future)</h4>
+    <p>A future version will include an online backup command that walks the data file page-by-page with a stable snapshot, without blocking writes. Until then, the follower-as-backup pattern is the right approach.</p>
+
+    <h2 id="monitor">Monitoring</h2>
+    <p>DocumentForge exposes its state through the <code>DatabaseStatistics</code> object. Log these at regular intervals.</p>
+
+    <pre><span class="hl-kw">var</span> s = db.GetStatistics();
+
+Console.WriteLine(<span class="hl-kw">$"</span>File:     {s.FileSize / <span class="hl-num">1024.0</span> / <span class="hl-num">1024.0</span>:F2} MB<span class="hl-str">"</span>);
+Console.WriteLine(<span class="hl-kw">$"</span>Pages:    {s.PageCount:N0}<span class="hl-str">"</span>);
+Console.WriteLine(<span class="hl-kw">$"</span>Cache:    {s.CachedPages:N0} pages ({s.DirtyPages} dirty)<span class="hl-str">"</span>);
+<span class="hl-kw">foreach</span> (<span class="hl-kw">var</span> coll <span class="hl-kw">in</span> s.Collections)
+    Console.WriteLine(<span class="hl-kw">$"</span>{coll.Name}: {coll.DocumentCount} docs, {coll.IndexCount} indexes<span class="hl-str">"</span>);</pre>
+
+    <p>For replication:</p>
+
+    <pre><span class="hl-com">// Leader metrics</span>
+leader.LeaderCurrentSeq            <span class="hl-com">// how many ops have been issued</span>
+leader.GetLogicalFollowerCount()   <span class="hl-com">// connected followers</span>
+
+<span class="hl-com">// Follower metrics</span>
+follower.FollowerLastSeq           <span class="hl-com">// how far caught up</span>
+follower.LogicallyReplicatedOps    <span class="hl-com">// running total</span>
+follower.GapsDetected              <span class="hl-com">// &gt; 0 means lost ops — alert!</span></pre>
+
+    <p>Replication lag is <code>leader.LeaderCurrentSeq - follower.FollowerLastSeq</code>. Healthy systems keep this near zero during normal traffic.</p>
+
+    <h2 id="checklist">Production checklist</h2>
+    <ul>
+      <li>✓ Leader and followers on trusted network (no auth in protocol yet)</li>
+      <li>✓ Monitor replication lag — alert on sustained growth</li>
+      <li>✓ Monitor <code>GapsDetected</code> — should always be 0</li>
+      <li>✓ Cache size tuned to your data size</li>
+      <li>✓ Backups automated via a dedicated follower</li>
+      <li>✓ Clients know which host is the current leader</li>
+      <li>✓ Client retry logic for transient "read-only mode" errors during planned handover</li>
+      <li>✓ Disk space alerting on the data file's volume</li>
+      <li>✓ Tested a full handover in staging before needing one in prod</li>
+    </ul>
+  </article>
+</div>
+
+<footer>
+  <div class="container">
+    <p><strong>DocumentForge</strong> — built with care, zero dependencies.</p>
+    <p class="meta">MIT License · Open Source · Version 0.1.0</p>
+  </div>
+</footer>
+
+</body>
+</html>
