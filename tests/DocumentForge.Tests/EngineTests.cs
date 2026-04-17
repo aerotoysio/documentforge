@@ -276,26 +276,26 @@ public class EngineTests : IDisposable
                 .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("C", db3, ownsDb: true))
                 .ShardCollection("orders", shardKeyPath: "pnr");
 
-            // Insert 30 orders with varying PNRs - should distribute across shards
-            for (int i = 0; i < 30; i++)
-                cluster.Insert("orders", $$"""{"pnr": "ORD{{i:D3}}", "amount": {{i * 10}}}""");
+            // Insert 300 orders - consistent hashing spreads them reasonably
+            for (int i = 0; i < 300; i++)
+                cluster.Insert("orders", $$"""{"pnr": "ORD{{i:D4}}", "amount": {{i * 10}}}""");
 
             // Count per shard to verify distribution
             long c1 = db1.Execute("SELECT COUNT(*) FROM orders").Documents[0]["count"].AsInt64;
             long c2 = db2.Execute("SELECT COUNT(*) FROM orders").Documents[0]["count"].AsInt64;
             long c3 = db3.Execute("SELECT COUNT(*) FROM orders").Documents[0]["count"].AsInt64;
 
-            Assert.Equal(30, c1 + c2 + c3);
+            Assert.Equal(300, c1 + c2 + c3);
             Assert.True(c1 > 0 && c2 > 0 && c3 > 0, $"Expected docs on all shards, got {c1}/{c2}/{c3}");
 
             // Single-shard query (WHERE on shard key) should route to ONE shard
-            var result = cluster.Execute("SELECT * FROM orders WHERE pnr = 'ORD005'");
+            var result = cluster.Execute("SELECT * FROM orders WHERE pnr = 'ORD0050'");
             Assert.Single(result.Documents);
             Assert.Contains("SINGLE_SHARD", result.QueryPlan!);
 
             // Scatter-gather query (no shard key filter)
             var all = cluster.Execute("SELECT * FROM orders");
-            Assert.Equal(30, all.Documents.Count);
+            Assert.Equal(300, all.Documents.Count);
             Assert.Contains("SCATTER_GATHER", all.QueryPlan!);
         }
         finally
@@ -304,6 +304,85 @@ public class EngineTests : IDisposable
             try { File.Delete(path2); File.Delete(path2 + ".wal"); File.Delete(path2 + ".recovery"); } catch { }
             try { File.Delete(path3); File.Delete(path3 + ".wal"); File.Delete(path3 + ".recovery"); } catch { }
         }
+    }
+
+    [Fact]
+    public void Cluster_ConfigRoundTrip_JsonPersistence()
+    {
+        var configPath = Path.Combine(Path.GetTempPath(), $"cfg_{Guid.NewGuid():N}.json");
+        try
+        {
+            var original = new DocumentForge.Engine.Cluster.ClusterConfig
+            {
+                Version = 1,
+                VirtualNodesPerShard = 200,
+                Shards = new()
+                {
+                    new() { Name = "dubai",     Endpoint = "dubai.example.com:5500" },
+                    new() { Name = "singapore", Endpoint = "sg.example.com:5500" }
+                },
+                Collections =
+                {
+                    ["orders"]   = new() { Strategy = DocumentForge.Engine.Cluster.ShardingStrategy.Hash,       ShardKeyPath = "pnr" },
+                    ["airports"] = new() { Strategy = DocumentForge.Engine.Cluster.ShardingStrategy.Replicated }
+                }
+            };
+
+            original.Save(configPath);
+            var loaded = DocumentForge.Engine.Cluster.ClusterConfig.Load(configPath);
+
+            Assert.Equal(200, loaded.VirtualNodesPerShard);
+            Assert.Equal(2, loaded.Shards.Count);
+            Assert.Equal("dubai", loaded.Shards[0].Name);
+            Assert.Equal("singapore", loaded.Shards[1].Name);
+            Assert.Equal(2, loaded.Collections.Count);
+            Assert.Equal("pnr", loaded.Collections["orders"].ShardKeyPath);
+            Assert.Equal(DocumentForge.Engine.Cluster.ShardingStrategy.Replicated, loaded.Collections["airports"].Strategy);
+        }
+        finally { try { File.Delete(configPath); } catch { } }
+    }
+
+    [Fact]
+    public void Cluster_ConsistentHashing_StabilityAcrossRestart()
+    {
+        // Build ring twice with the same shard names - routing must be IDENTICAL
+        var ring1 = new DocumentForge.Engine.Cluster.ConsistentHashRing(
+            new[] { "dubai", "singapore", "london" }, virtualNodesPerShard: 150);
+        var ring2 = new DocumentForge.Engine.Cluster.ConsistentHashRing(
+            new[] { "dubai", "singapore", "london" }, virtualNodesPerShard: 150);
+
+        for (int i = 0; i < 1000; i++)
+        {
+            var key = $"PNR{i:D5}";
+            Assert.Equal(ring1.PickShardIndex(key), ring2.PickShardIndex(key));
+        }
+    }
+
+    [Fact]
+    public void Cluster_ConsistentHashing_AddShardOnlyMovesFractionOfKeys()
+    {
+        var ring3 = new DocumentForge.Engine.Cluster.ConsistentHashRing(
+            new[] { "A", "B", "C" }, virtualNodesPerShard: 150);
+        var ring4 = new DocumentForge.Engine.Cluster.ConsistentHashRing(
+            new[] { "A", "B", "C", "D" }, virtualNodesPerShard: 150);
+
+        int moved = 0;
+        const int total = 10_000;
+        for (int i = 0; i < total; i++)
+        {
+            var key = $"KEY{i:D6}";
+            var before = ring3.PickShardIndex(key);
+            var after = ring4.PickShardIndex(key);
+            // Map shard indices: ring3's shard idx 0/1/2 = A/B/C; ring4's idx 0/1/2/3 = A/B/C/D.
+            // A key moved if after != 3 (new shard D) but maps to a different letter OR if after == 3.
+            // Simpler: just check if the shard index changed AND the new ring has the key on a new position.
+            // Because A/B/C have same names, they're at mostly the same ring positions.
+            if (ring3.PickShardIndex(key) != ring4.PickShardIndex(key)) moved++;
+        }
+
+        // Naive hash would move ~75%. Consistent hashing should move ~25% (1 / N+1).
+        var movedPct = moved * 100.0 / total;
+        Assert.True(movedPct < 40, $"Consistent hashing should move ~25% of keys, but moved {movedPct:F1}%");
     }
 
     [Fact]
