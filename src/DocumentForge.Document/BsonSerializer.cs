@@ -1,3 +1,4 @@
+using System.Buffers;
 using DocumentForge.Core;
 
 namespace DocumentForge.Document;
@@ -14,7 +15,6 @@ public static class BsonSerializer
         using var ms = new MemoryStream();
         using var writer = new BinaryWriter(ms);
 
-        // Placeholder for total size
         writer.Write((int)0);
         writer.Write((short)doc.Count);
 
@@ -27,14 +27,47 @@ public static class BsonSerializer
             WriteValue(writer, field.Value);
         }
 
-        writer.Write((byte)0xFF); // terminator
+        writer.Write((byte)0xFF);
 
-        // Go back and write total size
         var totalSize = (int)ms.Position;
         ms.Position = 0;
         writer.Write(totalSize);
 
         return ms.ToArray();
+    }
+
+    /// <summary>
+    /// Serialize into a pooled buffer. Caller MUST return the buffer to ArrayPool when done.
+    /// Fast path when called from Collection.Insert - saves one allocation vs Serialize().
+    /// </summary>
+    public static (byte[] Buffer, int Length) SerializeToPooled(BsonDocument doc)
+    {
+        using var ms = new MemoryStream();
+        using (var writer = new BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen: true))
+        {
+            writer.Write((int)0);
+            writer.Write((short)doc.Count);
+
+            foreach (var field in doc)
+            {
+                writer.Write((byte)field.Value.Type);
+                var keyBytes = System.Text.Encoding.UTF8.GetBytes(field.Key);
+                writer.Write((short)keyBytes.Length);
+                writer.Write(keyBytes);
+                WriteValue(writer, field.Value);
+            }
+
+            writer.Write((byte)0xFF);
+
+            var totalSize = (int)ms.Position;
+            ms.Position = 0;
+            writer.Write(totalSize);
+        } // writer disposed -> flushed
+
+        var length = (int)ms.Length;
+        var pooled = ArrayPool<byte>.Shared.Rent(length);
+        ms.GetBuffer().AsSpan(0, length).CopyTo(pooled);
+        return (pooled, length);
     }
 
     public static BsonDocument Deserialize(ReadOnlySpan<byte> data)

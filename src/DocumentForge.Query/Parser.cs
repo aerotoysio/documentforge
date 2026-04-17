@@ -217,8 +217,14 @@ public sealed class Parser
         Expect(TokenType.On);
         var collection = ReadIdentifierPath();
         Expect(TokenType.LeftParen);
-        var jsonPath = ReadIdentifierPath();
+
+        // Support composite indexes: (path1, path2, ...)
+        var paths = new List<string> { ReadIdentifierPath() };
+        while (Match(TokenType.Comma))
+            paths.Add(ReadIdentifierPath());
+
         Expect(TokenType.RightParen);
+        var jsonPath = string.Join(",", paths);
 
         return new CreateIndexStatement
         {

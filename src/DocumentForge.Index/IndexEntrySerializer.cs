@@ -4,28 +4,53 @@ using DocumentForge.Document;
 namespace DocumentForge.Index;
 
 /// <summary>
-/// Binary serialization for index entries: (key, docId, isDeleted).
-/// Format: [Flags:1][KeyType:1][KeyLen:2][KeyBytes:N][DocId:16]
-/// Flags: 0x01 = Deleted (tombstone)
+/// Binary serialization for index entries.
+/// Supports both single-field and composite keys.
+///
+/// Single-field format (backward compatible):
+///   [Flags:1][KeyType:1][KeyLen:2][KeyBytes:N][DocId:16]
+///
+/// Composite format (marker 0xFE in Flags):
+///   [Flags:1 | 0xFE][Count:1][Comp1Type:1][Comp1Len:2][Comp1Bytes]...[DocId:16]
 /// </summary>
 public static class IndexEntrySerializer
 {
     public const byte FlagDeleted = 0x01;
+    public const byte FlagComposite = 0xFE;
 
     public static byte[] Serialize(IndexKey key, DocumentId docId, bool isDeleted = false)
     {
         using var ms = new MemoryStream();
         using var w = new BinaryWriter(ms);
 
-        w.Write((byte)(isDeleted ? FlagDeleted : 0));
-        w.Write((byte)key.Value.Type);
+        byte flags = 0;
+        if (isDeleted) flags |= FlagDeleted;
 
-        var keyBytes = SerializeKeyValue(key.Value);
-        w.Write((short)keyBytes.Length);
-        w.Write(keyBytes);
+        if (key.Components.Count == 1)
+        {
+            // Single-field - backward compatible format
+            w.Write(flags);
+            w.Write((byte)key.Value.Type);
+            var keyBytes = SerializeKeyValue(key.Value);
+            w.Write((short)keyBytes.Length);
+            w.Write(keyBytes);
+        }
+        else
+        {
+            // Composite: set the composite marker bit
+            flags |= FlagComposite;
+            w.Write(flags);
+            w.Write((byte)key.Components.Count);
+            foreach (var comp in key.Components)
+            {
+                w.Write((byte)comp.Type);
+                var keyBytes = SerializeKeyValue(comp);
+                w.Write((short)keyBytes.Length);
+                w.Write(keyBytes);
+            }
+        }
 
         w.Write(docId.ToBytes());
-
         return ms.ToArray();
     }
 
@@ -34,14 +59,35 @@ public static class IndexEntrySerializer
         int offset = 0;
         var flags = data[offset++];
         bool isDeleted = (flags & FlagDeleted) != 0;
-        var keyType = (BsonType)data[offset++];
-        var keyLen = BitConverter.ToInt16(data[offset..]);
-        offset += 2;
-        var keyValue = DeserializeKeyValue(keyType, data.Slice(offset, keyLen));
-        offset += keyLen;
-        var docId = DocumentId.FromBytes(data.Slice(offset, 16));
+        bool isComposite = (flags & FlagComposite) == FlagComposite;
 
-        return (new IndexKey(keyValue), docId, isDeleted);
+        IndexKey key;
+        if (!isComposite)
+        {
+            var keyType = (BsonType)data[offset++];
+            var keyLen = BitConverter.ToInt16(data[offset..]);
+            offset += 2;
+            var keyValue = DeserializeKeyValue(keyType, data.Slice(offset, keyLen));
+            offset += keyLen;
+            key = new IndexKey(keyValue);
+        }
+        else
+        {
+            int count = data[offset++];
+            var components = new BsonValue[count];
+            for (int i = 0; i < count; i++)
+            {
+                var compType = (BsonType)data[offset++];
+                var compLen = BitConverter.ToInt16(data[offset..]);
+                offset += 2;
+                components[i] = DeserializeKeyValue(compType, data.Slice(offset, compLen));
+                offset += compLen;
+            }
+            key = new IndexKey(components);
+        }
+
+        var docId = DocumentId.FromBytes(data.Slice(offset, 16));
+        return (key, docId, isDeleted);
     }
 
     private static byte[] SerializeKeyValue(BsonValue value)
