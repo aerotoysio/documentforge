@@ -257,6 +257,82 @@ public class EngineTests : IDisposable
             Assert.Equal(0, new FileInfo(recoveryPath).Length);
     }
 
+    public sealed class TestOrder
+    {
+        public string _id { get; set; } = "";
+        public string Pnr { get; set; } = "";
+        public string Status { get; set; } = "";
+        public int Amount { get; set; }
+    }
+
+    [Fact]
+    public void Linq_WhereAndFirstOrDefault()
+    {
+        _db.Insert("orders", """{"pnr": "ABC123", "status": "CONFIRMED", "amount": 100}""");
+        _db.Insert("orders", """{"pnr": "DEF456", "status": "CANCELLED", "amount": 50}""");
+
+        var orders = _db.Collection<TestOrder>("orders");
+        var found = orders.Where(o => o.Pnr == "ABC123").FirstOrDefault();
+
+        Assert.NotNull(found);
+        Assert.Equal("ABC123", found!.Pnr);
+        Assert.Equal(100, found.Amount);
+    }
+
+    [Fact]
+    public void Linq_MultipleConditions_And()
+    {
+        _db.Insert("orders", """{"pnr": "A", "status": "CONFIRMED", "amount": 100}""");
+        _db.Insert("orders", """{"pnr": "B", "status": "CONFIRMED", "amount": 500}""");
+        _db.Insert("orders", """{"pnr": "C", "status": "CANCELLED", "amount": 200}""");
+
+        var orders = _db.Collection<TestOrder>("orders");
+        var results = orders.Where(o => o.Status == "CONFIRMED" && o.Amount > 200).ToList();
+
+        Assert.Single(results);
+        Assert.Equal("B", results[0].Pnr);
+    }
+
+    [Fact]
+    public void Linq_OrderByAndTake()
+    {
+        _db.Insert("orders", """{"pnr": "X", "amount": 300}""");
+        _db.Insert("orders", """{"pnr": "Y", "amount": 100}""");
+        _db.Insert("orders", """{"pnr": "Z", "amount": 200}""");
+
+        var orders = _db.Collection<TestOrder>("orders");
+        var top2 = orders.OrderByDescending(o => o.Amount).Take(2).ToList();
+
+        Assert.Equal(2, top2.Count);
+        Assert.Equal("X", top2[0].Pnr);  // 300
+        Assert.Equal("Z", top2[1].Pnr);  // 200
+    }
+
+    [Fact]
+    public void Linq_CountWithWhere()
+    {
+        _db.Insert("orders", """{"pnr": "A", "status": "CONFIRMED"}""");
+        _db.Insert("orders", """{"pnr": "B", "status": "CONFIRMED"}""");
+        _db.Insert("orders", """{"pnr": "C", "status": "CANCELLED"}""");
+
+        var orders = _db.Collection<TestOrder>("orders");
+        Assert.Equal(2, orders.Where(o => o.Status == "CONFIRMED").Count());
+    }
+
+    [Fact]
+    public void Linq_WithCapturedVariable()
+    {
+        _db.Insert("orders", """{"pnr": "CAP001", "amount": 100}""");
+        _db.Insert("orders", """{"pnr": "CAP002", "amount": 200}""");
+
+        var targetPnr = "CAP002";
+        var orders = _db.Collection<TestOrder>("orders");
+        var found = orders.Where(o => o.Pnr == targetPnr).FirstOrDefault();
+
+        Assert.NotNull(found);
+        Assert.Equal("CAP002", found!.Pnr);
+    }
+
     [Fact]
     public void Cluster_HashShard_RoutesSingleDocToOneShard()
     {

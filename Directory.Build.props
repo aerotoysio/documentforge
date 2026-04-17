@@ -6,4 +6,28 @@
     <LangVersion>latest</LangVersion>
     <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
   </PropertyGroup>
+
+  <!-- Shared NuGet metadata. Per-project csproj files control whether to pack. -->
+  <PropertyGroup>
+    <Version>0.1.0</Version>
+    <Authors>DocumentForge contributors</Authors>
+    <Company>DocumentForge</Company>
+    <Product>DocumentForge</Product>
+    <Copyright>Copyright © DocumentForge contributors</Copyright>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/yourname/documentforge</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/yourname/documentforge</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>database;document-database;json;embedded;nosql;sql;replication;sharding</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+    <IncludeSymbols>true</IncludeSymbols>
+    <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!-- Only pack library projects, not samples/tests -->
+  <PropertyGroup>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
 </Project>

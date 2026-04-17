@@ -1,7 +1,13 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <RootNamespace>DocumentForge.Engine</RootNamespace>
+    <PackageId>DocumentForge</PackageId>
+    <Description>Embedded JSON document database for .NET with SQL-like queries, B-tree indexes, persistent WAL, logical replication, auto-failover, and consistent-hash sharding. Zero external dependencies.</Description>
+    <IsPackable>true</IsPackable>
   </PropertyGroup>
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" Condition="Exists('..\..\README.md')" />
+  </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\DocumentForge.Query\DocumentForge.Query.csproj" />
     <ProjectReference Include="..\DocumentForge.Transactions\DocumentForge.Transactions.csproj" />

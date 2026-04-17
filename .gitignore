@@ -24,6 +24,11 @@ publish/
 *.dfdb
 *.dfdb.wal
 
+## NuGet artifacts
+artifacts/
+*.nupkg
+*.snupkg
+
 ## OS
 Thumbs.db
 .DS_Store

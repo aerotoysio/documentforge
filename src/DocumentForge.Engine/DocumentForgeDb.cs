@@ -174,6 +174,15 @@ public sealed class DocumentForgeDb : IDisposable
         return recovered;
     }
 
+    // --- LINQ API ---
+
+    /// <summary>
+    /// Get a strongly-typed LINQ view of a collection. Write queries in C# instead of SQL:
+    /// <code>db.Collection&lt;Order&gt;("orders").Where(o => o.Pnr == "ABC123").FirstOrDefault();</code>
+    /// </summary>
+    public Linq.LinqCollection<T> Collection<T>(string name) where T : class =>
+        new Linq.LinqCollection<T>(this, name);
+
     // --- Collection API ---
 
     public Collection GetOrCreateCollection(string name)
