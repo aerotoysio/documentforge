@@ -258,6 +258,127 @@ public class EngineTests : IDisposable
     }
 
     [Fact]
+    public void Cluster_HashShard_RoutesSingleDocToOneShard()
+    {
+        var path1 = Path.Combine(Path.GetTempPath(), $"sh1_{Guid.NewGuid():N}.dfdb");
+        var path2 = Path.Combine(Path.GetTempPath(), $"sh2_{Guid.NewGuid():N}.dfdb");
+        var path3 = Path.Combine(Path.GetTempPath(), $"sh3_{Guid.NewGuid():N}.dfdb");
+
+        try
+        {
+            var db1 = DocumentForgeDb.Create(path1);
+            var db2 = DocumentForgeDb.Create(path2);
+            var db3 = DocumentForgeDb.Create(path3);
+
+            using var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster()
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db1, ownsDb: true))
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("B", db2, ownsDb: true))
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("C", db3, ownsDb: true))
+                .ShardCollection("orders", shardKeyPath: "pnr");
+
+            // Insert 30 orders with varying PNRs - should distribute across shards
+            for (int i = 0; i < 30; i++)
+                cluster.Insert("orders", $$"""{"pnr": "ORD{{i:D3}}", "amount": {{i * 10}}}""");
+
+            // Count per shard to verify distribution
+            long c1 = db1.Execute("SELECT COUNT(*) FROM orders").Documents[0]["count"].AsInt64;
+            long c2 = db2.Execute("SELECT COUNT(*) FROM orders").Documents[0]["count"].AsInt64;
+            long c3 = db3.Execute("SELECT COUNT(*) FROM orders").Documents[0]["count"].AsInt64;
+
+            Assert.Equal(30, c1 + c2 + c3);
+            Assert.True(c1 > 0 && c2 > 0 && c3 > 0, $"Expected docs on all shards, got {c1}/{c2}/{c3}");
+
+            // Single-shard query (WHERE on shard key) should route to ONE shard
+            var result = cluster.Execute("SELECT * FROM orders WHERE pnr = 'ORD005'");
+            Assert.Single(result.Documents);
+            Assert.Contains("SINGLE_SHARD", result.QueryPlan!);
+
+            // Scatter-gather query (no shard key filter)
+            var all = cluster.Execute("SELECT * FROM orders");
+            Assert.Equal(30, all.Documents.Count);
+            Assert.Contains("SCATTER_GATHER", all.QueryPlan!);
+        }
+        finally
+        {
+            try { File.Delete(path1); File.Delete(path1 + ".wal"); File.Delete(path1 + ".recovery"); } catch { }
+            try { File.Delete(path2); File.Delete(path2 + ".wal"); File.Delete(path2 + ".recovery"); } catch { }
+            try { File.Delete(path3); File.Delete(path3 + ".wal"); File.Delete(path3 + ".recovery"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Cluster_ReplicatedCollection_EveryShardHasFullCopy()
+    {
+        var path1 = Path.Combine(Path.GetTempPath(), $"rep1_{Guid.NewGuid():N}.dfdb");
+        var path2 = Path.Combine(Path.GetTempPath(), $"rep2_{Guid.NewGuid():N}.dfdb");
+
+        try
+        {
+            var db1 = DocumentForgeDb.Create(path1);
+            var db2 = DocumentForgeDb.Create(path2);
+
+            using var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster()
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db1, ownsDb: true))
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("B", db2, ownsDb: true))
+                .ReplicateCollection("airports");
+
+            // Inserting to a replicated collection writes to ALL shards
+            cluster.Insert("airports", """{"code": "JFK", "name": "John F. Kennedy"}""");
+            cluster.Insert("airports", """{"code": "LAX", "name": "Los Angeles"}""");
+
+            long c1 = db1.Execute("SELECT COUNT(*) FROM airports").Documents[0]["count"].AsInt64;
+            long c2 = db2.Execute("SELECT COUNT(*) FROM airports").Documents[0]["count"].AsInt64;
+            Assert.Equal(2, c1);
+            Assert.Equal(2, c2);
+        }
+        finally
+        {
+            try { File.Delete(path1); File.Delete(path1 + ".wal"); File.Delete(path1 + ".recovery"); } catch { }
+            try { File.Delete(path2); File.Delete(path2 + ".wal"); File.Delete(path2 + ".recovery"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Cluster_ScatterGatherAggregate_MergesCountSum()
+    {
+        var path1 = Path.Combine(Path.GetTempPath(), $"agg1_{Guid.NewGuid():N}.dfdb");
+        var path2 = Path.Combine(Path.GetTempPath(), $"agg2_{Guid.NewGuid():N}.dfdb");
+
+        try
+        {
+            var db1 = DocumentForgeDb.Create(path1);
+            var db2 = DocumentForgeDb.Create(path2);
+
+            using var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster()
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db1, ownsDb: true))
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("B", db2, ownsDb: true))
+                .ShardCollection("sales", shardKeyPath: "orderId");
+
+            for (int i = 0; i < 20; i++)
+                cluster.Insert("sales", $$"""{"orderId": "ORD{{i:D3}}", "amount": {{i * 10}}}""");
+
+            // Verify distribution was real (both shards got some)
+            var c1 = db1.Execute("SELECT COUNT(*) FROM sales").Documents[0]["count"].AsInt64;
+            var c2 = db2.Execute("SELECT COUNT(*) FROM sales").Documents[0]["count"].AsInt64;
+            Assert.Equal(20, c1 + c2);
+
+            // Aggregate across shards
+            var sumResult = cluster.Execute("SELECT SUM(amount) FROM sales");
+            Assert.Single(sumResult.Documents);
+            // Expected: 0 + 10 + 20 + ... + 190 = 1900
+            Assert.Equal(1900.0, sumResult.Documents[0]["SUM(amount)"].AsDouble);
+
+            var countResult = cluster.Execute("SELECT COUNT(*) FROM sales");
+            Assert.Equal(20, countResult.Documents[0]["count"].AsInt64);
+        }
+        finally
+        {
+            try { File.Delete(path1); File.Delete(path1 + ".wal"); File.Delete(path1 + ".recovery"); } catch { }
+            try { File.Delete(path2); File.Delete(path2 + ".wal"); File.Delete(path2 + ".recovery"); } catch { }
+        }
+    }
+
+    [Fact]
     public async System.Threading.Tasks.Task AutoFailover_PromotesOnLeaderSilence()
     {
         int leaderPort = 6000 + System.Random.Shared.Next(50);
