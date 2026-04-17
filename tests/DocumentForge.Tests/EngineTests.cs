@@ -258,6 +258,112 @@ public class EngineTests : IDisposable
     }
 
     [Fact]
+    public async System.Threading.Tasks.Task LogicalReplication_CatchupAfterReconnect()
+    {
+        int port = 5800 + System.Random.Shared.Next(100);
+        var leaderPath = Path.Combine(Path.GetTempPath(), $"cleader_{Guid.NewGuid():N}.dfdb");
+        var followerPath = Path.Combine(Path.GetTempPath(), $"cfollower_{Guid.NewGuid():N}.dfdb");
+
+        try
+        {
+            using var leader = DocumentForgeDb.Create(leaderPath);
+            leader.StartLogicalReplicationServer(port);
+            await System.Threading.Tasks.Task.Delay(150);
+
+            // Follower connects, receives a few inserts, then disconnects
+            var follower1 = DocumentForgeDb.Create(followerPath);
+            follower1.StartLogicalReplicationFollower("localhost", port);
+
+            for (int i = 0; i < 20 && leader.GetLogicalFollowerCount() == 0; i++)
+                await System.Threading.Tasks.Task.Delay(50);
+
+            leader.Insert("orders", """{"pnr": "BEFORE_1"}""");
+            leader.Insert("orders", """{"pnr": "BEFORE_2"}""");
+
+            // Wait for follower to receive
+            for (int i = 0; i < 20 && follower1.LogicallyReplicatedOps() < 2; i++)
+                await System.Threading.Tasks.Task.Delay(50);
+            Assert.True(follower1.LogicallyReplicatedOps() >= 2);
+
+            // Disconnect follower
+            follower1.Dispose();
+            await System.Threading.Tasks.Task.Delay(100);
+
+            // Leader continues to get writes while follower is gone
+            leader.Insert("orders", """{"pnr": "DURING_1"}""");
+            leader.Insert("orders", """{"pnr": "DURING_2"}""");
+            leader.Insert("orders", """{"pnr": "DURING_3"}""");
+
+            // Reconnect - persisted seq should trigger catchup
+            using var follower2 = DocumentForgeDb.Open(followerPath);
+            follower2.StartLogicalReplicationFollower("localhost", port);
+
+            // Wait for catchup: follower should get the 3 DURING ops
+            for (int i = 0; i < 30 && follower2.LogicallyReplicatedOps() < 3; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+
+            // Verify all 5 docs are on the follower
+            var result = follower2.Execute("SELECT * FROM orders");
+            Assert.Equal(5, result.Documents.Count);
+
+            // Gap detection: catchup doesn't involve gaps (we replay in order)
+            Assert.Equal(0, follower2.GapsDetected);
+        }
+        finally
+        {
+            try { File.Delete(leaderPath); File.Delete(leaderPath + ".wal"); File.Delete(leaderPath + ".recovery"); } catch { }
+            try {
+                File.Delete(followerPath); File.Delete(followerPath + ".wal");
+                File.Delete(followerPath + ".recovery"); File.Delete(followerPath + ".followerseq");
+            } catch { }
+        }
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task LogicalReplication_FollowerSeesInsertsWithWorkingIndex()
+    {
+        int port = 5700 + System.Random.Shared.Next(100);
+        var leaderPath = Path.Combine(Path.GetTempPath(), $"lleader_{Guid.NewGuid():N}.dfdb");
+        var followerPath = Path.Combine(Path.GetTempPath(), $"lfollower_{Guid.NewGuid():N}.dfdb");
+
+        try
+        {
+            using var leader = DocumentForgeDb.Create(leaderPath);
+            leader.StartLogicalReplicationServer(port);
+            await System.Threading.Tasks.Task.Delay(200);
+
+            using var follower = DocumentForgeDb.Create(followerPath);
+            follower.StartLogicalReplicationFollower("localhost", port);
+
+            // Wait for connect
+            for (int i = 0; i < 20 && leader.GetLogicalFollowerCount() == 0; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+            Assert.Equal(1, leader.GetLogicalFollowerCount());
+
+            // Insert on leader, create index on leader - both should replicate
+            leader.Insert("orders", """{"pnr": "A001", "lastName": "Smith"}""");
+            leader.Insert("orders", """{"pnr": "A002", "lastName": "Jones"}""");
+            leader.Insert("orders", """{"pnr": "A003", "lastName": "Smith"}""");
+            leader.CreateIndex("orders", "lastName", "idx_ln");
+
+            // Wait for replication
+            for (int i = 0; i < 20 && follower.LogicallyReplicatedOps() < 4; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+
+            // Follower should see the data AND use the index (coherent reads!)
+            var result = follower.Execute("SELECT * FROM orders WHERE lastName = 'Smith'");
+            Assert.True(result.Success);
+            Assert.Equal(2, result.Documents.Count);
+            Assert.Contains("INDEX_SCAN", result.QueryPlan!);
+        }
+        finally
+        {
+            try { File.Delete(leaderPath); File.Delete(leaderPath + ".wal"); File.Delete(leaderPath + ".recovery"); } catch { }
+            try { File.Delete(followerPath); File.Delete(followerPath + ".wal"); File.Delete(followerPath + ".recovery"); } catch { }
+        }
+    }
+
+    [Fact]
     public async System.Threading.Tasks.Task Replication_LeaderStreamsToFollower()
     {
         // Pick a free port for this test
@@ -616,5 +722,6 @@ public class EngineTests : IDisposable
         try { File.Delete(_dbPath); } catch { }
         try { File.Delete(_dbPath + ".wal"); } catch { }
         try { File.Delete(_dbPath + ".recovery"); } catch { }
+        try { File.Delete(_dbPath + ".followerseq"); } catch { }
     }
 }

@@ -21,6 +21,8 @@ public sealed class DocumentForgeDb : IDisposable
     private readonly RecoveryLog? _recoveryLog;
     private ReplicationServer? _replicationServer;
     private ReplicationFollower? _replicationFollower;
+    private LogicalReplicationServer? _logicalServer;
+    private LogicalReplicationFollower? _logicalFollower;
     private CombinedPreFlushHook? _combinedHook;
     private bool _disposed;
 
@@ -202,8 +204,16 @@ public sealed class DocumentForgeDb : IDisposable
         try
         {
             var collection = _catalog.GetOrCreateCollection(collectionName);
+            doc.EnsureId(); // ensure _id is set BEFORE we broadcast, so followers get the same id
             var id = collection.Insert(doc);
             _indexManager.OnDocumentInserted(collectionName, id, doc);
+
+            // Broadcast to read-only followers (with sequence number assignment)
+            if (_logicalServer is not null)
+            {
+                var bytes = BsonSerializer.Serialize(doc);
+                _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, bytes);
+            }
             return id;
         }
         finally
@@ -428,11 +438,34 @@ public sealed class DocumentForgeDb : IDisposable
         var index = _indexManager.CreateIndex(definition);
         _indexManager.RebuildIndex(index, collection);
 
-        // Persist the catalog page pointer to the file header (first time only)
         if (_indexCatalog.CatalogPage.IsValid)
         {
             _dataFile.SetIndexCatalogPage(_indexCatalog.CatalogPage);
         }
+
+        // Replicate index creation to read-only followers
+        if (_logicalServer is not null)
+        {
+            var data = SerializeIndexDefinition(indexName, jsonPath, unique);
+            _logicalServer.BroadcastNewOp(LogicalOpType.CreateIndex, collectionName, data);
+        }
+    }
+
+    private static byte[] SerializeIndexDefinition(string name, string path, bool unique)
+    {
+        using var ms = new MemoryStream();
+        using var w = new BinaryWriter(ms);
+        w.Write(name);
+        w.Write(path);
+        w.Write(unique);
+        return ms.ToArray();
+    }
+
+    private static (string Name, string Path, bool Unique) DeserializeIndexDefinition(byte[] data)
+    {
+        using var ms = new MemoryStream(data);
+        using var r = new BinaryReader(ms);
+        return (r.ReadString(), r.ReadString(), r.ReadBoolean());
     }
 
     public IReadOnlyList<IndexDefinition> GetIndexes(string collectionName)
@@ -488,6 +521,88 @@ public sealed class DocumentForgeDb : IDisposable
     }
 
     public long ReplicatedPageCount() => _replicationFollower?.PagesApplied ?? 0;
+
+    /// <summary>
+    /// Start this DB as a logical replication leader - streams operations (inserts/deletes/index ops)
+    /// to connected read-only followers. Unlike physical replication, followers that connect here
+    /// can SERVE QUERIES correctly because their indexes stay coherent.
+    /// </summary>
+    public void StartLogicalReplicationServer(int port)
+    {
+        if (_logicalServer is not null)
+            throw new DocumentForgeException("Logical replication server already running.");
+        _logicalServer = new LogicalReplicationServer(port);
+        _logicalServer.Start();
+    }
+
+    public int GetLogicalFollowerCount() => _logicalServer?.FollowerCount ?? 0;
+
+    /// <summary>
+    /// Start this DB as a logical replication follower (read-only replica).
+    /// Applies incoming ops through the engine's own Insert/Delete/CreateIndex so indexes
+    /// and location maps stay coherent. Queries on this instance will see replicated data.
+    /// </summary>
+    public void StartLogicalReplicationFollower(string host, int port)
+    {
+        if (_logicalFollower is not null)
+            throw new DocumentForgeException("Logical replication follower already running.");
+
+        var seqFilePath = FilePath + ".followerseq";
+        _logicalFollower = new LogicalReplicationFollower(host, port, seqFilePath, op =>
+        {
+            switch (op.OpType)
+            {
+                case LogicalOpType.Insert:
+                    var doc = BsonSerializer.Deserialize(op.Data);
+                    // Use Insert directly; it acquires write lock internally.
+                    // The doc's _id is already set, so EnsureId is a no-op and we preserve the leader's id.
+                    InsertOnFollower(op.Collection, doc);
+                    break;
+                case LogicalOpType.Delete:
+                    var docId = DocumentId.FromBytes(op.Data);
+                    DeleteOnFollower(op.Collection, docId);
+                    break;
+                case LogicalOpType.CreateIndex:
+                    var (name, path, unique) = DeserializeIndexDefinition(op.Data);
+                    try { CreateIndex(op.Collection, path, name, unique); } catch { /* already exists */ }
+                    break;
+            }
+        });
+        _logicalFollower.Start();
+    }
+
+    public long LogicallyReplicatedOps() => _logicalFollower?.OpsApplied ?? 0;
+    public long GapsDetected => _logicalFollower?.GapsDetected ?? 0;
+    public ulong FollowerLastSeq => _logicalFollower?.LastAppliedSeq ?? 0;
+    public ulong LeaderCurrentSeq => _logicalServer?.CurrentSeq ?? 0;
+
+    private void InsertOnFollower(string collectionName, BsonDocument doc)
+    {
+        _transactionManager.AcquireWriteLock();
+        try
+        {
+            var collection = _catalog.GetOrCreateCollection(collectionName);
+            var id = collection.Insert(doc);
+            _indexManager.OnDocumentInserted(collectionName, id, doc);
+            // DO NOT re-broadcast - followers don't replicate to other followers
+        }
+        finally { _transactionManager.ReleaseWriteLock(); }
+    }
+
+    private void DeleteOnFollower(string collectionName, DocumentId docId)
+    {
+        _transactionManager.AcquireWriteLock();
+        try
+        {
+            var collection = _catalog.GetCollection(collectionName);
+            if (collection is null) return;
+            var doc = collection.FindById(docId);
+            if (doc is null) return;
+            collection.Delete(docId);
+            _indexManager.OnDocumentDeleted(collectionName, docId, doc);
+        }
+        finally { _transactionManager.ReleaseWriteLock(); }
+    }
 
     // --- Database management ---
 
@@ -552,6 +667,8 @@ public sealed class DocumentForgeDb : IDisposable
         {
             _replicationServer?.Dispose();
             _replicationFollower?.Dispose();
+            _logicalServer?.Dispose();
+            _logicalFollower?.Dispose();
             _pageCache.FlushAll(); // this also truncates the recovery log
             _walWriter?.Dispose();
             _recoveryLog?.Dispose();
