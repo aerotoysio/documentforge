@@ -3,32 +3,41 @@ using DocumentForge.Engine;
 using DocumentForge.Document;
 using DocumentForge.Index;
 
+// --- Node configuration ---
+// Can be supplied via:
+//   1. --config ./node.json   (file with { nodeName, port, dataDir })
+//   2. CLI flags: --node-name X --port 5001 --data-dir ./data/shard-a
+//   3. Environment: DFDB_NODE_NAME, DFDB_PORT, DFDB_DATA_DIR
+//   4. Default: single-node on http://localhost:5000 with CWD data
+var config = NodeConfig.Load(args);
+
 var builder = WebApplication.CreateBuilder(args);
+builder.WebHost.UseUrls($"http://localhost:{config.Port}");
 builder.Services.AddCors(opts => opts.AddDefaultPolicy(p =>
     p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
 var app = builder.Build();
 app.UseCors();
 
-// Create/open the database
-var dbPath = Path.Combine(Directory.GetCurrentDirectory(), "api_database.dfdb");
+Directory.CreateDirectory(config.DataDir);
+var dbPath = Path.Combine(config.DataDir, "data.dfdb");
 var db = DocumentForgeDb.OpenOrCreate(dbPath);
 
 Console.WriteLine("=============================================================");
-Console.WriteLine("  DocumentForge REST API");
-Console.WriteLine($"  Database: {dbPath}");
-Console.WriteLine($"  Listening on: http://localhost:5000   (change via --urls or ASPNETCORE_URLS)");
+Console.WriteLine($"  DocumentForge node: {config.NodeName}");
+Console.WriteLine($"  Data dir:  {Path.GetFullPath(config.DataDir)}");
+Console.WriteLine($"  Listening: http://localhost:{config.Port}");
 Console.WriteLine("  Endpoints:");
 Console.WriteLine("    POST   /query              - Execute SQL query");
+Console.WriteLine("    POST   /seed               - Seed sample airline data");
 Console.WriteLine("    GET    /collections         - List collections");
-Console.WriteLine("    POST   /collections/{name}  - Insert document (JSON body)");
-Console.WriteLine("    GET    /collections/{name}  - Get all docs (with ?limit=N)");
-Console.WriteLine("    GET    /stats               - Database statistics");
-Console.WriteLine("    POST   /seed                - Seed sample airline data");
-Console.WriteLine("    POST   /index               - Create an index");
+Console.WriteLine("    POST   /collections/{name}  - Insert document");
+Console.WriteLine("    GET    /collections/{name}  - Get all docs (?limit=N)");
 Console.WriteLine("    DELETE /collections/{name}/{id} - Delete by ID");
 Console.WriteLine("    GET    /indexes/{collection} - List indexes");
+Console.WriteLine("    POST   /index               - Create an index");
+Console.WriteLine("    GET    /stats               - Node statistics");
 Console.WriteLine();
-Console.WriteLine("  Admin UI:  http://localhost:3000  (run: cd admin-ui && npm run dev)");
+Console.WriteLine($"  Admin UI:  http://localhost:3000  (set NEXT_PUBLIC_DFDB_URL=http://localhost:{config.Port})");
 Console.WriteLine("=============================================================");
 
 // ---- POST /query ----
@@ -235,3 +244,53 @@ app.Run();
 record QueryRequest(string Sql);
 record SeedRequest(int? Orders);
 record CreateIndexRequest(string Collection, string Path, string? Name = null, bool Unique = false);
+
+/// <summary>
+/// Per-node configuration loaded from (in priority order):
+///   1. --config path/to/node.json
+///   2. CLI flags: --node-name X --port 5001 --data-dir ./data/A
+///   3. Env vars: DFDB_NODE_NAME, DFDB_PORT, DFDB_DATA_DIR
+///   4. Defaults (single-node "node-1", port 5000, CWD data)
+/// </summary>
+sealed class NodeConfig
+{
+    public string NodeName { get; set; } = "node-1";
+    public int Port { get; set; } = 5000;
+    public string DataDir { get; set; } = Path.Combine(Directory.GetCurrentDirectory(), "data");
+
+    public static NodeConfig Load(string[] args)
+    {
+        var c = new NodeConfig();
+
+        // 1. Config file (--config foo.json)
+        var configIdx = Array.IndexOf(args, "--config");
+        if (configIdx >= 0 && configIdx + 1 < args.Length)
+        {
+            var path = args[configIdx + 1];
+            var loaded = JsonSerializer.Deserialize<NodeConfig>(File.ReadAllText(path),
+                new JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+            if (loaded is not null) c = loaded;
+        }
+
+        // 2. CLI flags override the file
+        for (int i = 0; i < args.Length - 1; i++)
+        {
+            switch (args[i])
+            {
+                case "--node-name": c.NodeName = args[i + 1]; break;
+                case "--port":      c.Port = int.Parse(args[i + 1]); break;
+                case "--data-dir":  c.DataDir = args[i + 1]; break;
+            }
+        }
+
+        // 3. Env vars (applied only if nothing above set them)
+        var envName = Environment.GetEnvironmentVariable("DFDB_NODE_NAME");
+        var envPort = Environment.GetEnvironmentVariable("DFDB_PORT");
+        var envDir  = Environment.GetEnvironmentVariable("DFDB_DATA_DIR");
+        if (c.NodeName == "node-1" && !string.IsNullOrEmpty(envName)) c.NodeName = envName;
+        if (c.Port == 5000 && int.TryParse(envPort, out var p)) c.Port = p;
+        if (c.DataDir.EndsWith("data") && !string.IsNullOrEmpty(envDir)) c.DataDir = envDir;
+
+        return c;
+    }
+}
