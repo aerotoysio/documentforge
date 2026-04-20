@@ -553,11 +553,11 @@ public sealed class DocumentForgeDb : IDisposable
     /// to connected read-only followers. Unlike physical replication, followers that connect here
     /// can SERVE QUERIES correctly because their indexes stay coherent.
     /// </summary>
-    public void StartLogicalReplicationServer(int port)
+    public void StartLogicalReplicationServer(int port, string? sharedSecret = null)
     {
         if (_logicalServer is not null)
             throw new DocumentForgeException("Logical replication server already running.");
-        _logicalServer = new LogicalReplicationServer(port);
+        _logicalServer = new LogicalReplicationServer(port, opLogCapacity: 10_000, secret: sharedSecret);
         _logicalServer.Start();
     }
 
@@ -568,7 +568,7 @@ public sealed class DocumentForgeDb : IDisposable
     /// Applies incoming ops through the engine's own Insert/Delete/CreateIndex so indexes
     /// and location maps stay coherent. Queries on this instance will see replicated data.
     /// </summary>
-    public void StartLogicalReplicationFollower(string host, int port)
+    public void StartLogicalReplicationFollower(string host, int port, string? sharedSecret = null)
     {
         if (_logicalFollower is not null)
             throw new DocumentForgeException("Logical replication follower already running.");
@@ -593,7 +593,7 @@ public sealed class DocumentForgeDb : IDisposable
                     try { CreateIndex(op.Collection, path, name, unique); } catch { /* already exists */ }
                     break;
             }
-        });
+        }, secret: sharedSecret);
         _logicalFollower.Start();
     }
 

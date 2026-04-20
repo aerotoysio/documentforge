@@ -22,7 +22,7 @@ public sealed class HttpShardTransport : IShardTransport
     public string ShardName { get; }
     public Uri BaseAddress => _client.BaseAddress!;
 
-    public HttpShardTransport(string shardName, string baseUrl, HttpClient? httpClient = null)
+    public HttpShardTransport(string shardName, string baseUrl, HttpClient? httpClient = null, string? apiKey = null)
     {
         ShardName = shardName;
         if (httpClient is null)
@@ -36,6 +36,9 @@ public sealed class HttpShardTransport : IShardTransport
             _client.BaseAddress ??= new Uri(baseUrl);
             _ownsClient = false;
         }
+        if (!string.IsNullOrEmpty(apiKey))
+            _client.DefaultRequestHeaders.Authorization =
+                new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", apiKey);
     }
 
     public QueryResult Execute(string sql)

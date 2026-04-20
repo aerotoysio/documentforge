@@ -63,8 +63,27 @@ public sealed class ShardDescriptor
     /// <summary>Human-readable shard name, e.g. "dubai", "shard-a".</summary>
     public string Name { get; set; } = "";
 
-    /// <summary>Where to reach this shard. Format depends on transport ("host:port" for TCP/HTTP, file path for in-process).</summary>
+    /// <summary>
+    /// Legacy / simple deployments: a single endpoint for the shard.
+    /// If Leader is set, that takes precedence.
+    /// </summary>
     public string Endpoint { get; set; } = "";
+
+    /// <summary>Leader node for this shard (accepts writes). Optional - falls back to Endpoint.</summary>
+    public string? Leader { get; set; }
+
+    /// <summary>Follower nodes for this shard (read replicas, failover candidates).</summary>
+    public List<string> Followers { get; set; } = new();
+
+    /// <summary>Resolved leader URL: Leader if set, else Endpoint.</summary>
+    public string LeaderEndpoint => !string.IsNullOrEmpty(Leader) ? Leader : Endpoint;
+
+    /// <summary>All endpoints including leader - useful for read-scale or health checks.</summary>
+    public IEnumerable<string> AllEndpoints()
+    {
+        yield return LeaderEndpoint;
+        foreach (var f in Followers) yield return f;
+    }
 }
 
 public sealed class CollectionPolicyDescriptor
