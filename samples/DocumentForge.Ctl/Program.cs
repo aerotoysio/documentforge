@@ -16,6 +16,7 @@ try
         "compact"       => CmdCompact(args.Skip(1).ToArray()),
         "cluster"       => CmdCluster(args.Skip(1).ToArray()),
         "health"        => CmdHealth(args.Skip(1).ToArray()),
+        "rebalance"     => CmdRebalance(args.Skip(1).ToArray()),
         "help" or "--help" or "-h" => PrintHelp(),
         _               => Fail($"Unknown command '{args[0]}'. Try 'dfctl help'."),
     };
@@ -179,6 +180,50 @@ static int CmdHealth(string[] args)
     return 0;
 }
 
+static int CmdRebalance(string[] args)
+{
+    if (args.Length < 2) return Fail("Usage: dfctl rebalance <old-config> <new-config> [--plan-only]");
+    var oldCfg = ClusterConfig.Load(args[0]);
+    var newCfg = ClusterConfig.Load(args[1]);
+    bool planOnly = args.Any(a => a == "--plan-only");
+
+    IShardTransport Make(ShardDescriptor d) => new HttpShardTransport(d.Name, d.Endpoint);
+
+    Console.WriteLine("Scanning current topology...");
+    var plan = ClusterRebalancer.Plan(oldCfg, newCfg, Make);
+
+    Header("Migration Plan");
+    KV("Total docs to move", plan.TotalDocumentsToMove.ToString("N0"));
+    Console.WriteLine();
+    foreach (var coll in plan.Collections)
+    {
+        Console.WriteLine($"  {Blue(coll.CollectionName)}  ({coll.EstimatedMovedDocs:N0} moves)");
+        foreach (var ((from, to), count) in coll.Moves.OrderBy(k => k.Key.From))
+            Console.WriteLine($"    {from} → {to}: {count:N0}");
+    }
+
+    if (planOnly)
+    {
+        Console.WriteLine();
+        Console.WriteLine(Gray("Plan-only run. Pass without --plan-only to execute."));
+        return 0;
+    }
+
+    Console.WriteLine();
+    Console.Write("Execute this migration? (type 'yes' to proceed): ");
+    if (Console.ReadLine()?.Trim() != "yes") { Console.WriteLine("Aborted."); return 0; }
+
+    var sw = System.Diagnostics.Stopwatch.StartNew();
+    ClusterRebalancer.Execute(plan, Make, progress =>
+        Console.WriteLine($"  {progress.CollectionName,-20} {progress.FromShard,-10} {Gray("moved")} {progress.DocsMoved,8:N0} / scanned {progress.DocsScanned,8:N0}"));
+    sw.Stop();
+
+    Console.WriteLine();
+    Console.WriteLine($"{Green("✓")} Migration complete in {sw.Elapsed.TotalSeconds:F1}s");
+    Console.WriteLine($"  Save the new config to all nodes: cp {args[1]} ...");
+    return 0;
+}
+
 static int PrintHelp()
 {
     Header("dfctl - DocumentForge management CLI");
@@ -202,6 +247,10 @@ static int PrintHelp()
 
     health    <config-file>
         Ping every shard over HTTP and report size + latency.
+
+    rebalance <old-config> <new-config> [--plan-only]
+        Show what would move under a new topology, then migrate the data.
+        Use --plan-only to preview without changing anything.
 
   EXAMPLES
 

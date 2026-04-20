@@ -739,6 +739,14 @@ public sealed class DocumentForgeDb : IDisposable
         finally { _transactionManager.ReleaseWriteLock(); }
     }
 
+    /// <summary>
+    /// Internal hook so the rebalancer can notify the index manager after a direct delete.
+    /// </summary>
+    internal void NotifyDocDeleted(string collectionName, DocumentId docId, BsonDocument doc)
+    {
+        _indexManager.OnDocumentDeleted(collectionName, docId, doc);
+    }
+
     private void DeleteOnFollower(string collectionName, DocumentId docId)
     {
         _transactionManager.AcquireWriteLock();

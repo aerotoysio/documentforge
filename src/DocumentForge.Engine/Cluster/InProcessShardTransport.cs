@@ -30,6 +30,19 @@ public sealed class InProcessShardTransport : IShardTransport
 
     public DatabaseStatistics GetStatistics() => _db.GetStatistics();
 
+    public bool DeleteById(string collectionName, DocumentId id)
+    {
+        var coll = _db.GetCollection(collectionName);
+        if (coll is null) return false;
+        var doc = coll.FindById(id);
+        if (doc is null) return false;
+        var ok = coll.Delete(id);
+        // Must also notify index manager so indexes drop this doc's entries. We go through
+        // a small helper on the engine to avoid exposing internals publicly.
+        if (ok) _db.NotifyDocDeleted(collectionName, id, doc);
+        return ok;
+    }
+
     public void Dispose()
     {
         if (_ownsDb) _db.Dispose();

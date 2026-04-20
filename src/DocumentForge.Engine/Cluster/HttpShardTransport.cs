@@ -90,6 +90,12 @@ public sealed class HttpShardTransport : IShardTransport
         return id;
     }
 
+    public bool DeleteById(string collectionName, DocumentId id)
+    {
+        var response = _client.DeleteAsync($"/collections/{collectionName}/{id}").GetAwaiter().GetResult();
+        return response.IsSuccessStatusCode;
+    }
+
     public DatabaseStatistics GetStatistics()
     {
         var response = _client.GetAsync("/stats").GetAwaiter().GetResult();
