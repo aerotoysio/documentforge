@@ -25,10 +25,16 @@ export default function Dashboard() {
     <>
       <div className="eyebrow">Dashboard</div>
       <h1 className="page-title">Overview</h1>
-      <div className="card">
+      <div className="card" style={{ borderLeft: '3px solid var(--red)' }}>
         <h3>Can&apos;t reach the database API</h3>
-        <p>Tried <code>{API_URL}</code> — {error}</p>
-        <p>Start it with: <code style={{ background: 'var(--gray-100)', padding: '2px 6px' }}>dotnet run --project samples/DocumentForge.Api</code></p>
+        <p>Tried <code style={{ background: 'var(--gray-100)', padding: '2px 6px' }}>{API_URL}</code> — {error}</p>
+        <h3 style={{ marginTop: 20 }}>Start the API:</h3>
+        <pre className="code-block">{`# From the repo root
+dotnet run --project samples/DocumentForge.Api
+# → listens on http://localhost:5000`}</pre>
+        <h3 style={{ marginTop: 20 }}>Or point this UI at a different host:</h3>
+        <pre className="code-block">{`# In admin-ui/.env.local
+NEXT_PUBLIC_DFDB_URL=https://dfdb.internal:5500`}</pre>
       </div>
     </>
   );
