@@ -740,9 +740,10 @@ public sealed class DocumentForgeDb : IDisposable
     }
 
     /// <summary>
-    /// Internal hook so the rebalancer can notify the index manager after a direct delete.
+    /// Hook so transports and the rebalancer can notify the index manager after a
+    /// direct delete that bypassed SQL.
     /// </summary>
-    internal void NotifyDocDeleted(string collectionName, DocumentId docId, BsonDocument doc)
+    public void NotifyDocDeleted(string collectionName, DocumentId docId, BsonDocument doc)
     {
         _indexManager.OnDocumentDeleted(collectionName, docId, doc);
     }
