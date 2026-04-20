@@ -23,6 +23,8 @@ publish/
 ## Database files
 *.dfdb
 *.dfdb.wal
+*.dfdb.recovery
+*.followerseq
 
 ## NuGet artifacts
 artifacts/
