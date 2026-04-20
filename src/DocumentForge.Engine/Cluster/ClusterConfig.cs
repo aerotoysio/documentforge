@@ -27,6 +27,12 @@ public sealed class ClusterConfig
     /// </summary>
     public int VirtualNodesPerShard { get; set; } = 150;
 
+    /// <summary>
+    /// When non-null, the cluster is mid-migration. Writes route to the current Shards list,
+    /// reads check current shards first and fall back to PreviousShards.
+    /// </summary>
+    public MigrationStateDescriptor? Migration { get; set; }
+
     private static readonly JsonSerializerOptions _json = new()
     {
         WriteIndented = true,
@@ -35,10 +41,21 @@ public sealed class ClusterConfig
 
     public string ToJson() => JsonSerializer.Serialize(this, _json);
     public static ClusterConfig FromJson(string json) => JsonSerializer.Deserialize<ClusterConfig>(json, _json)!;
-
     public void Save(string path) => File.WriteAllText(path, ToJson());
     public static ClusterConfig Load(string path) => FromJson(File.ReadAllText(path));
     public static bool Exists(string path) => File.Exists(path);
+}
+
+public sealed class MigrationStateDescriptor
+{
+    /// <summary>The shard list BEFORE the migration started - used as fallback for reads.</summary>
+    public List<ShardDescriptor> PreviousShards { get; set; } = new();
+
+    /// <summary>UTC start timestamp of this migration, for observability.</summary>
+    public DateTime StartedAt { get; set; }
+
+    /// <summary>Optional human-readable note (e.g. "scale 2->4 prep").</summary>
+    public string? Note { get; set; }
 }
 
 public sealed class ShardDescriptor

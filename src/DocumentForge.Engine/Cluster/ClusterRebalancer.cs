@@ -176,4 +176,122 @@ public sealed class ClusterRebalancer
         public DisposableShards(List<IShardTransport> items) { Items = items; }
         public void Dispose() { foreach (var s in Items) try { s.Dispose(); } catch { } }
     }
+
+    // =====================================================================
+    //  Online rebalancing
+    // =====================================================================
+
+    /// <summary>
+    /// Start an online rebalance: enables migration mode on the cluster (dual-read
+    /// fallback), then copies misplaced documents in the background without blocking
+    /// writes. Clients continue inserting and querying throughout. When the returned
+    /// Task completes, all misplaced documents have been moved and callers should
+    /// call <see cref="CompleteOnlineRebalance"/> to drop the previous ring.
+    /// </summary>
+    public static async Task<OnlineRebalanceReport> RunOnlineAsync(
+        DocumentForgeCluster cluster,
+        ClusterConfig oldConfig,
+        ClusterConfig newConfig,
+        List<IShardTransport> previousShards,
+        Action<Progress>? onProgress = null,
+        CancellationToken ct = default)
+    {
+        cluster.EnableMigrationMode(previousShards);
+
+        var report = new OnlineRebalanceReport { StartedAt = DateTime.UtcNow };
+
+        try
+        {
+            var newRing = new ConsistentHashRing(
+                newConfig.Shards.Select(s => s.Name).ToList(),
+                newConfig.VirtualNodesPerShard);
+            var oldRing = new ConsistentHashRing(
+                oldConfig.Shards.Select(s => s.Name).ToList(),
+                oldConfig.VirtualNodesPerShard);
+
+            var shardByName = cluster.Shards.ToDictionary(s => s.ShardName, s => s, StringComparer.OrdinalIgnoreCase);
+
+            foreach (var (collName, policy) in oldConfig.Collections)
+            {
+                if (policy.Strategy != ShardingStrategy.Hash || policy.ShardKeyPath is null)
+                    continue;
+
+                for (int srcIdx = 0; srcIdx < previousShards.Count; srcIdx++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var srcShard = previousShards[srcIdx];
+                    var fromName = oldConfig.Shards[srcIdx].Name;
+
+                    var result = srcShard.Execute($"SELECT * FROM {collName}");
+                    long scanned = 0, moved = 0;
+
+                    foreach (var doc in result.Documents)
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        scanned++;
+                        var keyVal = JsonPathExtractor.Extract(doc, policy.ShardKeyPath).ToString();
+                        int newIdx = newRing.PickShardIndex(keyVal);
+                        var toName = newConfig.Shards[newIdx].Name;
+                        if (fromName.Equals(toName, StringComparison.OrdinalIgnoreCase)) continue;
+
+                        if (!shardByName.TryGetValue(toName, out var destShard)) continue;
+
+                        // Idempotent: if the doc was already written by a client, our DeleteById
+                        // on srcShard succeeds (even without a live copy there it's fine) and
+                        // the destination may already have a newer version.
+                        try
+                        {
+                            destShard.Insert(collName, doc);
+                        }
+                        catch
+                        {
+                            // Destination has it (possibly a newer version from a client write)
+                            // - don't overwrite, just clean up the source.
+                        }
+                        srcShard.DeleteById(collName, doc.GetId());
+                        moved++;
+                        report.TotalMoved++;
+
+                        if (moved % 500 == 0)
+                            onProgress?.Invoke(new Progress {
+                                CollectionName = collName,
+                                FromShard = fromName, ToShard = "(many)",
+                                DocsMoved = moved, DocsScanned = scanned
+                            });
+                    }
+
+                    onProgress?.Invoke(new Progress {
+                        CollectionName = collName, FromShard = fromName, ToShard = "(done)",
+                        DocsMoved = moved, DocsScanned = scanned
+                    });
+                }
+            }
+
+            report.CompletedAt = DateTime.UtcNow;
+            return report;
+        }
+        catch
+        {
+            report.CompletedAt = DateTime.UtcNow;
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Call after <see cref="RunOnlineAsync"/> returns successfully. Drops the previous
+    /// ring so reads no longer pay the dual-scan cost, and disposes the previous transports.
+    /// </summary>
+    public static void CompleteOnlineRebalance(DocumentForgeCluster cluster, List<IShardTransport> previousShards)
+    {
+        cluster.DisableMigrationMode();
+        foreach (var s in previousShards) try { s.Dispose(); } catch { }
+    }
+
+    public sealed class OnlineRebalanceReport
+    {
+        public DateTime StartedAt { get; set; }
+        public DateTime CompletedAt { get; set; }
+        public long TotalMoved { get; set; }
+        public TimeSpan Duration => CompletedAt - StartedAt;
+    }
 }

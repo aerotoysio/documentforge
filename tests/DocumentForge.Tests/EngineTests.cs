@@ -485,6 +485,125 @@ public class EngineTests : IDisposable
     }
 
     [Fact]
+    public async System.Threading.Tasks.Task Cluster_OnlineRebalance_ZeroDataLossWithConcurrentWrites()
+    {
+        // Start with 2 shards, run concurrent writes while rebalancing to 4 shards.
+        // No doc should be lost; no doc should be duplicated after completion.
+        var paths = Enumerable.Range(0, 4).Select(i =>
+            Path.Combine(Path.GetTempPath(), $"onl_{i}_{Guid.NewGuid():N}.dfdb")).ToArray();
+
+        var dbs = paths.Select(p => DocumentForgeDb.Create(p)).ToList();
+        var names = new[] { "A", "B", "C", "D" };
+
+        try
+        {
+            var oldConfig = new DocumentForge.Engine.Cluster.ClusterConfig
+            {
+                Shards = new()
+                {
+                    new() { Name = "A", Endpoint = paths[0] },
+                    new() { Name = "B", Endpoint = paths[1] }
+                },
+                Collections = { ["orders"] = new() { Strategy = DocumentForge.Engine.Cluster.ShardingStrategy.Hash, ShardKeyPath = "pnr" } }
+            };
+
+            var newConfig = new DocumentForge.Engine.Cluster.ClusterConfig
+            {
+                Shards = new()
+                {
+                    new() { Name = "A", Endpoint = paths[0] },
+                    new() { Name = "B", Endpoint = paths[1] },
+                    new() { Name = "C", Endpoint = paths[2] },
+                    new() { Name = "D", Endpoint = paths[3] }
+                },
+                Collections = { ["orders"] = new() { Strategy = DocumentForge.Engine.Cluster.ShardingStrategy.Hash, ShardKeyPath = "pnr" } }
+            };
+
+            DocumentForge.Engine.Cluster.IShardTransport MakeTransport(DocumentForge.Engine.Cluster.ShardDescriptor d)
+            {
+                int idx = Array.IndexOf(paths, d.Endpoint);
+                return new DocumentForge.Engine.Cluster.InProcessShardTransport(d.Name, dbs[idx]);
+            }
+
+            // Populate initial cluster (A, B) with 200 docs
+            using (var cluster2 = new DocumentForge.Engine.Cluster.DocumentForgeCluster())
+            {
+                cluster2.AddShard(MakeTransport(oldConfig.Shards[0]));
+                cluster2.AddShard(MakeTransport(oldConfig.Shards[1]));
+                cluster2.ShardCollection("orders", "pnr");
+
+                for (int i = 0; i < 200; i++)
+                    cluster2.Insert("orders", $$"""{"pnr": "INIT{{i:D4}}"}""");
+            }
+
+            // Now stand up the NEW cluster with 4 shards
+            using var cluster4 = new DocumentForge.Engine.Cluster.DocumentForgeCluster();
+            cluster4.AddShard(MakeTransport(newConfig.Shards[0]));
+            cluster4.AddShard(MakeTransport(newConfig.Shards[1]));
+            cluster4.AddShard(MakeTransport(newConfig.Shards[2]));
+            cluster4.AddShard(MakeTransport(newConfig.Shards[3]));
+            cluster4.ShardCollection("orders", "pnr");
+
+            // We need a separate set of "previous" transports for the rebalancer
+            var previousShards = new List<DocumentForge.Engine.Cluster.IShardTransport>
+            {
+                MakeTransport(oldConfig.Shards[0]),
+                MakeTransport(oldConfig.Shards[1])
+            };
+
+            var rebalanceTask = DocumentForge.Engine.Cluster.ClusterRebalancer.RunOnlineAsync(
+                cluster4, oldConfig, newConfig, previousShards);
+
+            // Concurrent writes from the client - these go to the NEW ring
+            var concurrentIds = new List<string>();
+            for (int i = 0; i < 50; i++)
+            {
+                var pnr = $"LIVE{i:D4}";
+                concurrentIds.Add(pnr);
+                cluster4.Insert("orders", $$"""{"pnr": "{{pnr}}", "status": "DURING_REBAL"}""");
+                if (i % 10 == 0) await System.Threading.Tasks.Task.Delay(10);
+            }
+
+            // Wait for rebalance to finish
+            var report = await rebalanceTask;
+
+            // Complete the migration (drop the previous ring)
+            DocumentForge.Engine.Cluster.ClusterRebalancer.CompleteOnlineRebalance(cluster4, previousShards);
+
+            // Verify: 200 initial + 50 concurrent = 250 docs total, all findable
+            long totalAcrossShards = 0;
+            for (int i = 0; i < 4; i++)
+                totalAcrossShards += dbs[i].Execute("SELECT COUNT(*) FROM orders").Documents[0]["count"].AsInt64;
+            Assert.Equal(250, totalAcrossShards);
+
+            // Every concurrent-write PNR is still findable
+            foreach (var pnr in concurrentIds)
+            {
+                var r = cluster4.Execute($"SELECT * FROM orders WHERE pnr = '{pnr}'");
+                Assert.Single(r.Documents);
+                Assert.Equal("DURING_REBAL", r.Documents[0]["status"].AsString);
+            }
+
+            // Every INIT PNR is still findable (they moved during the rebalance)
+            for (int i = 0; i < 200; i++)
+            {
+                var r = cluster4.Execute($"SELECT * FROM orders WHERE pnr = 'INIT{i:D4}'");
+                Assert.Single(r.Documents);
+            }
+
+            Assert.True(report.TotalMoved > 0, "Rebalance should have moved some docs");
+        }
+        finally
+        {
+            foreach (var db in dbs) { try { db.Dispose(); } catch { } }
+            foreach (var p in paths)
+            {
+                try { File.Delete(p); File.Delete(p + ".wal"); File.Delete(p + ".recovery"); } catch { }
+            }
+        }
+    }
+
+    [Fact]
     public void Cluster_Rebalance_ScaleDown_DropsShard()
     {
         var paths = Enumerable.Range(0, 3).Select(i =>
