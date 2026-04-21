@@ -1,7 +1,21 @@
 # DocumentForge
 
 **An embedded JSON document database for .NET. SQL-like queries, persistent indexes,
-replication, sharding — in ~5,000 lines with zero external dependencies.**
+replication, sharding — in ~6,000 lines with zero external dependencies.**
+
+**One binary does it all:**
+
+```bash
+dfdb serve    --port 5000 --data-dir ./data       # run a node
+dfdb repl     ./data/data.dfdb                    # interactive SQL
+dfdb query    ./data/data.dfdb "SELECT * FROM o"  # one-shot query
+dfdb seed     ./data/data.dfdb 10000              # demo data
+dfdb cluster  init cluster.json                   # cluster config
+dfdb health   cluster.json                        # ping every shard
+dfdb rebalance old.json new.json                  # safely reshape
+```
+
+Or embed as a library:
 
 ```csharp
 using var db = DocumentForgeDb.OpenOrCreate("airline.dfdb");
@@ -51,11 +65,31 @@ See [docs/performance.html](docs/performance.html) for full methodology.
 
 ## Getting started
 
+### Option A — download the `dfdb` binary (no .NET required)
+
+Build once, ship anywhere — self-contained, no runtime needed on the target machine:
+
+```bash
+.\scripts\publish-dfdb.ps1   # Windows
+./scripts/publish-dfdb.sh    # macOS/Linux
+```
+
+Produces `dist/win-x64/dfdb.exe` (and friends) — drop on any server:
+
+```bash
+# Serve a node
+./dfdb serve --port 5000 --data-dir ./data
+
+# Seed + query
+./dfdb seed  ./data/data.dfdb 10000
+./dfdb query ./data/data.dfdb "SELECT COUNT(*) FROM orders"
+```
+
+### Option B — embed as a NuGet package in your .NET app
+
 ```bash
 dotnet add package DocumentForge
 ```
-
-Then in code:
 
 ```csharp
 using DocumentForge.Engine;
@@ -87,19 +121,21 @@ src/
   DocumentForge.Query        SQL lexer, parser, executor, optimizer
   DocumentForge.Transactions WAL, replication, auto-failover
   DocumentForge.Engine       DocumentForgeDb, LINQ API, Cluster router
+  DocumentForge.Cli          ✨ unified `dfdb` binary (serve + cli)
 
 tests/
-  DocumentForge.Tests        44+ unit and integration tests
+  DocumentForge.Tests        48 unit + integration tests
 
-samples/
+samples/                     Demos showing how to use the library
   DocumentForge.AirlineDemo  10K-order airline reservation demo
-  DocumentForge.Repl         Interactive SQL console
-  DocumentForge.Api          REST API for Postman / remote shards
+  DocumentForge.Repl         Interactive SQL console (same as `dfdb repl`)
+  DocumentForge.Api          REST API (same as `dfdb serve`)
   DocumentForge.Benchmark    250K / 10M document stress test
-  DocumentForge.Ctl          `dfctl` management CLI
+  DocumentForge.Ctl          `dfctl` management CLI (superseded by `dfdb`)
 
 admin-ui/                    Next.js 15 admin web UI (separate app)
 docs/                        Swiss-style documentation website
+scripts/                     start-cluster, publish-dfdb, sample-cluster/
 ```
 
 ## Status
