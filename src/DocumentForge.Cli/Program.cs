@@ -67,7 +67,10 @@ public class Program
         Console.WriteLine();
         Console.WriteLine("  RUN A NODE");
         Console.WriteLine("    serve [--config node.json | --port N --data-dir DIR | --api-key KEY]");
+        Console.WriteLine("          [--replication-role leader|follower --replication-port N");
+        Console.WriteLine("           --leader-host H --leader-port N --auto-failover-seconds N]");
         Console.WriteLine("        Start the REST API for one node. Pairs with the admin UI.");
+        Console.WriteLine("        Optional replication flags stand up a leader listener or follower loop.");
         Console.WriteLine();
         Console.WriteLine("  QUERY LOCAL DATABASE");
         Console.WriteLine("    inspect <file>                       Show stats, collections, indexes");
@@ -91,6 +94,15 @@ public class Program
         Console.WriteLine("    dfdb seed    ./data/shard-a/data.dfdb 10000");
         Console.WriteLine("    dfdb cluster init cluster.json");
         Console.WriteLine("    dfdb health  cluster.json");
+        Console.WriteLine();
+        Console.WriteLine("    # Leader:");
+        Console.WriteLine("    dfdb serve --port 5000 --data-dir ./data/leader \\");
+        Console.WriteLine("               --replication-role leader --replication-port 5500");
+        Console.WriteLine();
+        Console.WriteLine("    # Follower with auto-failover:");
+        Console.WriteLine("    dfdb serve --port 5010 --data-dir ./data/replica \\");
+        Console.WriteLine("               --replication-role follower --leader-host localhost --leader-port 5500 \\");
+        Console.WriteLine("               --auto-failover-seconds 10");
         Console.WriteLine();
         return 0;
     }

@@ -46,6 +46,9 @@ public static class ServeCommand
         var dbPath = Path.Combine(config.DataDir, "data.dfdb");
         var db = DocumentForgeDb.OpenOrCreate(dbPath);
 
+        // Optional replication wiring - leader / follower / none
+        var replicationSummary = StartReplication(db, config);
+
         // Optional bearer-token middleware
         if (!string.IsNullOrEmpty(config.Security?.ApiKey))
         {
@@ -65,31 +68,92 @@ public static class ServeCommand
             });
         }
 
-        PrintBanner(config, bindUrl);
+        PrintBanner(config, bindUrl, replicationSummary);
         MapEndpoints(app, db);
+        MapAdminEndpoints(app, db, config);
+        MapReplicationEndpoints(app, db, config);
 
         app.Lifetime.ApplicationStopping.Register(() => db.Dispose());
         app.Run();
         return 0;
     }
 
-    private static void PrintBanner(NodeConfig config, string bindUrl)
+    private static void PrintBanner(NodeConfig config, string bindUrl, string replicationSummary)
     {
         Console.WriteLine();
         Console.WriteLine("  \x1b[36mdfdb serve\x1b[0m");
-        Console.WriteLine($"  node:      {config.NodeName}");
-        Console.WriteLine($"  data dir:  {Path.GetFullPath(config.DataDir)}");
-        Console.WriteLine($"  listening: {bindUrl}");
-        Console.WriteLine($"  security:  API key {(string.IsNullOrEmpty(config.Security?.ApiKey) ? "\x1b[90mOFF (dev mode)\x1b[0m" : "\x1b[32mON\x1b[0m")}" +
+        Console.WriteLine($"  node:       {config.NodeName}");
+        Console.WriteLine($"  data dir:   {Path.GetFullPath(config.DataDir)}");
+        Console.WriteLine($"  listening:  {bindUrl}");
+        Console.WriteLine($"  security:   API key {(string.IsNullOrEmpty(config.Security?.ApiKey) ? "\x1b[90mOFF (dev mode)\x1b[0m" : "\x1b[32mON\x1b[0m")}" +
                           $"  |  TLS {(config.Security?.Tls is null ? "\x1b[90mOFF\x1b[0m" : "\x1b[32mON\x1b[0m")}" +
                           $"  |  replication-secret {(string.IsNullOrEmpty(config.Security?.ReplicationSecret) ? "\x1b[90mOFF\x1b[0m" : "\x1b[32mON\x1b[0m")}");
+        Console.WriteLine($"  replication: {replicationSummary}");
         Console.WriteLine();
-        Console.WriteLine("  endpoints: POST /query | GET /stats | GET /collections | POST /collections/{name}");
-        Console.WriteLine("             DELETE /collections/{name}/{id} | GET /indexes/{collection}");
-        Console.WriteLine("             POST /index | POST /seed");
+        Console.WriteLine("  app API:   POST /query | GET /stats | GET /collections | POST /collections/{name}");
+        Console.WriteLine("             GET|DELETE /collections/{name}/{id} | POST /collections/{name}/bulk");
+        Console.WriteLine("             DELETE /collections/{name} | GET /indexes/{collection} | POST /index");
+        Console.WriteLine("             POST /seed | GET /health");
+        Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint | POST /admin/compact/{collection}");
+        Console.WriteLine("  replication:");
+        Console.WriteLine("             GET  /replication/status");
+        Console.WriteLine("             POST /replication/start-leader | /replication/start-follower");
+        Console.WriteLine("             POST /replication/promote | /replication/read-only | /replication/read-write");
+        Console.WriteLine("             POST /replication/auto-failover/enable | /disable");
         Console.WriteLine();
         Console.WriteLine($"  admin UI:  http://localhost:3000  (set NEXT_PUBLIC_DFDB_URL={bindUrl})");
         Console.WriteLine();
+    }
+
+    /// <summary>
+    /// Stands up the replication listener / follower loop based on config.Replication.
+    /// Returns a short human-readable summary for the startup banner.
+    /// </summary>
+    private static string StartReplication(DocumentForgeDb db, NodeConfig config)
+    {
+        var rep = config.Replication;
+        var secret = config.Security?.ReplicationSecret;
+
+        if (rep is null || string.IsNullOrEmpty(rep.Role))
+            return "\x1b[90mOFF (single node)\x1b[0m";
+
+        if (rep.IsLeader)
+        {
+            var port = rep.Port ?? 5500;
+            if (port == config.Port)
+                throw new InvalidOperationException(
+                    $"Replication port ({port}) must differ from the HTTP port ({config.Port}).");
+
+            db.StartLogicalReplicationServer(port, secret);
+            return $"\x1b[32mLEADER\x1b[0m  listening on :{port}" +
+                   (string.IsNullOrEmpty(secret) ? "" : "  (shared-secret required)");
+        }
+
+        if (rep.IsFollower)
+        {
+            if (string.IsNullOrEmpty(rep.LeaderHost) || rep.LeaderPort is null)
+                throw new InvalidOperationException(
+                    "Follower role requires --leader-host and --leader-port (or the matching node.json fields).");
+
+            db.StartLogicalReplicationFollower(rep.LeaderHost!, rep.LeaderPort!.Value, secret);
+
+            var detail = $"following {rep.LeaderHost}:{rep.LeaderPort}";
+
+            if (rep.AutoFailover?.SilenceSeconds is int silenceSeconds && silenceSeconds > 0)
+            {
+                var newPort = rep.AutoFailover.NewLeaderPort ?? rep.LeaderPort!.Value;
+                db.EnableAutoFailover(
+                    newLeaderPort: newPort,
+                    silenceTimeout: TimeSpan.FromSeconds(silenceSeconds),
+                    onPromoted: p => Console.WriteLine($"[dfdb] auto-failover: promoted to leader on :{p}"));
+                detail += $"  |  auto-failover after {silenceSeconds}s (new port :{newPort})";
+            }
+
+            return $"\x1b[32mFOLLOWER\x1b[0m  {detail}";
+        }
+
+        throw new InvalidOperationException(
+            $"Unknown replication role '{rep.Role}'. Expected 'leader' or 'follower'.");
     }
 
     private static void MapEndpoints(WebApplication app, DocumentForgeDb db)
@@ -142,6 +206,54 @@ public static class ServeCommand
             if (doc is null) return Results.NotFound();
             if (coll.Delete(docId)) db.NotifyDocDeleted(name, docId, doc);
             return Results.Ok(new { success = true });
+        });
+
+        // Find a single document by id
+        app.MapGet("/collections/{name}/{id}", (string name, string id) =>
+        {
+            var coll = db.GetCollection(name);
+            if (coll is null) return Results.NotFound();
+            if (!Guid.TryParse(id, out var guid)) return Results.BadRequest(new { error = "Invalid document id" });
+            var doc = coll.FindById(new DocumentId(guid));
+            if (doc is null) return Results.NotFound();
+            return Results.Ok(JsonDocument.Parse(doc.ToJson()).RootElement);
+        });
+
+        // Bulk insert: accepts a JSON array of documents
+        app.MapPost("/collections/{name}/bulk", async (string name, HttpRequest request) =>
+        {
+            using var reader = new StreamReader(request.Body);
+            var json = await reader.ReadToEndAsync();
+            if (string.IsNullOrWhiteSpace(json)) return Results.BadRequest(new { error = "Empty body" });
+
+            List<BsonDocument>? docs;
+            try
+            {
+                using var parsed = JsonDocument.Parse(json);
+                if (parsed.RootElement.ValueKind != JsonValueKind.Array)
+                    return Results.BadRequest(new { error = "Body must be a JSON array of documents." });
+
+                docs = new List<BsonDocument>(parsed.RootElement.GetArrayLength());
+                foreach (var el in parsed.RootElement.EnumerateArray())
+                    docs.Add(BsonDocument.FromJson(el.GetRawText()));
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var inserted = db.BulkInsert(name, docs);
+            sw.Stop();
+            return Results.Ok(new { success = true, inserted, timeSeconds = Math.Round(sw.Elapsed.TotalSeconds, 3) });
+        });
+
+        // Drop an entire collection (destructive - requires explicit X-Confirm: true header)
+        app.MapDelete("/collections/{name}", (string name, HttpRequest request) =>
+        {
+            if (request.Headers["X-Confirm"].ToString() != "true")
+                return Results.BadRequest(new { error = "Destructive op. Include header 'X-Confirm: true' to proceed." });
+            var dropped = db.DropCollection(name);
+            return dropped
+                ? Results.Ok(new { success = true, dropped = name })
+                : Results.NotFound();
         });
 
         app.MapGet("/indexes/{collection}", (string collection) =>
@@ -212,6 +324,150 @@ public static class ServeCommand
         });
     }
 
+    private static void MapAdminEndpoints(WebApplication app, DocumentForgeDb db, NodeConfig config)
+    {
+        // Liveness + identity
+        app.MapGet("/health", () => Results.Ok(new
+        {
+            status = "ok",
+            node = config.NodeName,
+            version = "0.1.0",
+            readOnly = db.IsReadOnly,
+            uptimeSeconds = Math.Round((DateTime.UtcNow - _startedAt).TotalSeconds, 1)
+        }));
+
+        // Force a cache flush (all dirty pages to disk, truncate recovery log)
+        app.MapPost("/admin/flush", () =>
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            db.Flush();
+            sw.Stop();
+            return Results.Ok(new { success = true, timeMs = sw.Elapsed.TotalMilliseconds });
+        });
+
+        // Synonym for flush - common DB ops term
+        app.MapPost("/admin/checkpoint", () =>
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            db.Checkpoint();
+            sw.Stop();
+            return Results.Ok(new { success = true, timeMs = sw.Elapsed.TotalMilliseconds });
+        });
+
+        // Compact (reclaim space from deletes) on a single collection
+        app.MapPost("/admin/compact/{collection}", (string collection) =>
+        {
+            try
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var r = db.Compact(collection);
+                db.Flush();
+                sw.Stop();
+                return Results.Ok(new
+                {
+                    success = true,
+                    collection,
+                    pagesCompacted = r.PagesCompacted,
+                    bytesReclaimed = r.BytesReclaimed,
+                    timeMs = sw.Elapsed.TotalMilliseconds
+                });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+    }
+
+    private static void MapReplicationEndpoints(WebApplication app, DocumentForgeDb db, NodeConfig config)
+    {
+        // Current role + observability - safe for routine polling
+        app.MapGet("/replication/status", () =>
+        {
+            var rep = config.Replication;
+            return Results.Ok(new
+            {
+                node = config.NodeName,
+                role = rep?.NormalizedRole ?? "none",
+                readOnly = db.IsReadOnly,
+                leader = new
+                {
+                    currentSeq = db.LeaderCurrentSeq,
+                    followerCount = db.GetLogicalFollowerCount()
+                },
+                follower = new
+                {
+                    lastAppliedSeq = db.FollowerLastSeq,
+                    opsApplied = db.LogicallyReplicatedOps(),
+                    gapsDetected = db.GapsDetected,
+                    autoFailoverPromoted = db.WasAutoFailoverPromoted
+                }
+            });
+        });
+
+        app.MapPost("/replication/start-leader", (StartLeaderRequest req) =>
+        {
+            try
+            {
+                db.StartLogicalReplicationServer(req.Port, req.SharedSecret ?? config.Security?.ReplicationSecret);
+                return Results.Ok(new { success = true, role = "leader", port = req.Port });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        app.MapPost("/replication/start-follower", (StartFollowerRequest req) =>
+        {
+            try
+            {
+                db.StartLogicalReplicationFollower(req.Host, req.Port,
+                    req.SharedSecret ?? config.Security?.ReplicationSecret);
+                return Results.Ok(new { success = true, role = "follower", leader = $"{req.Host}:{req.Port}" });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        // Manual promotion (planned handover step 2 or recovery after leader crash)
+        app.MapPost("/replication/promote", (PromoteRequest req) =>
+        {
+            try
+            {
+                db.PromoteToLeader(req.Port);
+                return Results.Ok(new { success = true, newRole = "leader", port = req.Port });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        // Read-only toggle (step 1 of planned handover - stops accepting writes)
+        app.MapPost("/replication/read-only", () =>
+        {
+            db.EnterReadOnlyMode();
+            return Results.Ok(new { success = true, readOnly = true });
+        });
+
+        app.MapPost("/replication/read-write", () =>
+        {
+            db.ExitReadOnlyMode();
+            return Results.Ok(new { success = true, readOnly = false });
+        });
+
+        app.MapPost("/replication/auto-failover/enable", (AutoFailoverRequest req) =>
+        {
+            try
+            {
+                var silence = TimeSpan.FromSeconds(req.SilenceSeconds);
+                db.EnableAutoFailover(req.NewLeaderPort, silence,
+                    onPromoted: p => Console.WriteLine($"[dfdb] auto-failover: promoted to leader on :{p}"));
+                return Results.Ok(new { success = true, silenceSeconds = req.SilenceSeconds, newLeaderPort = req.NewLeaderPort });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        app.MapPost("/replication/auto-failover/disable", () =>
+        {
+            db.DisableAutoFailover();
+            return Results.Ok(new { success = true });
+        });
+    }
+
+    private static readonly DateTime _startedAt = DateTime.UtcNow;
+
     private static bool ConstantTimeEquals(string a, string b)
     {
         if (a.Length != b.Length) return false;
@@ -225,3 +481,7 @@ public static class ServeCommand
 public record QueryRequest(string Sql);
 public record SeedRequest(int? Orders);
 public record CreateIndexRequest(string Collection, string Path, string? Name = null, bool Unique = false);
+public record StartLeaderRequest(int Port, string? SharedSecret = null);
+public record StartFollowerRequest(string Host, int Port, string? SharedSecret = null);
+public record PromoteRequest(int Port);
+public record AutoFailoverRequest(int SilenceSeconds, int NewLeaderPort);
