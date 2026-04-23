@@ -19,8 +19,10 @@
       <a href="query-language.html">Query Language</a>
       <a href="data-modeling.html">Data Modeling</a>
       <a href="replication.html">Replication</a>
+      <a href="sharding.html">Sharding</a>
       <a href="deployment.html">Deployment</a>
       <a href="security.html">Security</a>
+      <a href="cli-reference.html">CLI</a>
       <a href="performance.html" class="active">Performance</a>
     </div>
   </div>
@@ -30,7 +32,7 @@
   <div class="container">
     <div class="eyebrow">Chapter 06</div>
     <h1>Performance</h1>
-    <p>Real numbers from a benchmark you can run yourself. Limits, bottlenecks, and the fix for each.</p>
+    <p>Real numbers from a benchmark you can run yourself. ~100M docs per node, effectively unlimited with sharding — 1B and 1T are real, intended scale points. Limits, bottlenecks, and the fix for each.</p>
   </div>
 </section>
 
@@ -39,7 +41,10 @@
     <h5>On this page</h5>
     <ul>
       <li><a href="#numbers">Real numbers</a></li>
-      <li><a href="#scale">Scale projection</a></li>
+      <li><a href="#scale">Scale: single node</a></li>
+      <li><a href="#scale-sharded">Scale: with sharding</a></li>
+      <li><a href="#usecase-1b">1 billion doc use cases</a></li>
+      <li><a href="#usecase-1t">1 trillion doc use cases</a></li>
       <li><a href="#bottlenecks">Bottlenecks</a></li>
       <li><a href="#tuning">Tuning</a></li>
       <li><a href="#how">How it gets this fast</a></li>
@@ -66,8 +71,8 @@
 
     <p><strong>2.6 million queries executed in 5 minutes</strong> during the query benchmark. On one laptop. In C#.</p>
 
-    <h2 id="scale">Scale projection</h2>
-    <p>Based on the 250K benchmark, here's what to expect as your dataset grows:</p>
+    <h2 id="scale">Scale: single node</h2>
+    <p>Based on the 250K benchmark, here's what to expect <em>per node</em> — i.e. one <code>.dfdb</code> file served by one <code>dfdb serve</code> process:</p>
 
     <table>
       <thead><tr><th>Scale</th><th>File size</th><th>RAM usage</th><th>Insert rate</th><th>Indexed lookup</th><th>Status</th></tr></thead>
@@ -76,11 +81,117 @@
         <tr><td>10M docs</td><td>~5 GB</td><td>~2–3 GB</td><td>40–60K/sec</td><td>150–200K QPS</td><td>💪 Comfortable</td></tr>
         <tr><td>50M docs</td><td>~25 GB</td><td>~12 GB</td><td>20–30K/sec</td><td>80–120K QPS</td><td>⚡ Sweet spot ends</td></tr>
         <tr><td>100M docs</td><td>~50 GB</td><td>~25 GB</td><td>10–20K/sec</td><td>50–80K QPS</td><td>⚠️ Needs 32GB+</td></tr>
-        <tr><td>500M docs</td><td>~250 GB</td><td>&gt;100 GB</td><td>limited</td><td>cache-bound</td><td>❌ Needs redesign</td></tr>
+        <tr><td>500M docs</td><td>~250 GB</td><td>&gt;100 GB</td><td>limited</td><td>cache-bound</td><td>❌ Shard it</td></tr>
       </tbody>
     </table>
 
-    <p>The cliff at ~100M is the in-memory index. Once your indexes don't fit in RAM, performance tanks. See <a href="#bottlenecks">Bottlenecks</a> below.</p>
+    <p>The cliff at ~100M on a single node comes from three in-RAM structures: the location map (~24 bytes/doc), the in-memory B-tree (~32–48 bytes/entry × number of indexes), and the working-set page cache. Once your indexes don't fit in RAM, performance tanks. See <a href="#bottlenecks">Bottlenecks</a> below for the fixes.</p>
+
+    <div class="callout">
+      <strong>Per node, not per database.</strong> The 100M figure is what one process handles comfortably. Your database can be much bigger — that's what <a href="sharding.html">sharding</a> is for. Keep reading.
+    </div>
+
+    <h2 id="scale-sharded">Scale: with sharding</h2>
+    <p>Consistent-hash sharding splits a collection across N nodes. Each node only carries 1/N of the documents, 1/N of each index, and 1/N of the hot set. <strong>There is no architectural cap on total document count — scale is bounded by how many nodes you want to run.</strong></p>
+
+    <table>
+      <thead><tr><th>Shards</th><th>Docs (rough)</th><th>Aggregate data</th><th>Aggregate inserts</th><th>Indexed lookup</th><th>Hardware profile</th></tr></thead>
+      <tbody>
+        <tr><td>3</td><td>300 M</td><td>~150 GB</td><td>~150 K/sec</td><td>~600 K QPS</td><td>3 × 32 GB / 500 GB NVMe</td></tr>
+        <tr><td>10</td><td><strong>1 B</strong></td><td>~500 GB</td><td>~500 K/sec</td><td>~1.5–2 M QPS</td><td>10 × 32 GB / 500 GB NVMe</td></tr>
+        <tr><td>100</td><td>10 B</td><td>~5 TB</td><td>~5 M/sec</td><td>~15–20 M QPS</td><td>100 × 64 GB / 1 TB NVMe</td></tr>
+        <tr><td>1,000</td><td><strong>1 T</strong></td><td>~500 TB</td><td>~10 M/sec (wire-bound)</td><td>~50–100 M QPS</td><td>1,000 × 128 GB / 2 TB NVMe</td></tr>
+      </tbody>
+    </table>
+
+    <p>A few things hold across all rows:</p>
+    <ul>
+      <li><strong>Point lookups</strong> on the shard key route to <em>one</em> node. Latency stays sub-millisecond regardless of cluster size — the consistent-hash ring is an O(log N) lookup.</li>
+      <li><strong>Writes</strong> route to one shard. Aggregate write throughput scales linearly with shard count, bounded by how much write traffic you can put on the wire.</li>
+      <li><strong>Queries without the shard key</strong> fan out to every shard. Still useful at 10 shards, painful at 1,000 — keep hot paths on the shard key.</li>
+      <li><strong>Cross-shard JOINs</strong> re-gather at the coordinator. Think of them as analytical queries, not OLTP.</li>
+      <li><strong>Rebalance is online.</strong> Adding shards moves data in the background; reads and writes continue throughout. See the <a href="sharding.html">Sharding guide</a>.</li>
+    </ul>
+
+    <h2 id="usecase-1b">What 1 billion documents looks like</h2>
+    <p>10 shards × ~100M each. This is the comfortable "big but not absurd" tier — plausibly a single team's production workload.</p>
+
+    <div class="feature-grid">
+      <div class="feature">
+        <div class="num">AIR</div>
+        <h4>Global airline reservations</h4>
+        <p>Every PNR booked worldwide in ~2 years. Lookup by PNR is a single-shard hit. Passenger-name search fans out to 10 nodes — still sub-second. Exactly the Sabre/Amadeus workload this design was inspired by.</p>
+      </div>
+      <div class="feature">
+        <div class="num">IoT</div>
+        <h4>Connected-device telemetry</h4>
+        <p>1B events = ~11,500 events/sec for 24 months, or 30K/sec for 1 year. Shard on <code>deviceId</code>: per-device history is one node; fleet-wide queries fan out.</p>
+      </div>
+      <div class="feature">
+        <div class="num">ORD</div>
+        <h4>E-commerce order history</h4>
+        <p>Amazon-scale order history is around this mark. Shard on <code>customerId</code> — a customer's entire order history lives on one node. Order-by-date global queries use the fan-out path.</p>
+      </div>
+      <div class="feature">
+        <div class="num">LOG</div>
+        <h4>Application audit log</h4>
+        <p>Every API call to a mid-sized SaaS for 5–10 years. Shard on <code>tenantId</code> for GDPR-clean per-customer data residency.</p>
+      </div>
+      <div class="feature">
+        <div class="num">GAM</div>
+        <h4>Game match history</h4>
+        <p>Every match ever played in a popular online game. Shard on <code>playerId</code> — the player's personal history is always one-node. Leaderboards use a replicated collection.</p>
+      </div>
+      <div class="feature">
+        <div class="num">FIN</div>
+        <h4>Transaction ledger</h4>
+        <p>A mid-sized bank's full transaction log for a decade. Shard on <code>accountId</code>. Point queries by transaction ID are one-shard; daily-settlement aggregates are batch fan-out.</p>
+      </div>
+    </div>
+
+    <div class="callout">
+      <strong>Infrastructure reality check at 1B:</strong> 10 boxes with ~32–64 GB RAM and a terabyte of fast NVMe each. Fits in a single rack. Runs on three AZs with a follower per shard for read scale and auto-failover. Replication secret on, TLS on, API keys on. Boring, dependable, ~$2–5K/month in commodity cloud.
+    </div>
+
+    <h2 id="usecase-1t">What 1 trillion documents looks like</h2>
+    <p>1,000 shards × ~1B each, or 10,000 × ~100M. At this scale you are firmly in "serious operational commitment" territory — but the architecture does not break, and nothing in the engine cares whether N is 10 or 10,000.</p>
+
+    <div class="feature-grid">
+      <div class="feature">
+        <div class="num">CAR</div>
+        <h4>Every connected vehicle on Earth</h4>
+        <p>~1.5B connected cars, 700 events/day each = ~1T events/year. Shard on <code>vin</code>. Per-car history is one-node (for the insurance adjuster, the OTA update planner, the fleet manager). Aggregate fleet metrics are batch analytical jobs.</p>
+      </div>
+      <div class="feature">
+        <div class="num">FEED</div>
+        <h4>Social-network timeline events</h4>
+        <p>Every post, like, share, and view for a billion-user network over ~2 years. Shard on <code>userId</code>. The "show me my timeline" path is one-shard-per-follower-fanout; trending-topics is a separate, derived pipeline.</p>
+      </div>
+      <div class="feature">
+        <div class="num">PAY</div>
+        <h4>Global payment processor ledger</h4>
+        <p>Every card swipe, every transfer, for ~5 years. Shard on <code>merchantId</code> or <code>cardHash</code>. Point lookups for dispute/refund workflows stay sub-millisecond even as the ledger grows.</p>
+      </div>
+      <div class="feature">
+        <div class="num">SENS</div>
+        <h4>Smart-city sensor mesh</h4>
+        <p>Every traffic, air-quality, and utility sensor in a major metro, every minute, for a decade. Shard on <code>sensorId</code> + time bucket. Historical per-sensor queries hit one shard; heat-maps are batch aggregations.</p>
+      </div>
+      <div class="feature">
+        <div class="num">GEN</div>
+        <h4>Genomics variant store</h4>
+        <p>Every human SNP × every patient in a research biobank. Shard on <code>patientId</code>. Per-patient studies are one-shard; population-wide cohorts are deliberate fan-out analytical workloads.</p>
+      </div>
+      <div class="feature">
+        <div class="num">DOC</div>
+        <h4>Archival document / email store</h4>
+        <p>Every email sent through a Tier-1 email provider for 7 years. Shard on <code>mailboxId</code>. The user's "find an old email" path is one-shard; legal-hold exports are fan-out.</p>
+      </div>
+    </div>
+
+    <div class="callout">
+      <strong>Infrastructure reality check at 1T:</strong> 500–2,000 nodes depending on shape. Multi-DC replication with planned handover for maintenance windows. Tiered storage (hot NVMe, warm SATA, cold object store) becomes meaningful at this scale. Expect to invest seriously in observability, per-shard dashboards, and a rebalance schedule. The point is not that this is easy — it's that the database doesn't introduce any ceiling below here. You will hit wire, disk, budget, or ops ceilings before you hit a DocumentForge one.
+    </div>
 
     <h2 id="bottlenecks">Bottlenecks</h2>
     <p>Each bottleneck has a known fix. Some are already implemented, some are roadmap.</p>
@@ -93,7 +204,7 @@
         <tr><td>Location map in RAM</td><td>~50M docs</td><td>Move to persistent structure</td><td>🗺️ Roadmap</td></tr>
         <tr><td>In-memory B-tree</td><td>~50M docs</td><td>True on-disk B-tree (SQLite style)</td><td>🗺️ Roadmap</td></tr>
         <tr><td>Single global write lock</td><td>Hundreds of concurrent writers</td><td>Page-level locking / MVCC</td><td>🗺️ Roadmap</td></tr>
-        <tr><td>Single-file per node</td><td>&gt;10TB scale</td><td>Sharding across nodes</td><td>🗺️ Possible</td></tr>
+        <tr><td>Single-file per node</td><td>~100M docs / ~50 GB</td><td>Consistent-hash <a href="sharding.html">sharding</a> across nodes</td><td>✅ Shipped</td></tr>
       </tbody>
     </table>
 

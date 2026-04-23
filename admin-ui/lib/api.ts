@@ -1,4 +1,4 @@
-// Thin client for the DocumentForge.Api sample.
+// Thin client for the dfdb REST API (from `dfdb serve`).
 // Override the default URL with NEXT_PUBLIC_DFDB_URL.
 // API key (bearer token) is stored in localStorage and attached to every request.
 

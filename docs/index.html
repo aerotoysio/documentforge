@@ -22,6 +22,7 @@
       <a href="replication.html">Replication</a>
       <a href="deployment.html">Deployment</a>
       <a href="security.html">Security</a>
+      <a href="cli-reference.html">CLI</a>
       <a href="performance.html">Performance</a>
     </div>
   </div>
@@ -61,7 +62,7 @@
         <div class="label">Point lookups / sec</div>
       </div>
       <div class="stat">
-        <div class="num">47</div>
+        <div class="num">48</div>
         <div class="label">Tests, all green</div>
       </div>
       <div class="stat">
@@ -158,13 +159,13 @@ Console.WriteLine(result.Documents[<span class="hl-num">0</span>].ToJson());
       </div>
       <div class="feature">
         <div class="num">API</div>
-        <h4>REST server</h4>
-        <p>Stand up a node per shard with one command. JSON-in/JSON-out. Each node reads a small <code>node.json</code> config.</p>
+        <h4>REST server (built in)</h4>
+        <p><code>dfdb serve</code> stands up a node per shard with one command. JSON-in/JSON-out. Each node reads a small <code>node.json</code> config (or takes CLI flags).</p>
       </div>
       <div class="feature">
         <div class="num">CLI</div>
-        <h4>dfctl</h4>
-        <p>Inspect a file, run queries, edit cluster configs, check health, plan and execute rebalances from the terminal.</p>
+        <h4>dfdb binary</h4>
+        <p>One self-contained executable with every feature: <code>serve</code>, <code>query</code>, <code>repl</code>, <code>cluster</code>, <code>health</code>, <code>rebalance</code>, <code>seed</code>. Ships as a 47 MB file with the runtime bundled &mdash; no .NET required on the target machine.</p>
       </div>
       <div class="feature">
         <div class="num">UI</div>
@@ -174,7 +175,7 @@ Console.WriteLine(result.Documents[<span class="hl-num">0</span>].ToJson());
     </div>
 
     <div class="callout" style="margin-top: 48px">
-      <strong>Status:</strong> DocumentForge is a learning-focused open-source project demonstrating how a modern document database can be built from the ground up in ~6,000 lines of C#. 47 tests, a NuGet package, a Next.js admin UI, a CLI, and seven doc pages. Use it for embedded scenarios, prototypes, small-to-medium production workloads, and understanding how databases actually work.
+      <strong>Status:</strong> DocumentForge is a learning-focused open-source project demonstrating how a modern document database can be built from the ground up in ~6,500 lines of C#. 48 tests, a NuGet package, a single-file <code>dfdb</code> binary, a Next.js admin UI, and ten documentation pages (including a full CLI reference). Use it for embedded scenarios, prototypes, small-to-medium production workloads, and understanding how databases actually work.
     </div>
   </div>
 </section>

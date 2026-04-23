@@ -22,6 +22,7 @@
       <a href="sharding.html">Sharding</a>
       <a href="deployment.html">Deployment</a>
       <a href="security.html">Security</a>
+      <a href="cli-reference.html">CLI</a>
       <a href="performance.html">Performance</a>
     </div>
   </div>
@@ -154,22 +155,22 @@ db.Execute(<span class="hl-str">"CREATE INDEX idx_status_date ON orders (status,
     <h2 id="repl">Interactive REPL</h2>
     <p>Included in the repo is an interactive console for experimenting with SQL queries against your database.</p>
 
-    <pre>dotnet run --project samples/DocumentForge.Repl
+    <pre>dfdb repl ./data/data.dfdb
 
-dfdb&gt; seed 1000
 dfdb&gt; SELECT * FROM orders WHERE pnr = 'ABC123'
 dfdb&gt; SELECT status, COUNT(*) FROM orders GROUP BY status
 dfdb&gt; stats</pre>
 
     <h2 id="api">REST API</h2>
-    <p>For testing from Postman or wiring into other services, there's a minimal REST API sample.</p>
+    <p>For testing from Postman or wiring other services in, use <code>dfdb serve</code>:</p>
 
-    <pre>dotnet run --project samples/DocumentForge.Api
+    <pre>dfdb serve --port 5000 --data-dir ./data
 
 <span class="hl-com"># Then from another terminal</span>
 curl -X POST http://localhost:5000/query \
      -H "Content-Type: application/json" \
      -d '{"sql": "SELECT * FROM orders LIMIT 5"}'</pre>
+    <p>The same endpoints power the admin UI, so pointing it at any <code>dfdb serve</code> instance just works.</p>
 
     <h2 id="next">Next steps</h2>
     <ul>

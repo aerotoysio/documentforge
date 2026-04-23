@@ -62,22 +62,22 @@ export default function SettingsPage() {
         </p>
         <div className="setting-row"><span className="key">Version</span><span className="val">0.1.0</span></div>
         <div className="setting-row"><span className="key">License</span><span className="val">MIT</span></div>
-        <div className="setting-row"><span className="key">Tests</span><span className="val">47 passing</span></div>
+        <div className="setting-row"><span className="key">Tests</span><span className="val">48 passing</span></div>
       </div>
 
       <div className="card">
         <h3>Useful commands</h3>
         <pre className="code-block">{`# Start a node with an API key
-dotnet run --project samples/DocumentForge.Api -- \\
+dfdb serve \\
     --node-name shard-a --port 5001 \\
     --data-dir ./data/shard-a \\
     --api-key sk_prod_abc123
 
 # Or as env var
-DFDB_API_KEY=sk_prod_abc123 dotnet run --project samples/DocumentForge.Api
+DFDB_API_KEY=sk_prod_abc123 dfdb serve --port 5001 --data-dir ./data
 
 # Check health of an entire cluster
-dfctl health cluster.json
+dfdb health cluster.json
 
 # Launch local 3-shard cluster
 ./scripts/start-cluster.sh`}</pre>

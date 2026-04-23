@@ -12,7 +12,7 @@ Helpers for running DocumentForge locally across multiple nodes.
 ./scripts/start-cluster.sh
 ```
 
-This launches three `DocumentForge.Api` processes, each with its own port and data directory:
+This launches three `dfdb` processes (one per shard), each with its own port and data directory:
 
 | Node | URL | Data folder |
 |---|---|---|
@@ -24,7 +24,7 @@ All three nodes share `scripts/sample-cluster/cluster.json` which describes
 the full topology. Check that every node is up:
 
 ```bash
-dotnet run --project samples/DocumentForge.Ctl -- health scripts/sample-cluster/cluster.json
+dfdb health scripts/sample-cluster/cluster.json
 ```
 
 You should see three green dots.
@@ -87,13 +87,13 @@ Each node reads a small JSON file on startup:
 Start a node manually:
 
 ```bash
-dotnet run --project samples/DocumentForge.Api -- --config scripts/sample-cluster/node-a.json
+dfdb serve --config scripts/sample-cluster/node-a.json
 ```
 
 Or with explicit flags instead of a file:
 
 ```bash
-dotnet run --project samples/DocumentForge.Api -- \
+dfdb serve \
     --node-name shard-a \
     --port 5001 \
     --data-dir ./data/shard-a
@@ -102,8 +102,7 @@ dotnet run --project samples/DocumentForge.Api -- \
 Or with env vars:
 
 ```bash
-DFDB_NODE_NAME=shard-a DFDB_PORT=5001 DFDB_DATA_DIR=./data/shard-a \
-    dotnet run --project samples/DocumentForge.Api
+DFDB_NODE_NAME=shard-a DFDB_PORT=5001 DFDB_DATA_DIR=./data/shard-a dfdb serve
 ```
 
 ## Setting up replication between local nodes

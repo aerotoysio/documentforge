@@ -22,6 +22,7 @@
       <a href="sharding.html">Sharding</a>
       <a href="deployment.html">Deployment</a>
       <a href="security.html">Security</a>
+      <a href="cli-reference.html">CLI</a>
       <a href="performance.html">Performance</a>
     </div>
   </div>
@@ -42,9 +43,11 @@
       <li><a href="#concept">Concepts</a></li>
       <li><a href="#logical">Logical replication</a></li>
       <li><a href="#physical">Physical replication</a></li>
-      <li><a href="#setup">Setting it up</a></li>
+      <li><a href="#setup">Setting it up (C# API)</a></li>
+      <li><a href="#cli-setup">From the CLI</a></li>
       <li><a href="#reconnect">Catchup on reconnect</a></li>
       <li><a href="#handover">Planned handover</a></li>
+      <li><a href="#autofailover">Auto-failover</a></li>
       <li><a href="#dc-move">Datacenter move runbook</a></li>
       <li><a href="#caveats">Caveats</a></li>
     </ul>
@@ -85,8 +88,8 @@
 
     <p>Physical replication doesn't solve the "can the follower serve reads" problem — its in-memory structures (indexes, location map) were built from the original data and aren't updated by page writes. Close and reopen the follower to rebuild them.</p>
 
-    <h2 id="setup">Setting it up</h2>
-    <p>Start with logical replication — it's what you want for most cases.</p>
+    <h2 id="setup">Setting it up (C# API)</h2>
+    <p>Replication runs over a dedicated TCP port, separate from the HTTP API. At the moment it's wired in code — you write a tiny bootstrap program that opens the database and calls the replication methods. See <a href="#cli-setup">From the CLI</a> below for the current CLI story and the roadmap.</p>
 
     <h4>Leader</h4>
     <pre><span class="hl-kw">using var</span> leader = DocumentForgeDb.OpenOrCreate(<span class="hl-str">"prod.dfdb"</span>);
@@ -109,6 +112,105 @@ leader.GetLogicalFollowerCount() <span class="hl-com">// how many followers are 
 follower.FollowerLastSeq         <span class="hl-com">// last applied op</span>
 follower.LogicallyReplicatedOps  <span class="hl-com">// running total</span>
 follower.GapsDetected            <span class="hl-com">// non-zero means lost ops — investigate!</span></pre>
+
+    <h2 id="cli-setup">From the CLI</h2>
+    <p><code>dfdb serve</code> can stand up a leader or follower directly — no custom code. Pass the role via flag, env var, or a <code>replication</code> block in <code>node.json</code>, and the node will bring up both the HTTP API and the replication wire when it starts.</p>
+
+    <h4>Leader</h4>
+    <pre>dfdb serve --port 5000 --data-dir ./data/leader \
+           --replication-role leader \
+           --replication-port 5500 \
+           --replication-secret repl_shared_xyz</pre>
+
+    <p>The HTTP API listens on <code>:5000</code>; the replication wire listens on <code>:5500</code>. Followers connect to the replication port, not the HTTP port.</p>
+
+    <h4>Follower</h4>
+    <pre>dfdb serve --port 5010 --data-dir ./data/replica \
+           --replication-role follower \
+           --leader-host localhost --leader-port 5500 \
+           --replication-secret repl_shared_xyz</pre>
+
+    <p>The follower opens its own HTTP API on <code>:5010</code> (so your app can read from it), and connects outbound to <code>leader-host:5500</code> for the replication stream.</p>
+
+    <h4>Follower with auto-failover</h4>
+    <pre>dfdb serve --port 5010 --data-dir ./data/replica \
+           --replication-role follower \
+           --leader-host localhost --leader-port 5500 \
+           --auto-failover-seconds 10</pre>
+
+    <p>If the leader goes silent for 10 seconds, this follower promotes itself and begins accepting writes on the leader's replication port. Add <code>--auto-failover-new-port N</code> if you want it to take over on a different port. See <a href="#autofailover">Auto-failover</a> for the trade-offs.</p>
+
+    <h4>All-in-one via node.json</h4>
+    <p>For production, put everything in a file. The <code>replication</code> block is honored by <code>dfdb serve</code> out of the box:</p>
+
+    <pre>{
+  <span class="hl-str">"nodeName"</span>: <span class="hl-str">"replica-1"</span>,
+  <span class="hl-str">"port"</span>: <span class="hl-num">5010</span>,
+  <span class="hl-str">"dataDir"</span>: <span class="hl-str">"/var/lib/dfdb/replica"</span>,
+  <span class="hl-str">"security"</span>: {
+    <span class="hl-str">"replicationSecret"</span>: <span class="hl-str">"repl_shared_xyz"</span>
+  },
+  <span class="hl-str">"replication"</span>: {
+    <span class="hl-str">"role"</span>: <span class="hl-str">"follower"</span>,
+    <span class="hl-str">"leaderHost"</span>: <span class="hl-str">"leader.internal"</span>,
+    <span class="hl-str">"leaderPort"</span>: <span class="hl-num">5500</span>,
+    <span class="hl-str">"autoFailover"</span>: {
+      <span class="hl-str">"silenceSeconds"</span>: <span class="hl-num">10</span>,
+      <span class="hl-str">"newLeaderPort"</span>: <span class="hl-num">5500</span>
+    }
+  }
+}</pre>
+
+    <pre>dfdb serve --config ./node.json</pre>
+
+    <h4>Env-var equivalents</h4>
+    <p>Every flag has an env var, handy in containers:</p>
+
+    <table>
+      <thead><tr><th>Flag</th><th>Env var</th></tr></thead>
+      <tbody>
+        <tr><td><code>--replication-role</code></td><td><code>DFDB_REPLICATION_ROLE</code></td></tr>
+        <tr><td><code>--replication-port</code></td><td><code>DFDB_REPLICATION_PORT</code></td></tr>
+        <tr><td><code>--leader-host</code></td><td><code>DFDB_LEADER_HOST</code></td></tr>
+        <tr><td><code>--leader-port</code></td><td><code>DFDB_LEADER_PORT</code></td></tr>
+        <tr><td><code>--auto-failover-seconds</code></td><td><code>DFDB_AUTO_FAILOVER_SECONDS</code></td></tr>
+        <tr><td><code>--replication-secret</code></td><td><code>DFDB_REPLICATION_SECRET</code></td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <strong>One shared secret on every node.</strong> Whatever value you set for <code>replicationSecret</code> on the leader must match on every follower or the handshake is rejected. See <a href="security.html#knob2">Security → Replication secret</a>.
+    </div>
+
+    <h4>Verifying it's working</h4>
+    <p>On startup, the banner shows the active role:</p>
+
+    <pre>dfdb serve
+  node:        replica-1
+  data dir:    /var/lib/dfdb/replica
+  listening:   http://localhost:5010
+  security:    API key OFF  |  TLS OFF  |  replication-secret ON
+  replication: FOLLOWER  following leader.internal:5500  |  auto-failover after 10s (new port :5500)</pre>
+
+    <p>Then query <code>/stats</code> on both nodes — document counts should match once catchup completes.</p>
+
+    <h4>Runtime control over HTTP</h4>
+    <p>Everything above is also exposed via REST, so a management tool (or the Postman collection) can drive it. See the <a href="cli-reference.html#rest-api">REST API reference</a> for the full list:</p>
+
+    <pre>GET  /replication/status
+POST /replication/start-leader       { "port": 5500 }
+POST /replication/start-follower     { "host": "leader.internal", "port": 5500 }
+POST /replication/read-only          <span class="hl-com"># planned handover step 1</span>
+POST /replication/promote            { "port": 5500 }  <span class="hl-com"># step 2</span>
+POST /replication/auto-failover/enable   { "silenceSeconds": 10, "newLeaderPort": 5500 }
+POST /replication/auto-failover/disable</pre>
+
+    <h4>Direct C# API</h4>
+    <p>The CLI flags and HTTP endpoints map 1:1 to the C# methods, which remain available if you're embedding DocumentForge in your own process instead of running <code>dfdb serve</code>:</p>
+
+    <pre>db.StartLogicalReplicationServer(port: <span class="hl-num">5500</span>, sharedSecret: <span class="hl-str">"..."</span>);
+db.StartLogicalReplicationFollower(<span class="hl-str">"leader-host"</span>, <span class="hl-num">5500</span>, sharedSecret: <span class="hl-str">"..."</span>);
+db.EnableAutoFailover(newLeaderPort: <span class="hl-num">5500</span>, silenceTimeout: TimeSpan.FromSeconds(<span class="hl-num">10</span>));</pre>
 
     <h2 id="reconnect">Catchup on reconnect</h2>
     <p>When a follower disconnects and reconnects:</p>
@@ -141,6 +243,28 @@ newLeader.PromoteToLeader(port: <span class="hl-num">5500</span>);
 
     <p>Between steps 1 and 2, writes to <code>oldLeader</code> throw <code>DocumentForgeException("Database is in read-only mode...")</code>. After step 2, <code>newLeader</code> accepts writes.</p>
 
+    <h2 id="autofailover">Auto-failover</h2>
+    <p>Planned handover is the safe path — zero data loss, no split-brain risk. For crashes (leader process died, host went dark, network partition), you can opt in to automatic promotion. A follower watches the leader's heartbeat stream and, if nothing arrives within a silence threshold, promotes itself to leader.</p>
+
+    <pre><span class="hl-kw">using var</span> follower = DocumentForgeDb.OpenOrCreate(<span class="hl-str">"replica.dfdb"</span>);
+follower.StartLogicalReplicationFollower(<span class="hl-str">"leader-host"</span>, <span class="hl-num">5500</span>);
+
+<span class="hl-com">// Enable auto-promotion if the leader goes silent for 10 seconds.</span>
+follower.EnableAutoFailover(
+    newLeaderPort: <span class="hl-num">5500</span>,
+    silenceTimeout: TimeSpan.FromSeconds(<span class="hl-num">10</span>),
+    onPromoted: port =&gt; Console.WriteLine(<span class="hl-str">$"Promoted to leader on :{port}"</span>));</pre>
+
+    <p>The watcher has a 3-second grace period after startup (so normal connect-time silence doesn't trigger promotion). Once promoted, the follower stops consuming from the old leader, opens its own replication server on <code>newLeaderPort</code>, and begins accepting writes.</p>
+
+    <p>Useful properties while running:</p>
+    <pre>follower.WasAutoFailoverPromoted   <span class="hl-com">// true once it has taken over</span>
+follower.DisableAutoFailover()     <span class="hl-com">// stop watching (safe to call any time)</span></pre>
+
+    <div class="callout">
+      <strong>Trade-offs.</strong> Auto-failover accepts a small data loss window — any ops the leader committed but hadn't yet broadcast are lost. If your application cannot tolerate this, use planned handover for maintenance and reserve auto-failover for genuine crashes. To avoid split-brain, make sure only one follower has auto-failover enabled, or use a witness/quorum mechanism in front of it.
+    </div>
+
     <h2 id="dc-move">Datacenter move runbook</h2>
     <p>A concrete recipe for moving a production database from <em>Datacenter A</em> to <em>Datacenter B</em>:</p>
 
@@ -163,10 +287,11 @@ newLeader.PromoteToLeader(port: <span class="hl-num">5500</span>);
 
     <h2 id="caveats">Caveats and current limits</h2>
     <ul>
-      <li><strong>No auto-failover.</strong> Planned handover is manual. For crash failover (leader died), you'd need to promote a follower yourself and accept some data loss (the last few ops after the crash may not have reached the follower).</li>
+      <li><strong>Auto-failover has a small data-loss window.</strong> Ops the leader committed but hadn't yet broadcast when it died are lost. Planned handover avoids this — use it for maintenance.</li>
+      <li><strong>No built-in split-brain protection.</strong> Auto-failover has no witness/quorum — enable it on one follower only, or front it with your own fencing mechanism. Planned handover prevents split-brain by design (the old leader is read-only <em>before</em> the new one is promoted).</li>
       <li><strong>No multi-master.</strong> Writes go to the leader only. You cannot write to two nodes simultaneously.</li>
-      <li><strong>Ring-buffered catchup.</strong> A follower that's been offline for a very long time may need a fresh snapshot (manual file copy) to catch up.</li>
-      <li><strong>Client-side failover.</strong> DocumentForge doesn't include a client-side load balancer or discovery service. Your application knows which host is the current leader.</li>
+      <li><strong>Ring-buffered catchup.</strong> The leader keeps the last 10,000 ops for reconnecting followers. A follower that's been offline longer than that needs a fresh snapshot (manual file copy) to catch up.</li>
+      <li><strong>Client-side failover.</strong> DocumentForge doesn't include a client-side load balancer or discovery service. Your application needs to know which host is the current leader — typically via a config flip after promotion, DNS, or a small service-discovery layer in front.</li>
     </ul>
   </article>
 </div>

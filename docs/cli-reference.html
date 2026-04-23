@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CLI Reference — DocumentForge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="index.html" class="brand"><span class="brand-dot"></span>DocumentForge</a>
+    <div class="nav-links">
+      <a href="getting-started.html">Getting Started</a>
+      <a href="query-language.html">Query Language</a>
+      <a href="data-modeling.html">Data Modeling</a>
+      <a href="replication.html">Replication</a>
+      <a href="sharding.html">Sharding</a>
+      <a href="deployment.html">Deployment</a>
+      <a href="security.html">Security</a>
+      <a href="cli-reference.html" class="active">CLI</a>
+      <a href="performance.html">Performance</a>
+    </div>
+  </div>
+</nav>
+
+<section class="page-title">
+  <div class="container">
+    <div class="eyebrow">Chapter 09</div>
+    <h1>CLI Reference</h1>
+    <p>One binary, every feature. <code>dfdb</code> runs a node, queries a file, drives a cluster, and rebalances shards — all from the same executable.</p>
+  </div>
+</section>
+
+<div class="doc-layout">
+  <aside class="toc">
+    <h5>On this page</h5>
+    <ul>
+      <li><a href="#install">Install / run</a></li>
+      <li><a href="#serve">serve</a></li>
+      <li><a href="#inspect">inspect</a></li>
+      <li><a href="#query">query</a></li>
+      <li><a href="#repl">repl</a></li>
+      <li><a href="#compact">compact</a></li>
+      <li><a href="#seed">seed</a></li>
+      <li><a href="#cluster">cluster</a></li>
+      <li><a href="#health">health</a></li>
+      <li><a href="#rebalance">rebalance</a></li>
+      <li><a href="#nodeconfig">node.json format</a></li>
+      <li><a href="#envvars">Environment variables</a></li>
+      <li><a href="#precedence">Config precedence</a></li>
+      <li><a href="#rest-api">REST API endpoints</a></li>
+      <li><a href="#postman">Postman collection</a></li>
+    </ul>
+  </aside>
+
+  <article>
+    <h2 id="install">Install / run</h2>
+    <p>There are two ways to run the CLI. Both accept identical subcommands.</p>
+
+    <h4>Dev mode (source checkout)</h4>
+    <pre>dotnet run --project src/DocumentForge.Cli -- &lt;command&gt; [args]</pre>
+
+    <h4>Published binary</h4>
+    <pre><span class="hl-com"># Build the single-file binary for your platform</span>
+./scripts/publish-dfdb.sh     <span class="hl-com"># or publish-dfdb.ps1 on Windows</span>
+
+<span class="hl-com"># Then run it from dist/ — no .NET runtime required on the target</span>
+./dist/linux-x64/dfdb &lt;command&gt; [args]
+./dist/win-x64/dfdb.exe &lt;command&gt; [args]</pre>
+
+    <p>In the rest of this page we write <code>dfdb</code>; substitute whichever form fits your setup.</p>
+
+    <h4>Top-level help</h4>
+    <pre>dfdb help        <span class="hl-com"># or --help, -h</span>
+dfdb version     <span class="hl-com"># or --version, -v</span></pre>
+
+    <h2 id="serve">serve</h2>
+    <p>Start the REST API for a single node. This is what the admin UI, the LINQ client, and the <code>HttpShardTransport</code> talk to.</p>
+
+    <pre>dfdb serve [--config node.json]
+            [--node-name NAME]
+            [--port N]
+            [--data-dir DIR]
+            [--api-key KEY]
+            [--replication-secret SECRET]
+            [--bind-all]
+            [--replication-role leader|follower]
+            [--replication-port N]
+            [--leader-host H] [--leader-port N]
+            [--auto-failover-seconds N] [--auto-failover-new-port N]</pre>
+
+    <table>
+      <thead><tr><th>Flag</th><th>Default</th><th>Notes</th></tr></thead>
+      <tbody>
+        <tr><td><code>--config</code></td><td>—</td><td>Path to a <code>node.json</code> file. Loaded first; other flags override.</td></tr>
+        <tr><td><code>--node-name</code></td><td><code>node-1</code></td><td>Shows up in logs, health output, and shard descriptors.</td></tr>
+        <tr><td><code>--port</code></td><td><code>5000</code></td><td>HTTP (or HTTPS, with TLS configured) port.</td></tr>
+        <tr><td><code>--data-dir</code></td><td><code>./data</code></td><td>Directory for <code>data.dfdb</code>, WAL, and recovery log.</td></tr>
+        <tr><td><code>--api-key</code></td><td>off</td><td>If set, every request must carry <code>Authorization: Bearer &lt;key&gt;</code>.</td></tr>
+        <tr><td><code>--replication-secret</code></td><td>off</td><td>Shared secret enforced on the replication handshake.</td></tr>
+        <tr><td><code>--bind-all</code></td><td>loopback</td><td>Bind to <code>0.0.0.0</code> instead of <code>127.0.0.1</code>. Only enable behind a trusted network / firewall.</td></tr>
+        <tr><td><code>--replication-role</code></td><td>off</td><td><code>leader</code> or <code>follower</code>. Omit for a single-node setup.</td></tr>
+        <tr><td><code>--replication-port</code></td><td><code>5500</code></td><td>Leader: TCP port for the replication listener. Must differ from <code>--port</code>.</td></tr>
+        <tr><td><code>--leader-host</code></td><td>—</td><td>Follower: hostname of the leader.</td></tr>
+        <tr><td><code>--leader-port</code></td><td>—</td><td>Follower: replication port on the leader.</td></tr>
+        <tr><td><code>--auto-failover-seconds</code></td><td>off</td><td>Follower: promote if the leader is silent this many seconds.</td></tr>
+        <tr><td><code>--auto-failover-new-port</code></td><td>= leader port</td><td>Follower: which port to bind as leader once promoted.</td></tr>
+      </tbody>
+    </table>
+
+    <h4>Examples</h4>
+    <pre><span class="hl-com"># Single-node dev</span>
+dfdb serve --port 5000 --data-dir ./data
+
+<span class="hl-com"># Production node with API key + shared secret</span>
+dfdb serve --config ./node-shard-a.json \
+           --api-key sk_prod_abc123 \
+           --replication-secret repl_shared_xyz
+
+<span class="hl-com"># Everything via env vars (useful in containers)</span>
+DFDB_NODE_NAME=shard-a \
+DFDB_PORT=5001 \
+DFDB_DATA_DIR=/var/lib/dfdb/shard-a \
+DFDB_API_KEY=sk_prod_abc123 \
+dfdb serve
+
+<span class="hl-com"># Leader with replication enabled</span>
+dfdb serve --port 5000 --data-dir ./data/leader \
+           --replication-role leader --replication-port 5500
+
+<span class="hl-com"># Follower with auto-failover</span>
+dfdb serve --port 5010 --data-dir ./data/replica \
+           --replication-role follower \
+           --leader-host localhost --leader-port 5500 \
+           --auto-failover-seconds 10</pre>
+
+    <div class="callout">
+      <strong>Replication is fully CLI-driven.</strong> Pass <code>--replication-role</code> (and the follower flags) and <code>dfdb serve</code> stands up the replication listener or follower loop alongside the HTTP API. See <a href="replication.html#cli-setup">Replication → From the CLI</a> for the full protocol and failure modes.
+    </div>
+
+    <h2 id="inspect">inspect</h2>
+    <p>Offline introspection. Opens a <code>.dfdb</code> file locally and prints stats — size, page counts, collections, and indexes. Does not start a server.</p>
+
+    <pre>dfdb inspect &lt;file&gt;
+
+<span class="hl-com"># Example</span>
+dfdb inspect ./data/shard-a/data.dfdb</pre>
+
+    <h2 id="query">query</h2>
+    <p>Run a single SQL statement against a local file and print the results. Great for scripts and sanity checks.</p>
+
+    <pre>dfdb query &lt;file&gt; "&lt;sql&gt;"
+
+<span class="hl-com"># Examples</span>
+dfdb query ./data/shard-a/data.dfdb "SELECT COUNT(*) FROM orders"
+dfdb query ./data/shard-a/data.dfdb "SELECT * FROM orders WHERE pnr = 'ABC123'"</pre>
+
+    <h2 id="repl">repl</h2>
+    <p>Interactive SQL console. Opens the file, gives you a prompt, executes statements on Enter. Type <code>stats</code> to see storage info, <code>exit</code> to quit.</p>
+
+    <pre>dfdb repl &lt;file&gt;
+
+dfdb&gt; SELECT * FROM orders LIMIT 5
+dfdb&gt; SELECT status, COUNT(*) FROM orders GROUP BY status
+dfdb&gt; CREATE INDEX idx_pnr ON orders (pnr)
+dfdb&gt; stats
+dfdb&gt; exit</pre>
+
+    <h2 id="compact">compact</h2>
+    <p>Reclaim physical space left by <code>DELETE</code>. Rewrites the collection's pages in-place, releasing freed slots back to the allocator.</p>
+
+    <pre>dfdb compact &lt;file&gt; &lt;collection&gt;
+
+<span class="hl-com"># Example</span>
+dfdb compact ./data/shard-a/data.dfdb orders</pre>
+
+    <div class="callout">
+      <strong>Note:</strong> compaction takes an exclusive write lock. Don't run it against a file that a live <code>dfdb serve</code> has open — stop the server first, compact, then restart.
+    </div>
+
+    <h2 id="seed">seed</h2>
+    <p>Loads realistic airline-reservation sample data (orders with nested passengers and flights). Useful for demos and smoke tests.</p>
+
+    <pre>dfdb seed &lt;file&gt; [count]
+
+<span class="hl-com"># Examples</span>
+dfdb seed ./data/demo.dfdb               <span class="hl-com"># default 10,000 orders</span>
+dfdb seed ./data/demo.dfdb 250000        <span class="hl-com"># a quarter million</span></pre>
+
+    <h2 id="cluster">cluster</h2>
+    <p>Build and inspect the <code>cluster.json</code> topology file. This file describes every shard and what's sharded vs replicated.</p>
+
+    <pre>dfdb cluster init            &lt;config&gt;
+dfdb cluster show            &lt;config&gt;
+dfdb cluster add-shard       &lt;config&gt; &lt;name&gt; &lt;endpoint&gt;
+dfdb cluster add-collection  &lt;config&gt; &lt;name&gt; (hash &lt;path&gt;|replicated)</pre>
+
+    <h4>Examples</h4>
+    <pre><span class="hl-com"># Fresh cluster config</span>
+dfdb cluster init cluster.json
+
+<span class="hl-com"># Register three shards</span>
+dfdb cluster add-shard cluster.json shard-a http://localhost:5001
+dfdb cluster add-shard cluster.json shard-b http://localhost:5002
+dfdb cluster add-shard cluster.json shard-c http://localhost:5003
+
+<span class="hl-com"># orders are hash-sharded on pnr; airports are fully replicated to every shard</span>
+dfdb cluster add-collection cluster.json orders   hash pnr
+dfdb cluster add-collection cluster.json airports replicated
+
+<span class="hl-com"># Inspect what we built</span>
+dfdb cluster show cluster.json</pre>
+
+    <h2 id="health">health</h2>
+    <p>Ping every shard in a cluster config and report status + basic stats. Intended to be safe to run from anywhere — it only reads.</p>
+
+    <pre>dfdb health &lt;cluster-config&gt;
+
+<span class="hl-com"># Example output: three green dots, response times, doc counts per shard</span>
+dfdb health cluster.json</pre>
+
+    <h2 id="rebalance">rebalance</h2>
+    <p>Plan or execute a topology change (adding or removing shards). <code>--plan-only</code> prints what would move without touching data.</p>
+
+    <pre>dfdb rebalance &lt;old-config&gt; &lt;new-config&gt; [--plan-only]
+
+<span class="hl-com"># Preview only — no data moves</span>
+dfdb rebalance old-cluster.json new-cluster.json --plan-only
+
+<span class="hl-com"># Execute the migration</span>
+dfdb rebalance old-cluster.json new-cluster.json</pre>
+
+    <p>See the <a href="sharding.html">Sharding guide</a> for the online-rebalance protocol and what happens to reads/writes during migration.</p>
+
+    <h2 id="nodeconfig">node.json format</h2>
+    <p>Full schema. Every field except <code>nodeName</code>, <code>port</code>, and <code>dataDir</code> is optional.</p>
+
+    <pre>{
+  <span class="hl-str">"nodeName"</span>: <span class="hl-str">"shard-a"</span>,
+  <span class="hl-str">"port"</span>: <span class="hl-num">5001</span>,
+  <span class="hl-str">"dataDir"</span>: <span class="hl-str">"/var/lib/dfdb/shard-a"</span>,
+  <span class="hl-str">"bindAllInterfaces"</span>: <span class="hl-kw">false</span>,
+  <span class="hl-str">"security"</span>: {
+    <span class="hl-str">"apiKey"</span>: <span class="hl-str">"sk_prod_abc123"</span>,
+    <span class="hl-str">"replicationSecret"</span>: <span class="hl-str">"repl_shared_xyz"</span>,
+    <span class="hl-str">"tls"</span>: {
+      <span class="hl-str">"certPath"</span>: <span class="hl-str">"/etc/dfdb/cert.pfx"</span>,
+      <span class="hl-str">"certPassword"</span>: <span class="hl-str">"env:DFDB_CERT_PASSWORD"</span>
+    }
+  },
+  <span class="hl-str">"replication"</span>: {
+    <span class="hl-str">"role"</span>: <span class="hl-str">"follower"</span>,
+    <span class="hl-str">"port"</span>: <span class="hl-num">5500</span>,
+    <span class="hl-str">"leaderHost"</span>: <span class="hl-str">"leader.internal"</span>,
+    <span class="hl-str">"leaderPort"</span>: <span class="hl-num">5500</span>,
+    <span class="hl-str">"autoFailover"</span>: {
+      <span class="hl-str">"silenceSeconds"</span>: <span class="hl-num">10</span>,
+      <span class="hl-str">"newLeaderPort"</span>: <span class="hl-num">5500</span>
+    }
+  }
+}</pre>
+
+    <p>Notes:</p>
+    <ul>
+      <li><code>bindAllInterfaces: true</code> is equivalent to <code>--bind-all</code> — only enable behind a firewall.</li>
+      <li><code>certPassword</code> supports <code>env:VAR_NAME</code> indirection so you don't commit passwords to the config file.</li>
+      <li>Omit the <code>security</code> block entirely for local dev.</li>
+      <li>Omit the <code>replication</code> block for a single-node setup. <code>role</code> is either <code>"leader"</code> or <code>"follower"</code>.</li>
+      <li>On a leader, only <code>role</code> and <code>port</code> are read. On a follower, <code>leaderHost</code> + <code>leaderPort</code> are required; <code>autoFailover</code> is optional.</li>
+    </ul>
+
+    <h2 id="envvars">Environment variables</h2>
+    <p>Every flag on <code>dfdb serve</code> has an env-var equivalent. Useful for containers and orchestrators.</p>
+
+    <table>
+      <thead><tr><th>Flag</th><th>Env var</th></tr></thead>
+      <tbody>
+        <tr><td><code>--node-name</code></td><td><code>DFDB_NODE_NAME</code></td></tr>
+        <tr><td><code>--port</code></td><td><code>DFDB_PORT</code></td></tr>
+        <tr><td><code>--data-dir</code></td><td><code>DFDB_DATA_DIR</code></td></tr>
+        <tr><td><code>--api-key</code></td><td><code>DFDB_API_KEY</code></td></tr>
+        <tr><td><code>--replication-secret</code></td><td><code>DFDB_REPLICATION_SECRET</code></td></tr>
+        <tr><td><code>--replication-role</code></td><td><code>DFDB_REPLICATION_ROLE</code></td></tr>
+        <tr><td><code>--replication-port</code></td><td><code>DFDB_REPLICATION_PORT</code></td></tr>
+        <tr><td><code>--leader-host</code></td><td><code>DFDB_LEADER_HOST</code></td></tr>
+        <tr><td><code>--leader-port</code></td><td><code>DFDB_LEADER_PORT</code></td></tr>
+        <tr><td><code>--auto-failover-seconds</code></td><td><code>DFDB_AUTO_FAILOVER_SECONDS</code></td></tr>
+      </tbody>
+    </table>
+
+    <p>The admin UI also reads one env var at build time:</p>
+
+    <pre>NEXT_PUBLIC_DFDB_URL=http://localhost:5000 npm run dev</pre>
+
+    <h2 id="precedence">Config precedence</h2>
+    <p>When the same setting is provided by multiple sources, the later one wins:</p>
+
+    <ol>
+      <li><strong><code>--config node.json</code></strong> — loaded first</li>
+      <li><strong>CLI flags</strong> (<code>--port</code>, <code>--data-dir</code>, etc.) — override the config file</li>
+      <li><strong>Env vars</strong> (<code>DFDB_*</code>) — fill in anything still at its default</li>
+      <li><strong>Defaults</strong> — localhost:5000, <code>./data</code>, no security</li>
+    </ol>
+
+    <div class="callout">
+      <strong>Rule of thumb:</strong> put stable topology (<code>nodeName</code>, <code>port</code>, <code>dataDir</code>) in the config file, and pass secrets (<code>--api-key</code>, <code>DFDB_REPLICATION_SECRET</code>, cert password) via env vars or a secret manager.
+    </div>
+
+    <h2 id="rest-api">REST API endpoints</h2>
+    <p>Once <code>dfdb serve</code> is running, every database operation is available over HTTP. The <a href="postman/DocumentForge.postman_collection.json">Postman collection</a> covers them all with working examples.</p>
+
+    <h4>Application (CRUD + query)</h4>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET</code></td><td><code>/health</code></td><td>Liveness + node name, version, read-only flag, uptime.</td></tr>
+        <tr><td><code>POST</code></td><td><code>/query</code></td><td>Run arbitrary SQL. Body: <code>{ "sql": "..." }</code>.</td></tr>
+        <tr><td><code>GET</code></td><td><code>/stats</code></td><td>File size, pages, per-collection counts, all indexes.</td></tr>
+        <tr><td><code>GET</code></td><td><code>/collections</code></td><td>List all collection names.</td></tr>
+        <tr><td><code>POST</code></td><td><code>/collections/{name}</code></td><td>Insert a single JSON document.</td></tr>
+        <tr><td><code>POST</code></td><td><code>/collections/{name}/bulk</code></td><td>Bulk insert (JSON array).</td></tr>
+        <tr><td><code>GET</code></td><td><code>/collections/{name}</code></td><td>List documents. Supports <code>?limit=N</code>.</td></tr>
+        <tr><td><code>GET</code></td><td><code>/collections/{name}/{id}</code></td><td>Find one document by id.</td></tr>
+        <tr><td><code>DELETE</code></td><td><code>/collections/{name}/{id}</code></td><td>Delete one document.</td></tr>
+        <tr><td><code>DELETE</code></td><td><code>/collections/{name}</code></td><td>Drop the entire collection. Requires header <code>X-Confirm: true</code>.</td></tr>
+        <tr><td><code>GET</code></td><td><code>/indexes/{collection}</code></td><td>List indexes on a collection.</td></tr>
+        <tr><td><code>POST</code></td><td><code>/index</code></td><td>Create an index. Body: <code>{ collection, path, name?, unique? }</code>.</td></tr>
+        <tr><td><code>POST</code></td><td><code>/seed</code></td><td>Populate the demo airline dataset. Body: <code>{ "orders": 500 }</code>.</td></tr>
+      </tbody>
+    </table>
+
+    <h4>Admin</h4>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>POST</code></td><td><code>/admin/flush</code></td><td>Flush dirty pages to disk, truncate recovery log.</td></tr>
+        <tr><td><code>POST</code></td><td><code>/admin/checkpoint</code></td><td>Drain the WAL to a consistent on-disk state.</td></tr>
+        <tr><td><code>POST</code></td><td><code>/admin/compact/{collection}</code></td><td>Reclaim space from deletes. Returns pages compacted + bytes reclaimed.</td></tr>
+      </tbody>
+    </table>
+
+    <h4>Replication</h4>
+    <table>
+      <thead><tr><th>Method</th><th>Path</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET</code></td><td><code>/replication/status</code></td><td>Role, seqs, follower count, gaps, auto-failover state. Safe to poll.</td></tr>
+        <tr><td><code>POST</code></td><td><code>/replication/start-leader</code></td><td>Body: <code>{ port, sharedSecret? }</code>. Opens the replication listener.</td></tr>
+        <tr><td><code>POST</code></td><td><code>/replication/start-follower</code></td><td>Body: <code>{ host, port, sharedSecret? }</code>.</td></tr>
+        <tr><td><code>POST</code></td><td><code>/replication/read-only</code></td><td>Enter read-only mode (planned handover step 1).</td></tr>
+        <tr><td><code>POST</code></td><td><code>/replication/read-write</code></td><td>Exit read-only mode (recover / abort handover).</td></tr>
+        <tr><td><code>POST</code></td><td><code>/replication/promote</code></td><td>Body: <code>{ port }</code>. Take over as leader (handover step 2).</td></tr>
+        <tr><td><code>POST</code></td><td><code>/replication/auto-failover/enable</code></td><td>Body: <code>{ silenceSeconds, newLeaderPort }</code>.</td></tr>
+        <tr><td><code>POST</code></td><td><code>/replication/auto-failover/disable</code></td><td>Stop watching for leader silence.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout">
+      <strong>Sharding control is CLI-only on purpose.</strong> Cluster topology lives in a <code>cluster.json</code> file you version alongside your infra — not per-node state. Use <code>dfdb cluster</code> / <code>dfdb health</code> / <code>dfdb rebalance</code> to manage it. Each individual shard is still a regular node, so every endpoint above works on each one.
+    </div>
+
+    <h2 id="postman">Postman collection</h2>
+    <p>A ready-to-import Postman collection lives at <a href="postman/DocumentForge.postman_collection.json"><code>docs/postman/DocumentForge.postman_collection.json</code></a>. Two folders:</p>
+
+    <ul>
+      <li><strong>Application</strong> — how an app uses the database: seed, insert, bulk-insert, find-by-id, SQL queries, create index, delete.</li>
+      <li><strong>Database Operations</strong> — how a management app / SRE uses it: admin (flush, checkpoint, compact, drop), replication (status, start leader/follower, promote, auto-failover), and a sharding-via-CLI reference.</li>
+    </ul>
+
+    <h4>Setting it up</h4>
+    <ol>
+      <li>Open Postman → <em>File</em> → <em>Import</em> → choose the <code>DocumentForge.postman_collection.json</code> file.</li>
+      <li>On the collection, set <code>baseUrl</code> (default <code>http://localhost:5000</code>) and, if you started the node with <code>--api-key</code>, set <code>apiKey</code>.</li>
+      <li>Run <em>Application → Seed sample airline data</em> to get ~500 realistic orders + flights with 5 indexes.</li>
+      <li>Pre-request scripts auto-save returned ids to collection variables so Insert → Find → Delete chains work without hand-editing URLs.</li>
+    </ol>
+
+    <p>See <a href="postman/README.md"><code>docs/postman/README.md</code></a> for the variable reference and recommended first-run order.</p>
+  </article>
+</div>
+
+<footer>
+  <div class="container">
+    <p><strong>DocumentForge</strong> — built with care, zero dependencies.</p>
+    <p class="meta">MIT License · Open Source · Version 0.1.0</p>
+  </div>
+</footer>
+
+</body>
+</html>
