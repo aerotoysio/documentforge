@@ -105,7 +105,8 @@ public static class ServeCommand
         Console.WriteLine("             GET|DELETE /collections/{name}/{id} | POST /collections/{name}/bulk");
         Console.WriteLine("             DELETE /collections/{name} | GET /indexes/{collection} | POST /index");
         Console.WriteLine("             POST /seed | GET /health");
-        Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint | POST /admin/compact/{collection}");
+        Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint");
+        Console.WriteLine("             POST /admin/compact/{collection} | POST /admin/rebuild-indexes/{collection}");
         Console.WriteLine("  replication:");
         Console.WriteLine("             GET  /replication/status");
         Console.WriteLine("             POST /replication/start-leader | /replication/start-follower");
@@ -230,8 +231,12 @@ public static class ServeCommand
             return Results.Ok(JsonDocument.Parse(doc.ToJson()).RootElement);
         });
 
-        // Bulk insert: accepts a JSON array of documents
-        app.MapPost("/collections/{name}/bulk", async (string name, HttpRequest request) =>
+        // Bulk insert: accepts a JSON array of documents.
+        // By default, rebuilds indexes afterwards so queries see the new rows.
+        // Pass ?skipIndexes=true for raw throughput in cold-load scenarios;
+        // you are then responsible for calling POST /admin/rebuild-indexes/{name}
+        // before any index-using query, or results will be wrong.
+        app.MapPost("/collections/{name}/bulk", async (string name, HttpRequest request, bool? skipIndexes) =>
         {
             using var reader = new StreamReader(request.Body);
             var json = await reader.ReadToEndAsync();
@@ -252,8 +257,28 @@ public static class ServeCommand
 
             var sw = System.Diagnostics.Stopwatch.StartNew();
             var inserted = db.BulkInsert(name, docs);
+
+            var indexesRebuilt = 0;
+            var skipped = skipIndexes == true;
+            if (!skipped)
+            {
+                var existingIndexes = db.GetIndexes(name);
+                if (existingIndexes.Count > 0)
+                {
+                    db.RebuildIndexes(name);
+                    indexesRebuilt = existingIndexes.Count;
+                }
+            }
+
             sw.Stop();
-            return Results.Ok(new { success = true, inserted, timeSeconds = Math.Round(sw.Elapsed.TotalSeconds, 3) });
+            return Results.Ok(new
+            {
+                success = true,
+                inserted,
+                indexesRebuilt,
+                indexesSkipped = skipped,
+                timeSeconds = Math.Round(sw.Elapsed.TotalSeconds, 3)
+            });
         });
 
         // Drop an entire collection (destructive - requires explicit X-Confirm: true header)
@@ -363,6 +388,28 @@ public static class ServeCommand
             db.Checkpoint();
             sw.Stop();
             return Results.Ok(new { success = true, timeMs = sw.Elapsed.TotalMilliseconds });
+        });
+
+        // Rebuild every index on a collection from scratch.
+        // Needed after a bulk insert that used ?skipIndexes=true, or any time
+        // an operator suspects index corruption.
+        app.MapPost("/admin/rebuild-indexes/{collection}", (string collection) =>
+        {
+            try
+            {
+                var indexes = db.GetIndexes(collection);
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                db.RebuildIndexes(collection);
+                sw.Stop();
+                return Results.Ok(new
+                {
+                    success = true,
+                    collection,
+                    indexesRebuilt = indexes.Count,
+                    timeMs = sw.Elapsed.TotalMilliseconds
+                });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
 
         // Compact (reclaim space from deletes) on a single collection
