@@ -61,7 +61,7 @@ Verified on a 250K and 10M document workload (modern laptop, NVMe SSD):
 | Range query LIMIT 100| 144 QPS   | 47 QPS |
 | File size            | 120 MB    | 4.77 GB |
 
-See [docs/performance.html](docs/performance.html) for full methodology.
+Full methodology lives in the [documentation site](https://github.com/tailwind-retailing/documentforge-docs) — see `performance.html`.
 
 ## Getting started
 
@@ -99,16 +99,17 @@ db.Insert("users", """{"name": "Alice", "email": "alice@example.com"}""");
 var result = db.Execute("SELECT * FROM users WHERE name = 'Alice'");
 ```
 
-Full guide: [docs/getting-started.html](docs/getting-started.html)
+Full guide in the [docs site](https://github.com/tailwind-retailing/documentforge-docs) — see `getting-started.html`.
 
 ## Documentation
 
-- [Getting Started](docs/getting-started.html)
-- [Query Language](docs/query-language.html)
-- [Data Modeling](docs/data-modeling.html) — embed vs reference
-- [Replication](docs/replication.html) — logical, physical, planned handover
-- [Deployment](docs/deployment.html) — single-node to multi-region
-- [Performance](docs/performance.html) — real numbers, limits, tuning
+The docs live in a separate repo so they're easy to host on GitHub Pages:
+
+**[📘 tailwind-retailing/documentforge-docs](https://github.com/tailwind-retailing/documentforge-docs)**
+
+10 pages covering: Getting Started · Query Language · Data Modeling · Replication ·
+Sharding · Deployment (incl. Docker + Render) · Security · CLI Reference ·
+Performance · Postman collection.
 
 ## Repo layout
 
@@ -134,8 +135,11 @@ samples/                     Demos showing how to use the library
   DocumentForge.Ctl          `dfctl` management CLI (superseded by `dfdb`)
 
 admin-ui/                    Next.js 15 admin web UI (separate app)
-docs/                        Swiss-style documentation website
 scripts/                     start-cluster, publish-dfdb, sample-cluster/
+Dockerfile                   Multi-stage build → self-contained dfdb image
+render.yaml                  Render blueprint: one-click private deploy
+
+(Documentation site lives in the separate tailwind-retailing/documentforge-docs repo.)
 ```
 
 ## Status
