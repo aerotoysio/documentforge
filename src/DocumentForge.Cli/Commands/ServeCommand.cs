@@ -49,13 +49,24 @@ public static class ServeCommand
         // Optional replication wiring - leader / follower / none
         var replicationSummary = StartReplication(db, config);
 
-        // Optional bearer-token middleware
+        // Optional bearer-token middleware.
+        // /health is always public (load balancers, Render, Docker HEALTHCHECK all probe it
+        // without any auth context - if we gate it, the platform thinks we're unhealthy).
+        // CORS preflights (OPTIONS) are also exempt so browser callers work.
         if (!string.IsNullOrEmpty(config.Security?.ApiKey))
         {
             var expected = config.Security.ApiKey;
             app.Use(async (ctx, next) =>
             {
                 if (ctx.Request.Method == "OPTIONS") { await next(); return; }
+
+                var path = ctx.Request.Path.Value ?? "";
+                if (string.Equals(path, "/health", StringComparison.OrdinalIgnoreCase))
+                {
+                    await next();
+                    return;
+                }
+
                 var header = ctx.Request.Headers["Authorization"].ToString();
                 if (!header.StartsWith("Bearer ", StringComparison.Ordinal) ||
                     !ConstantTimeEquals(header.Substring(7), expected))
