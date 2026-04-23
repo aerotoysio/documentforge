@@ -22,6 +22,7 @@
       <a href="sharding.html">Sharding</a>
       <a href="deployment.html" class="active">Deployment</a>
       <a href="security.html">Security</a>
+      <a href="cli-reference.html">CLI</a>
       <a href="performance.html">Performance</a>
     </div>
   </div>
@@ -46,6 +47,8 @@
       <li><a href="#multi-region">Multi-region</a></li>
       <li><a href="#files">Files on disk</a></li>
       <li><a href="#config">Configuration</a></li>
+      <li><a href="#docker">Docker</a></li>
+      <li><a href="#render">Render.com</a></li>
       <li><a href="#backup">Backups</a></li>
       <li><a href="#monitor">Monitoring</a></li>
       <li><a href="#checklist">Production checklist</a></li>
@@ -74,7 +77,7 @@
     <p>No network, no auth, no config. The file moves with your app. One process holds the write lock; other processes see a <em>FileShare.Read</em> lock and should either open their own file or connect via a network API layer.</p>
 
     <h2 id="api">API tier</h2>
-    <p>When multiple application servers need to share data, run a <code>DocumentForge.Api</code> process in front of the database. Each node reads a small <code>node.json</code>:</p>
+    <p>When multiple application servers need to share data, run a <code>dfdb serve</code> process in front of the database. Each node reads a small <code>node.json</code>:</p>
 
     <pre>{
   <span class="hl-str">"nodeName"</span>: <span class="hl-str">"prod-1"</span>,
@@ -82,15 +85,13 @@
   <span class="hl-str">"dataDir"</span>: <span class="hl-str">"/var/lib/documentforge"</span>
 }</pre>
 
-    <pre>dotnet run --project samples/DocumentForge.Api -- --config node.json
+    <pre>dfdb serve --config node.json
 
 <span class="hl-com"># or with CLI flags</span>
-dotnet run --project samples/DocumentForge.Api -- \
-    --node-name prod-1 --port 5000 --data-dir /var/lib/documentforge
+dfdb serve --node-name prod-1 --port 5000 --data-dir /var/lib/documentforge
 
 <span class="hl-com"># or with env vars</span>
-DFDB_NODE_NAME=prod-1 DFDB_PORT=5000 DFDB_DATA_DIR=/var/lib/documentforge \
-    dotnet run --project samples/DocumentForge.Api</pre>
+DFDB_NODE_NAME=prod-1 DFDB_PORT=5000 DFDB_DATA_DIR=/var/lib/documentforge dfdb serve</pre>
 
     <p>App servers send queries over HTTP:</p>
     <pre>POST /query  {"sql": "SELECT * FROM orders WHERE pnr = 'ABC123'"}</pre>
@@ -106,7 +107,7 @@ DFDB_NODE_NAME=prod-1 DFDB_PORT=5000 DFDB_DATA_DIR=/var/lib/documentforge \
 ./scripts/start-cluster.sh
 
 <span class="hl-com"># Check health</span>
-dotnet run --project samples/DocumentForge.Ctl -- health scripts/sample-cluster/cluster.json</pre>
+dfdb health scripts/sample-cluster/cluster.json</pre>
 
     <h2 id="leader-follower">Leader + Follower(s)</h2>
     <p>For read scaling and standby capability, run one leader and N followers. Writes go to the leader; reads can go to any node.</p>
@@ -185,6 +186,146 @@ db.StartLogicalReplicationFollower(<span class="hl-str">"leader-host.internal"</
       <li>10M docs ~ 5GB data → 100K pages (800MB) recommended</li>
       <li>100M docs ~ 50GB data → you want 200K–500K pages and a machine with &gt; 32GB RAM</li>
     </ul>
+
+    <h2 id="docker">Docker</h2>
+    <p>A production-ready <code>Dockerfile</code> ships in the repo root. It's a multi-stage build that publishes a self-contained single-file binary on top of <code>runtime-deps:9.0-bookworm-slim</code> — no .NET runtime needed in the final image. Final image size lands around <strong>90–120 MB</strong> depending on compression.</p>
+
+    <h4>Build and run locally</h4>
+    <pre><span class="hl-com"># Build the image</span>
+docker build -t dfdb .
+
+<span class="hl-com"># Run with a named volume so data survives restarts</span>
+docker run --rm -p 5000:5000 -v dfdb-data:/data dfdb
+
+<span class="hl-com"># In another terminal</span>
+curl http://localhost:5000/health</pre>
+
+    <h4>Production run (API key + replication secret)</h4>
+    <pre>docker run -d --name dfdb \
+    -p 5000:5000 \
+    -v dfdb-data:/data \
+    -e DFDB_NODE_NAME=prod-1 \
+    -e DFDB_API_KEY=sk_prod_abc123 \
+    -e DFDB_REPLICATION_SECRET=repl_shared_xyz \
+    dfdb</pre>
+
+    <h4>As a replication leader</h4>
+    <pre>docker run -d --name dfdb-leader \
+    -p 5000:5000 -p 5500:5500 \
+    -v dfdb-leader-data:/data \
+    -e DFDB_REPLICATION_SECRET=repl_shared_xyz \
+    dfdb serve --bind-all \
+      --replication-role leader --replication-port 5500</pre>
+
+    <h4>As a follower with auto-failover</h4>
+    <pre>docker run -d --name dfdb-follower \
+    -p 5010:5000 \
+    -v dfdb-follower-data:/data \
+    -e DFDB_REPLICATION_SECRET=repl_shared_xyz \
+    dfdb serve --bind-all \
+      --replication-role follower \
+      --leader-host dfdb-leader --leader-port 5500 \
+      --auto-failover-seconds 10</pre>
+
+    <div class="callout">
+      <strong>Image layout:</strong> runs as the non-root <code>dfdb</code> user, writes only to <code>/data</code>, exposes ports <code>5000</code> (HTTP) and <code>5500</code> (replication). Health check hits <code>/health</code> every 30 s. Signals are handled via <code>tini</code> so <code>docker stop</code> flushes cleanly.
+    </div>
+
+    <h4>Docker Compose (leader + follower, one file)</h4>
+    <pre>services:
+  leader:
+    image: dfdb
+    build: .
+    ports: ["5000:5000", "5500:5500"]
+    volumes: ["leader-data:/data"]
+    environment:
+      DFDB_NODE_NAME: leader
+      DFDB_REPLICATION_SECRET: repl_shared_xyz
+    command: >
+      serve --bind-all
+      --replication-role leader --replication-port 5500
+
+  follower:
+    image: dfdb
+    build: .
+    ports: ["5010:5000"]
+    volumes: ["follower-data:/data"]
+    environment:
+      DFDB_NODE_NAME: follower
+      DFDB_REPLICATION_SECRET: repl_shared_xyz
+    depends_on: [leader]
+    command: >
+      serve --bind-all
+      --replication-role follower
+      --leader-host leader --leader-port 5500
+      --auto-failover-seconds 10
+
+volumes:
+  leader-data:
+  follower-data:</pre>
+
+    <p><code>docker compose up</code> → you have a leader, a follower replicating from it, and auto-failover wired in one command.</p>
+
+    <h2 id="render">Deploying to Render.com</h2>
+    <p>A ready-to-use <code>render.yaml</code> blueprint ships in the repo root. Render reads it, provisions a web service + a persistent disk, and wires up a health check automatically.</p>
+
+    <h4>One-click deploy</h4>
+    <ol>
+      <li>Push this repo to GitHub or GitLab.</li>
+      <li>In the Render dashboard: <strong>New +</strong> → <strong>Blueprint</strong> → point it at the repo.</li>
+      <li>Render reads <code>render.yaml</code> and creates:
+        <ul>
+          <li>A web service named <code>documentforge</code> built from the <code>Dockerfile</code> at the repo root.</li>
+          <li>A 10 GB persistent disk mounted at <code>/data</code>.</li>
+          <li>A health check on <code>/health</code>.</li>
+        </ul>
+      </li>
+      <li>Fill in the two <em>"set on dashboard"</em> env vars: <code>DFDB_API_KEY</code> and <code>DFDB_REPLICATION_SECRET</code>.</li>
+      <li>Deploy. First build takes ~3–4 minutes; subsequent deploys reuse the Docker layer cache.</li>
+    </ol>
+
+    <h4>What the blueprint looks like</h4>
+    <pre>services:
+  - type: web
+    name: documentforge
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    disk:
+      name: dfdb-data
+      mountPath: /data
+      sizeGB: 10
+    envVars:
+      - key: DFDB_NODE_NAME
+        value: render-1
+      - key: DFDB_API_KEY
+        sync: false             <span class="hl-com"># set in dashboard, not in git</span>
+      - key: DFDB_REPLICATION_SECRET
+        sync: false</pre>
+
+    <h4>How Render's <code>$PORT</code> is handled</h4>
+    <p>Render injects a <code>PORT</code> env var at start time. The container's entrypoint (<code>docker/entrypoint.sh</code>) maps <code>PORT</code> → <code>DFDB_PORT</code> before starting the binary, so the service listens on whichever port Render assigned. You don't need to hard-code anything.</p>
+
+    <h4>TLS, custom domain, auth</h4>
+    <ul>
+      <li><strong>TLS:</strong> Render terminates TLS at its edge and proxies plain HTTP to your container. Don't configure TLS in <code>node.json</code> for Render — let the edge handle it.</li>
+      <li><strong>Custom domain:</strong> add it in the dashboard; cert provisioning is automatic.</li>
+      <li><strong>Auth:</strong> because the edge is publicly reachable, always set <code>DFDB_API_KEY</code>. Every client then sends <code>Authorization: Bearer &lt;key&gt;</code>.</li>
+      <li><strong>Replication:</strong> Render's ingress routes HTTP only. For cross-service replication on Render, add a private service port or use a TCP proxy — for most use cases a single Render instance + regular backups is plenty.</li>
+    </ul>
+
+    <h4>Scaling on Render</h4>
+    <ul>
+      <li><code>starter</code> = 512 MB RAM — fine for &lt;1M docs. Bump to <code>standard</code> (2 GB), <code>pro</code> (4 GB), or higher for real workloads — see the <a href="performance.html">Performance</a> page for guidance.</li>
+      <li>Disks can be resized without downtime; bump <code>sizeGB</code> and redeploy.</li>
+      <li>For sharding, deploy the same blueprint multiple times (one service per shard) with different <code>name:</code> and <code>DFDB_NODE_NAME</code> values. Drive them from a local <code>cluster.json</code> via the <code>dfdb</code> CLI.</li>
+    </ul>
+
+    <div class="callout">
+      <strong>Other platforms:</strong> the same image runs unchanged on Fly.io, Railway, Koyeb, Azure Container Apps, Google Cloud Run (with a persistent volume), AWS App Runner, and any Kubernetes cluster. The only platform-specific bit is the <code>$PORT</code> env var translation in <code>docker/entrypoint.sh</code>, which is a no-op when <code>$PORT</code> isn't set.
+    </div>
 
     <h2 id="backup">Backups</h2>
     <p>Because the database is a file, backup is file copy. But don't just <code>cp</code> a live database — you might get a torn page mid-write.</p>
