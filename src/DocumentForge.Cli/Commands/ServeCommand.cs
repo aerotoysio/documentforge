@@ -18,6 +18,16 @@ public static class ServeCommand
 
         var builder = WebApplication.CreateBuilder(args);
 
+        // Sensible default logging - quiet the per-request ASP.NET Core chatter
+        // (4-5 lines per request swamps real signal at any traffic) but keep the
+        // single 'Request finished ...' summary line. Override via env vars or
+        // appsettings.json the standard ASP.NET way:
+        //   Logging__LogLevel__Microsoft.AspNetCore=Information   (re-enable noise)
+        //   Logging__LogLevel__Microsoft.AspNetCore=None          (silence entirely)
+        builder.Logging
+            .AddFilter("Microsoft.AspNetCore", Microsoft.Extensions.Logging.LogLevel.Warning)
+            .AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", Microsoft.Extensions.Logging.LogLevel.Information);
+
         var scheme = config.Security?.Tls is not null ? "https" : "http";
         var host = config.BindAllInterfaces ? "0.0.0.0" : "localhost";
         var bindUrl = $"{scheme}://{host}:{config.Port}";
