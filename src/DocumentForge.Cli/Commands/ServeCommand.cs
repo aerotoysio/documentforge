@@ -103,8 +103,8 @@ public static class ServeCommand
         Console.WriteLine();
         Console.WriteLine("  app API:   POST /query | GET /stats | GET /collections | POST /collections/{name}");
         Console.WriteLine("             POST /collections/{name}/bulk");
-        Console.WriteLine("             GET|DELETE /collections/{name}/{id}                (by internal _id)");
-        Console.WriteLine("             GET|DELETE /collections/{name}/by/{field}/{value}  (by any field)");
+        Console.WriteLine("             GET|DELETE|PUT /collections/{name}/{id}                (by internal _id)");
+        Console.WriteLine("             GET|DELETE|PUT /collections/{name}/by/{field}/{value}  (by any field)");
         Console.WriteLine("             DELETE /collections/{name} | GET /indexes/{collection} | POST /index");
         Console.WriteLine("             POST /seed | GET /health");
         Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint");
@@ -222,6 +222,67 @@ public static class ServeCommand
             if (doc is null) return Results.NotFound();
             if (coll.Delete(docId)) db.NotifyDocDeleted(name, docId, doc);
             return Results.Ok(new { success = true });
+        });
+
+        // Replace a document by internal _id. Body is the full new document
+        // (the original _id is always preserved — you don't need to include it).
+        app.MapPut("/collections/{name}/{id}", async (string name, string id, HttpRequest request) =>
+        {
+            if (!Guid.TryParse(id, out var guid))
+                return Results.BadRequest(new { error = "This endpoint expects DocumentForge's internal _id. To update by a business key, use PUT /collections/{name}/by/{field}/{value}." });
+
+            using var reader = new StreamReader(request.Body);
+            var json = await reader.ReadToEndAsync();
+            if (string.IsNullOrWhiteSpace(json)) return Results.BadRequest(new { error = "Empty body" });
+
+            try
+            {
+                var docId = new DocumentId(guid);
+                var ok = db.Replace(name, docId, json);
+                if (!ok) return Results.NotFound();
+                return Results.Ok(new { success = true, id = docId.ToString(), collection = name });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        // Replace by business key. Finds the first document where {field} = {value}
+        // and replaces its content with the request body. Field name and value are
+        // sanitised the same way as the GET/DELETE by-field routes.
+        app.MapPut("/collections/{name}/by/{field}/{value}", async (string name, string field, string value, HttpRequest request) =>
+        {
+            if (!IsValidFieldPath(field))
+                return Results.BadRequest(new { error = "Field name must match [a-zA-Z_][a-zA-Z0-9_.\\[\\]]*" });
+
+            using var reader = new StreamReader(request.Body);
+            var json = await reader.ReadToEndAsync();
+            if (string.IsNullOrWhiteSpace(json)) return Results.BadRequest(new { error = "Empty body" });
+
+            // Look up the doc id via SQL so indexes are honoured.
+            var safeValue = value.Replace("'", "''");
+            var lookupSql = $"SELECT * FROM {name} WHERE {field} = '{safeValue}' LIMIT 1";
+            var found = db.Execute(lookupSql);
+            if (!found.Success) return Results.BadRequest(new { error = found.Message });
+            if (found.Documents.Count == 0) return Results.NotFound();
+
+            var existingId = found.Documents[0]["_id"];
+            if (existingId.IsNull)
+                return Results.BadRequest(new { error = "Matched document has no _id - cannot replace." });
+
+            try
+            {
+                var docId = new DocumentId(Guid.Parse(existingId.ToJson().Trim('"')));
+                var ok = db.Replace(name, docId, json);
+                if (!ok) return Results.NotFound();
+                return Results.Ok(new
+                {
+                    success = true,
+                    id = docId.ToString(),
+                    collection = name,
+                    matchedBy = new { field, value },
+                    plan = found.QueryPlan
+                });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
 
         // Find a single document by id
