@@ -11,6 +11,7 @@ public enum TokenType
     True, False, Null,
     Count, Join,
     Sum, Avg, Min, Max, Group, By,
+    Distinct,
 
     // Operators
     Equals, NotEquals,
