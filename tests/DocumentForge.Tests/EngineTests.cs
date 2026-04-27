@@ -1744,6 +1744,116 @@ public class EngineTests : IDisposable
         Assert.Single(_db.Execute("SELECT * FROM widgets WHERE name = 'alpha'").Documents);
     }
 
+    // --- Issues #3 (IN) + #4 (OR-of-equalities indexed plan) ---
+    [Fact]
+    public void Query_InClause_ParsesAndReturnsMatches()
+    {
+        _db.Insert("rules", """{"id": "rule-bag-policy"}""");
+        _db.Insert("rules", """{"id": "rule-tier-bonus"}""");
+        _db.Insert("rules", """{"id": "rule-other"}""");
+
+        var r = _db.Execute("SELECT * FROM rules WHERE id IN ('rule-bag-policy', 'rule-tier-bonus')");
+
+        Assert.True(r.Success);
+        Assert.Equal(2, r.Documents.Count);
+        var ids = r.Documents.Select(d => d["id"].AsString).OrderBy(x => x).ToList();
+        Assert.Equal(new[] { "rule-bag-policy", "rule-tier-bonus" }, ids);
+    }
+
+    [Fact]
+    public void Query_InClause_OnIndexedField_UsesMultiKeyIndexScan()
+    {
+        _db.Insert("rules", """{"id": "rule-a"}""");
+        _db.Insert("rules", """{"id": "rule-b"}""");
+        _db.Insert("rules", """{"id": "rule-c"}""");
+        _db.CreateIndex("rules", "id", "idx_rule_id", unique: true);
+
+        var r = _db.Execute("SELECT * FROM rules WHERE id IN ('rule-a', 'rule-c')");
+
+        Assert.True(r.Success);
+        Assert.Equal(2, r.Documents.Count);
+        Assert.Contains("INDEX_SCAN_MULTI", r.QueryPlan);
+        Assert.Contains("idx_rule_id", r.QueryPlan);
+        Assert.Contains("2 keys", r.QueryPlan);
+    }
+
+    [Fact]
+    public void Query_OrOfEqualities_OnIndexedField_UsesMultiKeyIndexScan()
+    {
+        _db.Insert("rules", """{"id": "rule-a", "v": 1}""");
+        _db.Insert("rules", """{"id": "rule-b", "v": 2}""");
+        _db.Insert("rules", """{"id": "rule-c", "v": 3}""");
+        _db.CreateIndex("rules", "id", "idx_rule_id", unique: true);
+
+        var r = _db.Execute("SELECT * FROM rules WHERE id = 'rule-a' OR id = 'rule-b'");
+
+        Assert.True(r.Success);
+        Assert.Equal(2, r.Documents.Count);
+        Assert.Contains("INDEX_SCAN_MULTI", r.QueryPlan);
+    }
+
+    [Fact]
+    public void Query_OrOfEqualities_NoIndex_FallsBackToCollectionScan()
+    {
+        _db.Insert("rules", """{"id": "rule-a"}""");
+        _db.Insert("rules", """{"id": "rule-b"}""");
+        // no index on `id`
+
+        var r = _db.Execute("SELECT * FROM rules WHERE id = 'rule-a' OR id = 'rule-b'");
+
+        Assert.True(r.Success);
+        Assert.Equal(2, r.Documents.Count);
+        Assert.Equal("COLLECTION_SCAN", r.QueryPlan);
+    }
+
+    [Fact]
+    public void Query_OrAcrossDifferentColumns_DoesNotUseMultiKeyScan()
+    {
+        // Mixed columns can't be folded into one index scan; the planner
+        // should NOT mistakenly pick INDEX_SCAN_MULTI here.
+        _db.Insert("rules", """{"id": "rule-a", "kind": "x"}""");
+        _db.Insert("rules", """{"id": "rule-b", "kind": "y"}""");
+        _db.CreateIndex("rules", "id", "idx_rule_id", unique: true);
+
+        var r = _db.Execute("SELECT * FROM rules WHERE id = 'rule-a' OR kind = 'y'");
+
+        Assert.True(r.Success);
+        Assert.Equal(2, r.Documents.Count);
+        Assert.DoesNotContain("INDEX_SCAN_MULTI", r.QueryPlan);
+    }
+
+    [Fact]
+    public void Query_InClause_DedupesAcrossKeys()
+    {
+        // Non-unique index; multiple docs share key "x"
+        _db.Insert("rules", """{"kind": "x", "v": 1}""");
+        _db.Insert("rules", """{"kind": "x", "v": 2}""");
+        _db.Insert("rules", """{"kind": "y", "v": 3}""");
+        _db.CreateIndex("rules", "kind", "idx_rule_kind");
+
+        var r = _db.Execute("SELECT * FROM rules WHERE kind IN ('x', 'y', 'x')");  // duplicate value
+
+        Assert.True(r.Success);
+        // Three real matching docs total (x x y); the duplicate IN value
+        // shouldn't return doc #1 or #2 twice.
+        Assert.Equal(3, r.Documents.Count);
+        Assert.Contains("INDEX_SCAN_MULTI", r.QueryPlan);
+    }
+
+    [Fact]
+    public void Query_InClause_NumericValues()
+    {
+        _db.Insert("orders", """{"qty": 1}""");
+        _db.Insert("orders", """{"qty": 5}""");
+        _db.Insert("orders", """{"qty": 10}""");
+        _db.Insert("orders", """{"qty": 100}""");
+
+        var r = _db.Execute("SELECT * FROM orders WHERE qty IN (1, 10, 100)");
+
+        Assert.True(r.Success);
+        Assert.Equal(3, r.Documents.Count);
+    }
+
     [Fact]
     public void BulkInsertTracked_AssignsIdsInInputOrder()
     {

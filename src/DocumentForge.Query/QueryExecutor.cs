@@ -181,6 +181,36 @@ public sealed class QueryExecutor
     {
         if (where is null) return null;
 
+        // OR-of-equalities on a single indexed path: covers
+        //   WHERE x = a OR x = b OR x = c
+        // and (because the parser lowers IN to OR-equalities) also covers
+        //   WHERE x IN (a, b, c).
+        // Each branch becomes one INDEX_SCAN; results are unioned with dedupe.
+        if (TryFlattenSamePathOrEqualities(where, out var orPath, out var orValues))
+        {
+            var orIndex = _indexManager.FindIndexForPath(collectionName, orPath);
+            if (orIndex is not null && !orIndex.Definition.IsComposite)
+            {
+                collection.BuildLocationMap();
+                var seen = new HashSet<DocumentId>();
+                var orResults = new List<BsonDocument>();
+                foreach (var (val, valType) in orValues)
+                {
+                    var key = new IndexKey(ConvertToSearchValue(val, valType));
+                    foreach (var docId in orIndex.Search(key))
+                    {
+                        if (!seen.Add(docId)) continue; // doc already collected via another branch
+                        var doc = collection.FindById(docId);
+                        if (doc is null) continue;
+                        orResults.Add(doc);
+                        if (effectiveLimit.HasValue && orResults.Count >= effectiveLimit.Value) break;
+                    }
+                    if (effectiveLimit.HasValue && orResults.Count >= effectiveLimit.Value) break;
+                }
+                return (orResults, $"INDEX_SCAN_MULTI({orIndex.Definition.Name}, {orValues.Count} keys)");
+            }
+        }
+
         // Gather all top-level AND comparisons
         var comparisons = CollectAndComparisons(where);
 
@@ -309,6 +339,49 @@ public sealed class QueryExecutor
         }
         Visit(expr);
         return list;
+    }
+
+    /// <summary>
+    /// Returns true if <paramref name="expr"/> is exclusively equality comparisons
+    /// on a single shared JSON path, joined by OR (or just one comparison alone).
+    /// Used by the planner to fold IN(...) and OR-of-equalities into a single
+    /// multi-key INDEX_SCAN.
+    /// </summary>
+    private static bool TryFlattenSamePathOrEqualities(
+        Expression expr,
+        out string path,
+        out List<(object? Value, TokenType ValueType)> values)
+    {
+        var pathRef = "";
+        var collected = new List<(object?, TokenType)>();
+
+        bool Visit(Expression e)
+        {
+            if (e is ComparisonExpression c)
+            {
+                if (c.Operator != TokenType.Equals) return false;
+                if (pathRef.Length == 0) pathRef = c.JsonPath;
+                else if (pathRef != c.JsonPath) return false;
+                collected.Add((c.Value, c.ValueType));
+                return true;
+            }
+            if (e is LogicalExpression l && l.Operator == TokenType.Or)
+            {
+                return Visit(l.Left) && Visit(l.Right);
+            }
+            return false;
+        }
+
+        if (Visit(expr) && collected.Count >= 1)
+        {
+            path = pathRef;
+            values = collected;
+            return true;
+        }
+
+        path = "";
+        values = new List<(object?, TokenType)>();
+        return false;
     }
 
     /// <summary>
