@@ -396,11 +396,24 @@ public static class ServeCommand
         });
 
         // Bulk insert: accepts a JSON array of documents.
-        // By default, rebuilds indexes afterwards so queries see the new rows.
-        // Pass ?skipIndexes=true for raw throughput in cold-load scenarios;
-        // you are then responsible for calling POST /admin/rebuild-indexes/{name}
-        // before any index-using query, or results will be wrong.
-        app.MapPost("/collections/{name}/bulk", async (string name, HttpRequest request, bool? skipIndexes) =>
+        //
+        // Response shape:
+        //   {
+        //     success: bool,         // true iff every doc landed (and !rolledBack)
+        //     count: N,              // number of inserted ids
+        //     ids: [docId, ...],     // _id strings, in input order, of every inserted doc
+        //     errors: [{ index, error }, ...],   // per-doc failures (omitted if atomic+success)
+        //     rolledBack: bool,      // true iff atomic=true and we rolled back on first failure
+        //     atomic: bool, indexesRebuilt: N, indexesSkipped: bool, timeSeconds: f
+        //   }
+        //
+        // Query flags:
+        //   ?atomic=true       all-or-nothing - first error rolls back every previous insert
+        //                      in the same lock window. Returns 400 with rolledBack=true.
+        //   ?skipIndexes=true  cold-load mode: don't rebuild indexes after the batch.
+        //                      You then MUST call POST /admin/rebuild-indexes/{name}
+        //                      before any indexed query, or results will be wrong.
+        app.MapPost("/collections/{name}/bulk", async (string name, HttpRequest request, bool? skipIndexes, bool? atomic) =>
         {
             using var reader = new StreamReader(request.Body);
             var json = await reader.ReadToEndAsync();
@@ -419,12 +432,16 @@ public static class ServeCommand
             }
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
 
-            var sw = System.Diagnostics.Stopwatch.StartNew();
-            var inserted = db.BulkInsert(name, docs);
-
-            var indexesRebuilt = 0;
+            var atomicMode = atomic == true;
             var skipped = skipIndexes == true;
-            if (!skipped)
+
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var result = db.BulkInsertTracked(name, docs, atomic: atomicMode);
+
+            // Rebuild indexes after the batch unless explicitly asked not to.
+            // Skip the rebuild on a rolled-back atomic batch (nothing inserted to index).
+            var indexesRebuilt = 0;
+            if (!skipped && !result.RolledBack)
             {
                 var existingIndexes = db.GetIndexes(name);
                 if (existingIndexes.Count > 0)
@@ -435,14 +452,25 @@ public static class ServeCommand
             }
 
             sw.Stop();
-            return Results.Ok(new
+
+            var responseBody = new
             {
-                success = true,
-                inserted,
+                success = result.Errors.Count == 0 && !result.RolledBack,
+                count = result.InsertedIds.Count,
+                ids = result.InsertedIds.Select(i => i.ToString()).ToArray(),
+                errors = result.Errors.Select(e => new { index = e.Index, error = e.Error }).ToArray(),
+                rolledBack = result.RolledBack,
+                atomic = atomicMode,
                 indexesRebuilt,
                 indexesSkipped = skipped,
                 timeSeconds = Math.Round(sw.Elapsed.TotalSeconds, 3)
-            });
+            };
+
+            // Atomic mode that rolled back -> 400 (caller asked us to fail the whole thing).
+            // Non-atomic with some errors -> still 200, the response carries the per-doc errors.
+            return result.RolledBack
+                ? Results.BadRequest(responseBody)
+                : Results.Ok(responseBody);
         });
 
         // Drop an entire collection (destructive - requires explicit X-Confirm: true header)

@@ -1669,6 +1669,99 @@ public class EngineTests : IDisposable
         Assert.False(_db.RebuildIndex("environments", "idx_does_not_exist"));
     }
 
+    // --- Issue #5: bulk insert with per-doc tracking ---
+    [Fact]
+    public void BulkInsertTracked_AllSucceed_ReturnsIdsNoErrors()
+    {
+        var docs = new[] {
+            BsonDocument.FromJson("""{"name":"alpha"}"""),
+            BsonDocument.FromJson("""{"name":"beta"}"""),
+            BsonDocument.FromJson("""{"name":"gamma"}"""),
+        };
+
+        var r = _db.BulkInsertTracked("widgets", docs);
+
+        Assert.False(r.RolledBack);
+        Assert.Empty(r.Errors);
+        Assert.Equal(3, r.InsertedIds.Count);
+        // Every returned id resolves to a doc on disk.
+        var coll = _db.GetCollection("widgets")!;
+        foreach (var id in r.InsertedIds)
+            Assert.NotNull(coll.FindById(id));
+    }
+
+    [Fact]
+    public void BulkInsertTracked_PartialFailure_NonAtomic_ReportsErrorsKeepsSuccesses()
+    {
+        // Set up uniqueness on `name` so we can deterministically force a collision.
+        _db.Insert("widgets", """{"name":"alpha"}""");
+        _db.CreateIndex("widgets", "name", "idx_widget_name", unique: true);
+
+        var docs = new[] {
+            BsonDocument.FromJson("""{"name":"beta"}"""),    // OK
+            BsonDocument.FromJson("""{"name":"alpha"}"""),   // duplicate -> fail
+            BsonDocument.FromJson("""{"name":"gamma"}"""),   // OK
+        };
+
+        var r = _db.BulkInsertTracked("widgets", docs, atomic: false);
+
+        Assert.False(r.RolledBack);
+        Assert.Equal(2, r.InsertedIds.Count);
+        Assert.Single(r.Errors);
+        Assert.Equal(1, r.Errors[0].Index);
+        Assert.Contains("alpha", r.Errors[0].Error);
+
+        // beta and gamma are reachable; alpha (the original) is still the only one.
+        Assert.Single(_db.Execute("SELECT * FROM widgets WHERE name = 'beta'").Documents);
+        Assert.Single(_db.Execute("SELECT * FROM widgets WHERE name = 'gamma'").Documents);
+        Assert.Single(_db.Execute("SELECT * FROM widgets WHERE name = 'alpha'").Documents);
+    }
+
+    [Fact]
+    public void BulkInsertTracked_PartialFailure_Atomic_RollsBackEverything()
+    {
+        _db.Insert("widgets", """{"name":"alpha"}""");
+        _db.CreateIndex("widgets", "name", "idx_widget_name", unique: true);
+
+        var docs = new[] {
+            BsonDocument.FromJson("""{"name":"beta"}"""),
+            BsonDocument.FromJson("""{"name":"gamma"}"""),
+            BsonDocument.FromJson("""{"name":"alpha"}"""),  // collision triggers rollback
+            BsonDocument.FromJson("""{"name":"delta"}"""),
+        };
+
+        var r = _db.BulkInsertTracked("widgets", docs, atomic: true);
+
+        Assert.True(r.RolledBack);
+        Assert.Empty(r.InsertedIds);
+        Assert.Single(r.Errors);
+        Assert.Equal(2, r.Errors[0].Index);
+
+        // Nothing from the batch should have stuck. Only the original alpha remains.
+        Assert.Empty(_db.Execute("SELECT * FROM widgets WHERE name = 'beta'").Documents);
+        Assert.Empty(_db.Execute("SELECT * FROM widgets WHERE name = 'gamma'").Documents);
+        Assert.Empty(_db.Execute("SELECT * FROM widgets WHERE name = 'delta'").Documents);
+        Assert.Single(_db.Execute("SELECT * FROM widgets WHERE name = 'alpha'").Documents);
+    }
+
+    [Fact]
+    public void BulkInsertTracked_AssignsIdsInInputOrder()
+    {
+        var docs = new[] {
+            BsonDocument.FromJson("""{"label":"first"}"""),
+            BsonDocument.FromJson("""{"label":"second"}"""),
+            BsonDocument.FromJson("""{"label":"third"}"""),
+        };
+
+        var r = _db.BulkInsertTracked("widgets", docs);
+
+        Assert.Equal(3, r.InsertedIds.Count);
+        var coll = _db.GetCollection("widgets")!;
+        Assert.Equal("first",  coll.FindById(r.InsertedIds[0])!["label"].AsString);
+        Assert.Equal("second", coll.FindById(r.InsertedIds[1])!["label"].AsString);
+        Assert.Equal("third",  coll.FindById(r.InsertedIds[2])!["label"].AsString);
+    }
+
     [Fact]
     public void Query_SelectDistinct_WithLimit_AppliesDistinctBeforeLimit()
     {
