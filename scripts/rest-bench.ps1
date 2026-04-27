@@ -5,8 +5,8 @@
 # Usage (default — local Docker at localhost:5000):
 #     .\scripts\rest-bench.ps1
 #
-# Against Render:
-#     .\scripts\rest-bench.ps1 -Url "https://documentforge.onrender.com" -ApiKey "test-api-key"
+# Against any remote instance (replace the URL and key with your own):
+#     .\scripts\rest-bench.ps1 -Url "https://your-instance.example.com" -ApiKey "<your-bearer-key>"
 #
 # Longer run:
 #     .\scripts\rest-bench.ps1 -Seconds 10
