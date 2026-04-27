@@ -1577,6 +1577,98 @@ public class EngineTests : IDisposable
         Assert.False(ok);
     }
 
+    // --- Regression for github issue #2: PUT same indexed value to same doc ---
+    // Before the fix this threw DuplicateKeyException ('Duplicate key in unique
+    // index') even though the only existing entry belonged to the doc being
+    // updated. The page write committed regardless, leaving the HTTP status and
+    // the data state disagreeing.
+    [Fact]
+    public void Replace_SameUniqueIndexedValue_DoesNotThrowSelfCollision()
+    {
+        var id = _db.Insert("environments", """{"name": "staging", "ruleBindings": {}}""");
+        _db.CreateIndex("environments", "name", "idx_env_name", unique: true);
+
+        // PUT with the SAME name but a different ruleBindings - must succeed.
+        var ok = _db.Replace("environments", id, """{"name": "staging", "ruleBindings": {"rule-x": 3}}""");
+
+        Assert.True(ok);
+        var updated = _db.GetCollection("environments")!.FindById(id);
+        Assert.NotNull(updated);
+        Assert.Equal("staging", updated!["name"].AsString);
+        Assert.True(updated["ruleBindings"].AsDocument.ContainsKey("rule-x"));
+
+        // Indexed lookup still finds it - this is the issue #1 manifestation
+        // we're guarding against (a half-commit would leave the index empty).
+        var byField = _db.Execute("SELECT * FROM environments WHERE name = 'staging'");
+        Assert.Single(byField.Documents);
+        Assert.Contains("INDEX_SCAN", byField.QueryPlan);
+    }
+
+    [Fact]
+    public void Replace_DifferentDocSameUniqueValue_RejectsAndDoesNotCommit()
+    {
+        var staging = _db.Insert("environments", """{"name": "staging", "ruleBindings": {}}""");
+        var prod    = _db.Insert("environments", """{"name": "prod",    "ruleBindings": {}}""");
+        _db.CreateIndex("environments", "name", "idx_env_name", unique: true);
+
+        // Try to rename `prod` to `staging` - should be rejected because `staging`
+        // already belongs to a different doc.
+        Assert.Throws<DuplicateKeyException>(() =>
+            _db.Replace("environments", prod, """{"name": "staging", "ruleBindings": {"rebellion": 1}}"""));
+
+        // Crucial: the page must NOT have been committed. Pre-fix, the page wrote
+        // first and the index check failed second, leaving inconsistent state.
+        var prodDoc = _db.GetCollection("environments")!.FindById(prod);
+        Assert.Equal("prod", prodDoc!["name"].AsString);
+        Assert.False(prodDoc["ruleBindings"].AsDocument.ContainsKey("rebellion"));
+
+        // Both indexed lookups still resolve to their original docs.
+        var byStaging = _db.Execute("SELECT * FROM environments WHERE name = 'staging'");
+        Assert.Single(byStaging.Documents);
+        Assert.Equal(staging.ToString(), byStaging.Documents[0].GetId().ToString());
+    }
+
+    [Fact]
+    public void Replace_ChangingIndexedValueToFreshUniqueValue_UpdatesIndex()
+    {
+        var id = _db.Insert("environments", """{"name": "old", "v": 1}""");
+        _db.CreateIndex("environments", "name", "idx_env_name", unique: true);
+
+        Assert.True(_db.Replace("environments", id, """{"name": "new", "v": 2}"""));
+
+        // Old key is gone from the index; new key resolves correctly.
+        Assert.Empty(_db.Execute("SELECT * FROM environments WHERE name = 'old'").Documents);
+        var hits = _db.Execute("SELECT * FROM environments WHERE name = 'new'").Documents;
+        Assert.Single(hits);
+        Assert.Equal(2, hits[0]["v"].AsInt32);
+    }
+
+    // --- Regression for github issue #1: surgical per-index rebuild ---
+    [Fact]
+    public void RebuildIndex_SingleIndex_RestoresLookups()
+    {
+        _db.Insert("environments", """{"name": "alpha"}""");
+        _db.Insert("environments", """{"name": "beta"}""");
+        _db.CreateIndex("environments", "name", "idx_env_name", unique: true);
+
+        // Pre-rebuild: lookup works.
+        Assert.Single(_db.Execute("SELECT * FROM environments WHERE name = 'alpha'").Documents);
+
+        var ok = _db.RebuildIndex("environments", "idx_env_name");
+        Assert.True(ok);
+
+        // Post-rebuild: lookup still works (and the index is freshly populated).
+        Assert.Single(_db.Execute("SELECT * FROM environments WHERE name = 'alpha'").Documents);
+        Assert.Single(_db.Execute("SELECT * FROM environments WHERE name = 'beta'").Documents);
+    }
+
+    [Fact]
+    public void RebuildIndex_UnknownIndexName_ReturnsFalse()
+    {
+        _db.Insert("environments", """{"name": "alpha"}""");
+        Assert.False(_db.RebuildIndex("environments", "idx_does_not_exist"));
+    }
+
     [Fact]
     public void Query_SelectDistinct_WithLimit_AppliesDistinctBeforeLimit()
     {

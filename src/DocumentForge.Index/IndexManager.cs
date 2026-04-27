@@ -207,8 +207,78 @@ public sealed class IndexManager
     public void OnDocumentUpdated(string collectionName, DocumentId docId,
         BsonDocument oldDoc, BsonDocument newDoc)
     {
-        OnDocumentDeleted(collectionName, docId, oldDoc);
-        OnDocumentInserted(collectionName, docId, newDoc);
+        var key = new CollectionName(collectionName).Value;
+        if (!_indexesByCollection.TryGetValue(key, out var indexes)) return;
+
+        // Validate first - no mutations until every unique index is happy.
+        // For each unique index, simulate the new state (after deleting the old
+        // entry) and check whether the new value would collide with a different
+        // doc. If yes, throw before any side effects so the caller can roll back.
+        foreach (var index in indexes)
+        {
+            if (!index.Definition.IsUnique) continue;
+            ValidateUniqueIndexUpdate(index, docId, oldDoc, newDoc);
+        }
+
+        // All validations passed - apply.
+        foreach (var index in indexes)
+        {
+            DeleteDocFromIndex(index, oldDoc, docId);
+            InsertDocIntoIndex(index, newDoc, docId);
+        }
+    }
+
+    /// <summary>
+    /// Throws DuplicateKeyException if the new doc's indexed value already exists
+    /// in the unique index for a DIFFERENT docId. Same-docId collisions are fine
+    /// (handled by BTreeIndex.Insert as a no-op self-collision).
+    /// </summary>
+    private static void ValidateUniqueIndexUpdate(
+        BTreeIndex index, DocumentId docId, BsonDocument oldDoc, BsonDocument newDoc)
+    {
+        IEnumerable<IndexKey> newKeys;
+        if (index.Definition.IsComposite)
+        {
+            var k = BuildCompositeKey(newDoc, index.Definition.Paths);
+            newKeys = k is null ? Array.Empty<IndexKey>() : new[] { k };
+        }
+        else
+        {
+            newKeys = JsonPathExtractor
+                .ExtractAll(newDoc, index.Definition.JsonPath)
+                .Where(v => !v.IsNull)
+                .Select(v => new IndexKey(v));
+        }
+
+        // Old keys we're about to remove - so any "collision" with one of these
+        // is actually self-cleanup, not a real conflict.
+        var oldKeys = new HashSet<IndexKey>();
+        if (index.Definition.IsComposite)
+        {
+            var k = BuildCompositeKey(oldDoc, index.Definition.Paths);
+            if (k is not null) oldKeys.Add(k);
+        }
+        else
+        {
+            foreach (var v in JsonPathExtractor.ExtractAll(oldDoc, index.Definition.JsonPath))
+                if (!v.IsNull) oldKeys.Add(new IndexKey(v));
+        }
+
+        foreach (var newKey in newKeys)
+        {
+            // After the delete phase, this key will only have entries that
+            // weren't part of the old doc. Look up current entries.
+            var entries = index.Search(newKey);
+            foreach (var existingDocId in entries)
+            {
+                // Entry that's about to be removed by the delete phase - ignore.
+                if (existingDocId.Equals(docId) && oldKeys.Contains(newKey)) continue;
+                // Entry pointing at the same doc we're updating - self-collision, ignore.
+                if (existingDocId.Equals(docId)) continue;
+                // A genuinely different doc has this key - real conflict.
+                throw new DuplicateKeyException(index.Definition.Name, newKey.ToString());
+            }
+        }
     }
 
     public void RebuildIndex(BTreeIndex index, Collection collection)

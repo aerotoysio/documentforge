@@ -296,8 +296,20 @@ public sealed class DocumentForgeDb : IDisposable
             // Always preserve the original _id so the replacement is in place.
             newDoc["_id"] = oldDoc["_id"];
 
-            if (!collection.Update(id, newDoc)) return false;
+            // Validate + apply index changes FIRST. If validation throws (e.g. a
+            // unique-index collision with a different doc), the page is untouched -
+            // no half-commits. Only if the index transition succeeds do we commit
+            // the page.
             _indexManager.OnDocumentUpdated(collectionName, id, oldDoc, newDoc);
+
+            if (!collection.Update(id, newDoc))
+            {
+                // Page write failed for an unexpected reason - try to put the index
+                // back where it was. Best-effort: validation already passed for the
+                // forward direction, so the reverse should too.
+                try { _indexManager.OnDocumentUpdated(collectionName, id, newDoc, oldDoc); } catch { }
+                return false;
+            }
 
             // Replicate as delete + insert (LogicalOpType.Update is on the roadmap).
             if (_logicalServer is not null)
@@ -391,7 +403,8 @@ public sealed class DocumentForgeDb : IDisposable
     }
 
     /// <summary>
-    /// Rebuild all indexes for a collection from scratch. Use after BulkInsert.
+    /// Rebuild all indexes for a collection from scratch. Use after BulkInsert
+    /// or when you suspect index drift across the whole collection.
     /// </summary>
     public void RebuildIndexes(string collectionName)
     {
@@ -402,6 +415,23 @@ public sealed class DocumentForgeDb : IDisposable
         {
             _indexManager.RebuildIndex(index, collection);
         }
+    }
+
+    /// <summary>
+    /// Rebuild a single named index from scratch. Surgical recovery when one
+    /// specific index has drifted (e.g. a unique-index half-commit corrupted it).
+    /// Returns true if the index was found and rebuilt; false if not found.
+    /// </summary>
+    public bool RebuildIndex(string collectionName, string indexName)
+    {
+        var collection = _catalog.GetCollection(collectionName);
+        if (collection is null) return false;
+
+        var index = _indexManager.GetIndex(indexName);
+        if (index is null) return false;
+
+        _indexManager.RebuildIndex(index, collection);
+        return true;
     }
 
     /// <summary>
