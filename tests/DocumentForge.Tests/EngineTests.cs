@@ -1840,6 +1840,73 @@ public class EngineTests : IDisposable
         Assert.Contains("INDEX_SCAN_MULTI", r.QueryPlan);
     }
 
+    // --- Issue #9: unique-index check must reject duplicate Insert ---
+    [Fact]
+    public void Insert_DuplicateValueOnUniqueIndex_ThrowsAndDoesNotPersist()
+    {
+        // Realistic schema setup: collection exists, then index, then real workload.
+        _db.Insert("users", """{"email":"a@example.com","v":1}""");
+        _db.CreateIndex("users", "email", "idx_users_email", unique: true);
+
+        // Second insert with same email must throw, AND must not leave
+        // a stranded doc on disk.
+        Assert.Throws<DuplicateKeyException>(() =>
+            _db.Insert("users", """{"email":"a@example.com","v":2}"""));
+
+        var all = _db.Execute("SELECT * FROM users").Documents;
+        Assert.Single(all);
+        Assert.Equal(1, all[0]["v"].AsInt32);
+
+        // Indexed lookup and full scan agree.
+        var byEmail = _db.Execute("SELECT * FROM users WHERE email = 'a@example.com'").Documents;
+        Assert.Single(byEmail);
+    }
+
+    // --- Issue #7: DropCollection must drop the indexes too ---
+    [Fact]
+    public void DropCollection_RemovesIndexesSoFreshSeedSucceeds()
+    {
+        _db.Insert("foo", """{"id":"x"}""");
+        _db.Insert("foo", """{"id":"y"}""");
+        _db.CreateIndex("foo", "id", "idx_foo_id", unique: true);
+
+        Assert.True(_db.DropCollection("foo"));
+
+        // Index registry should be empty for the dropped collection.
+        Assert.Empty(_db.GetIndexes("foo"));
+
+        // Re-seed the same data: must succeed cleanly.
+        _db.Insert("foo", """{"id":"x"}""");
+        _db.Insert("foo", """{"id":"y"}""");
+
+        var all = _db.Execute("SELECT * FROM foo").Documents;
+        Assert.Equal(2, all.Count);
+    }
+
+    // --- Issue #8: collection names should be case-insensitive end to end ---
+    [Fact]
+    public void CollectionAndIndexNames_AreCaseInsensitive()
+    {
+        _db.Insert("TaxVersions", """{"id":"a"}""");
+        _db.CreateIndex("TaxVersions", "id", "idx_TaxVersions_id", unique: true);
+
+        // Querying with any casing finds the same docs.
+        Assert.Single(_db.Execute("SELECT * FROM taxversions").Documents);
+        Assert.Single(_db.Execute("SELECT * FROM TAXVERSIONS").Documents);
+        Assert.Single(_db.Execute("SELECT * FROM TaxVersions").Documents);
+
+        // GetIndexes treats the same collection consistently regardless of case.
+        Assert.Single(_db.GetIndexes("TaxVersions"));
+        Assert.Single(_db.GetIndexes("taxversions"));
+
+        // Drop with one casing, re-create with another - must be a clean slate.
+        Assert.True(_db.DropCollection("taxversions"));
+        Assert.Empty(_db.GetIndexes("TaxVersions"));
+
+        _db.Insert("taxversions", """{"id":"a"}""");
+        Assert.Single(_db.Execute("SELECT * FROM TaxVersions").Documents);
+    }
+
     [Fact]
     public void Query_InClause_NumericValues()
     {
