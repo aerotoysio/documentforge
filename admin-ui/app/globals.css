@@ -122,3 +122,97 @@ textarea:focus, input:focus { outline: none; border-color: var(--red); }
 .setting-row:last-child { border: none; }
 .setting-row .key { color: var(--gray-500); font-family: var(--mono); font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; }
 .setting-row .val { color: var(--ink); font-weight: 600; }
+
+/* ---------- Connection picker (sidebar) ---------- */
+.conn-picker {
+  margin: 4px -4px 16px;
+  padding: 10px 12px;
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 4px;
+  position: relative;
+}
+.conn-picker-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  color: rgba(255,255,255,0.4);
+  margin-bottom: 6px;
+}
+.conn-picker-empty {
+  display: block;
+  font-size: 12px;
+  color: var(--red);
+  text-decoration: none;
+}
+.conn-picker-empty:hover { text-decoration: underline; }
+.conn-picker-current {
+  display: flex; align-items: center; gap: 8px;
+  cursor: pointer;
+  font-size: 13px;
+  color: white;
+  font-weight: 600;
+}
+.conn-picker-current:hover { opacity: 0.85; }
+.conn-dot {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--red); flex-shrink: 0;
+}
+.conn-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conn-caret { font-size: 9px; color: rgba(255,255,255,0.5); }
+.conn-picker-url {
+  margin-top: 4px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: rgba(255,255,255,0.5);
+  letter-spacing: 0.02em;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.conn-picker-menu {
+  position: absolute;
+  left: 12px; right: 12px; top: 100%;
+  margin-top: 4px;
+  background: var(--ink);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 4px;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+  z-index: 20;
+  max-height: 360px;
+  overflow: auto;
+}
+.conn-picker-option {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 10px;
+  cursor: pointer;
+  border-bottom: 1px solid rgba(255,255,255,0.06);
+  font-size: 12px;
+  color: rgba(255,255,255,0.85);
+}
+.conn-picker-option:hover { background: rgba(255,255,255,0.06); color: white; }
+.conn-picker-option.active { background: rgba(217,4,41,0.15); color: white; }
+.conn-picker-option .conn-url {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: rgba(255,255,255,0.45);
+  margin-left: auto;
+}
+.conn-picker-manage {
+  display: block;
+  padding: 8px 10px;
+  font-size: 11px;
+  font-family: var(--mono);
+  letter-spacing: 0.04em;
+  color: rgba(255,255,255,0.6);
+  text-decoration: none;
+  text-align: right;
+  border-top: 1px solid rgba(255,255,255,0.1);
+}
+.conn-picker-manage:hover { color: white; background: rgba(255,255,255,0.05); }
+
+/* Sidebar nav extras */
+.sidebar nav .nav-headline {
+  color: white; font-weight: 700;
+}
+.sidebar nav .nav-divider {
+  height: 1px; background: rgba(255,255,255,0.1); margin: 12px 8px;
+}

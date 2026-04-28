@@ -1,16 +1,18 @@
 'use client';
 
 import './studio.css';
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Explorer } from './Explorer';
 import { QueryTab } from './tabs/QueryTab';
 import { BrowseTab } from './tabs/BrowseTab';
 import { InspectorTab } from './tabs/InspectorTab';
 import { IndexesTab } from './tabs/IndexesTab';
 import { flushDb } from '@/lib/api';
+import { useConnections } from '@/lib/connections-context';
 import type { Tab, StatusInfo, TabContext } from './studio-types';
 
 export default function StudioPage() {
+  const { connections, active, setActive } = useConnections();
   const [tabs, setTabs] = useState<Tab[]>([
     { id: 't0', kind: 'query', title: 'Query', initialSql: 'SELECT * FROM orders LIMIT 50' } as Tab,
   ]);
@@ -18,6 +20,12 @@ export default function StudioPage() {
   const [status, setStatus] = useState<StatusInfo>({});
   const [explorerKey, setExplorerKey] = useState(0);
   const tabSeq = useRef(1);
+
+  // When the active CONNECTION changes, force the explorer + every tab to refresh.
+  useEffect(() => {
+    setExplorerKey(k => k + 1);
+    setTabs(prev => prev.map(t => ({ ...t, refreshKey: (t.refreshKey ?? 0) + 1 })));
+  }, [active?.id]);
 
   const newTabId = () => `t${tabSeq.current++}`;
 
@@ -113,7 +121,26 @@ export default function StudioPage() {
         <span className="sep" />
         <button onClick={onFlush} title="Flush dirty pages to disk">⤓ Flush</button>
         <span className="spacer" />
-        <span className="endpoint">{status.endpoint ?? '…'}</span>
+        {connections.length > 1 ? (
+          <select
+            value={active?.id ?? ''}
+            onChange={e => setActive(e.target.value)}
+            style={{
+              fontFamily: 'var(--mono)', fontSize: 11, padding: '3px 6px',
+              border: '1px solid var(--studio-line-strong)', background: 'var(--studio-panel)',
+              color: 'var(--ink)', borderRadius: 3,
+            }}
+            title="Active connection"
+          >
+            {connections.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+        ) : null}
+        <span
+          className="endpoint"
+          style={active?.color ? { borderLeft: `3px solid ${active.color}`, paddingLeft: 8 } : undefined}
+        >
+          {active ? `${active.name} · ${active.baseUrl.replace(/^https?:\/\//, '')}` : (status.endpoint ?? '…')}
+        </span>
       </div>
 
       {/* Explorer (left) */}
