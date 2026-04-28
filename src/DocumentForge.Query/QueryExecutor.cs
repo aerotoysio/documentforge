@@ -52,7 +52,7 @@ public sealed class QueryExecutor
     {
         var collection = _catalog.GetCollection(stmt.Collection);
         if (collection is null)
-            return QueryResult.Ok(new List<BsonDocument>(), "EMPTY (collection not found)");
+            return QueryResult.Error(BuildUnknownCollectionMessage(stmt.Collection));
 
         // Can we push LIMIT down? Only if we don't need to sort afterward,
         // join, aggregate/group, or dedupe. Each of those operations needs
@@ -324,6 +324,28 @@ public sealed class QueryExecutor
     /// Walk down a top-level AND tree and collect all leaf comparisons.
     /// OR/NOT stop the collection (we can't use indexes through them in this simple form).
     /// </summary>
+    /// <summary>
+    /// Build a self-debugging error message for an unknown collection. Lists
+    /// the actual collections the catalog knows about, so a typo or case-folding
+    /// surprise is immediately obvious from the error alone.
+    /// </summary>
+    private string BuildUnknownCollectionMessage(string requested)
+    {
+        var known = _catalog.GetCollectionNames();
+        if (known.Count == 0)
+            return $"Collection '{requested}' not found. The database has no collections yet — POST a document to create one.";
+
+        // Surface a hint when the only difference is case.
+        var caseMatch = known.FirstOrDefault(n => string.Equals(n, requested, StringComparison.OrdinalIgnoreCase));
+        if (caseMatch is not null && caseMatch != requested)
+            return $"Collection '{requested}' not found. Did you mean '{caseMatch}'? Names are stored case-insensitively.";
+
+        var preview = known.Count > 12
+            ? string.Join(", ", known.Take(12)) + $", … (+{known.Count - 12} more)"
+            : string.Join(", ", known);
+        return $"Collection '{requested}' not found. Known collections: {preview}.";
+    }
+
     private static List<ComparisonExpression> CollectAndComparisons(Expression expr)
     {
         var list = new List<ComparisonExpression>();
