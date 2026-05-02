@@ -1862,6 +1862,107 @@ public class EngineTests : IDisposable
         Assert.Single(byEmail);
     }
 
+    // --- Issue #11: SQL DELETE must remove unique-index entries so a later
+    // insert with the same key can succeed. The REST `DELETE /collections/{c}/by/{f}/{v}`
+    // route lowers to `DELETE FROM c WHERE f = 'v'`, so this test exercises both
+    // the SQL path and the index-cleanup that hangs off it.
+    [Fact]
+    public void Delete_BySql_WithUniqueIndex_RemovesIndexEntrySoReinsertSucceeds()
+    {
+        _db.Insert("users", """{"email":"a@b.com","v":1}""");
+        _db.CreateIndex("users", "email", "idx_users_email", unique: true);
+
+        // Delete via SQL (the path that REST DELETE-by-field lowers to).
+        var del = _db.Execute("DELETE FROM users WHERE email = 'a@b.com'");
+        Assert.True(del.Success);
+        Assert.Equal(1, del.AffectedCount);
+
+        Assert.Empty(_db.Execute("SELECT * FROM users").Documents);
+
+        // Same key must be insertable again - no phantom uniqueness violation.
+        var newId = _db.Insert("users", """{"email":"a@b.com","v":2}""");
+        Assert.NotEqual(default, newId);
+
+        var rows = _db.Execute("SELECT * FROM users WHERE email = 'a@b.com'").Documents;
+        Assert.Single(rows);
+        Assert.Equal(2, rows[0]["v"].AsInt32);
+    }
+
+    // Same scenario as above but the index is created BEFORE any inserts, then
+    // we go through several delete-then-insert upsert cycles. Catches a regression
+    // where the delete only cleaned the in-memory index on the first cycle but
+    // the persisted append-log left a stale entry that resurfaced on reload.
+    [Fact]
+    public void Delete_BySql_RepeatedUpsertCycle_StaysConsistent()
+    {
+        // Seed once so the collection exists, then immediately remove it so the
+        // first iteration of the loop starts from an empty collection but the
+        // unique index is already in play.
+        _db.Insert("users", """{"email":"seed@x.com"}""");
+        _db.CreateIndex("users", "email", "idx_users_email", unique: true);
+        _db.Execute("DELETE FROM users WHERE email = 'seed@x.com'");
+
+        for (int i = 1; i <= 5; i++)
+        {
+            _db.Insert("users", $$"""{"email":"u@x.com","v":{{i}}}""");
+
+            var del = _db.Execute("DELETE FROM users WHERE email = 'u@x.com'");
+            Assert.True(del.Success);
+            Assert.Equal(1, del.AffectedCount);
+            Assert.Empty(_db.Execute("SELECT * FROM users").Documents);
+        }
+    }
+
+    // The most damning #11 case: the staging service had been delete-then-insert
+    // upserting cleanly until a deploy bounced the process. After restart, the
+    // index replay rebuilt the unique index with stale (key, docId) pairs from
+    // tombstoned entries, so the next insert with that business key threw
+    // Duplicate-key against an empty collection.
+    [Fact]
+    public void Delete_BySql_AfterRestart_IndexHasNoStaleEntries()
+    {
+        _db.Insert("users", """{"email":"a@b.com","v":1}""");
+        _db.CreateIndex("users", "email", "idx_users_email", unique: true);
+        _db.Execute("DELETE FROM users WHERE email = 'a@b.com'");
+        _db.Flush();
+        _db.Dispose();
+
+        // Re-open the same file the way `dfdb serve` does on restart.
+        using var db2 = DocumentForgeDb.Open(_dbPath);
+
+        Assert.Empty(db2.Execute("SELECT * FROM users").Documents);
+
+        // Pre-fix this threw DuplicateKeyException because the rebuilt unique
+        // index still pointed at the deleted doc's _id.
+        var newId = db2.Insert("users", """{"email":"a@b.com","v":2}""");
+        Assert.NotEqual(default, newId);
+
+        var rows = db2.Execute("SELECT * FROM users WHERE email = 'a@b.com'").Documents;
+        Assert.Single(rows);
+        Assert.Equal(2, rows[0]["v"].AsInt32);
+    }
+
+    // Mirrors the staging repro from issue #11: the user's collection name is
+    // `aerotoys.tax.users` and they upsert via DELETE-by-field then INSERT.
+    [Fact]
+    public void Delete_BySql_DottedCollectionName_WithUniqueIndex_AllowsReinsert()
+    {
+        const string coll = "aerotoys.tax.users";
+        _db.Insert(coll, """{"email":"a@b.com","v":1}""");
+        _db.CreateIndex(coll, "email", "idx_aerotoys_tax_users_email", unique: true);
+
+        var del = _db.Execute($"DELETE FROM {coll} WHERE email = 'a@b.com'");
+        Assert.True(del.Success);
+        Assert.Equal(1, del.AffectedCount);
+
+        // Re-insert via the same code path admin-ui uses (db.Insert), with the
+        // same email - must succeed.
+        _db.Insert(coll, """{"email":"a@b.com","v":2}""");
+        var rows = _db.Execute($"SELECT * FROM {coll} WHERE email = 'a@b.com'").Documents;
+        Assert.Single(rows);
+        Assert.Equal(2, rows[0]["v"].AsInt32);
+    }
+
     // --- Issue #7: DropCollection must drop the indexes too ---
     [Fact]
     public void DropCollection_RemovesIndexesSoFreshSeedSucceeds()

@@ -83,14 +83,20 @@ public sealed class IndexStorage
 
     /// <summary>
     /// Read all entries back (for index rebuild on open). Applies tombstones.
-    /// Returns the FINAL state: deleted entries are skipped, latest writes win.
+    /// Returns the FINAL state per (key, docId): for each pair the latest write
+    /// in append order wins, so a tombstone that follows an insert correctly
+    /// cancels it.
     /// </summary>
     public IEnumerable<(IndexKey Key, DocumentId DocId)> ReadAllEntries()
     {
-        // We need to replay in order, tracking which (key,docId) pairs have been deleted.
-        // Since entries are appended in order, a deletion tombstone cancels any earlier insert.
-        var deleted = new HashSet<(IndexKey, DocumentId)>(IndexEntryComparer.Instance);
-        var entries = new List<(IndexKey Key, DocumentId DocId)>();
+        // Walk every persisted entry in append order and track the most recent
+        // state for each (key, docId) pair. value=true means the pair is currently
+        // inserted; false means tombstoned. Pre-fix the replay only filtered an
+        // insert if a tombstone had ALREADY been seen earlier on the page, so the
+        // common case (insert then later delete) left the insert in the rebuilt
+        // index — which surfaced as phantom Duplicate-key errors after restart
+        // when callers re-inserted the same business key. (issue #11)
+        var state = new Dictionary<(IndexKey Key, DocumentId DocId), bool>(IndexEntryComparer.Instance);
 
         var pageId = _firstPage;
         while (pageId.IsValid)
@@ -105,10 +111,7 @@ public sealed class IndexStorage
                 if (slotData.IsEmpty) continue;
 
                 var (key, docId, isDeleted) = IndexEntrySerializer.Deserialize(slotData);
-                if (isDeleted)
-                    deleted.Add((key, docId));
-                else if (!deleted.Contains((key, docId)))
-                    entries.Add((key, docId));
+                state[(key, docId)] = !isDeleted;
             }
 
             // Track tail page
@@ -118,7 +121,11 @@ public sealed class IndexStorage
             pageId = page.Header.NextPageId;
         }
 
-        return entries;
+        foreach (var kvp in state)
+        {
+            if (kvp.Value)
+                yield return (kvp.Key.Key, kvp.Key.DocId);
+        }
     }
 }
 
