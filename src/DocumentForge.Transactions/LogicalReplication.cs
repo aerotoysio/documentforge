@@ -106,10 +106,28 @@ public sealed class OpLogBuffer
 /// <summary>
 /// Leader-side logical replication server with sequence numbers and follower catchup.
 /// </summary>
+/// <summary>
+/// Snapshot of one connected follower as the leader sees it. Exposed via
+/// <see cref="LogicalReplicationServer.GetFollowers"/> so the admin status
+/// endpoint can wire up topology without manual configuration.
+/// </summary>
+/// <param name="Endpoint">Remote address as <c>"host:port"</c>, or <c>"unknown"</c>
+/// if the socket has already torn down between snapshot and stringify.</param>
+/// <param name="ConnectedAtUtc">When the follower handshake completed.</param>
+/// <param name="HandshakeSeq">The follower's last-applied seq at handshake.
+/// We don't track ongoing acks today (Phase 2 of replication tx work);
+/// callers reading lag should compare this against
+/// <see cref="LogicalReplicationServer.CurrentSeq"/> with the understanding
+/// that it's a worst-case lower bound, not a live ack.</param>
+public readonly record struct FollowerInfo(string Endpoint, DateTime ConnectedAtUtc, ulong HandshakeSeq);
+
 public sealed class LogicalReplicationServer : IDisposable
 {
     private readonly TcpListener _listener;
-    private readonly List<TcpClient> _followers = new();
+    // Records the metadata we collected at handshake alongside the live socket
+    // so the status endpoint can report "who is connected" without the follower
+    // having to identify itself separately.
+    private readonly List<FollowerConn> _followers = new();
     private readonly object _lock = new();
     private readonly CancellationTokenSource _cts = new();
     private readonly string? _secret;
@@ -125,6 +143,35 @@ public sealed class LogicalReplicationServer : IDisposable
     public int Port { get; }
     public int FollowerCount { get { lock (_lock) return _followers.Count; } }
     public ulong CurrentSeq => (ulong)Interlocked.Read(ref _nextSeq) - 1;
+
+    /// <summary>
+    /// Snapshot of currently-connected followers. Used by the
+    /// <c>/replication/status</c> admin endpoint for topology auto-discovery.
+    /// </summary>
+    public IReadOnlyList<FollowerInfo> GetFollowers()
+    {
+        lock (_lock)
+        {
+            var list = new List<FollowerInfo>(_followers.Count);
+            foreach (var f in _followers)
+                list.Add(new FollowerInfo(f.Endpoint, f.ConnectedAtUtc, f.HandshakeSeq));
+            return list;
+        }
+    }
+
+    /// <summary>
+    /// One connected follower's bookkeeping. Endpoint and timestamps are
+    /// stamped during the handshake handler before the socket gets added
+    /// to the broadcast list, so by the time <see cref="GetFollowers"/>
+    /// observes the entry every field is already populated.
+    /// </summary>
+    private sealed class FollowerConn
+    {
+        public required TcpClient Client { get; init; }
+        public required string Endpoint { get; init; }
+        public required DateTime ConnectedAtUtc { get; init; }
+        public required ulong HandshakeSeq { get; init; }
+    }
 
     public LogicalReplicationServer(int port, int opLogCapacity = 10_000, string? secret = null)
     {
@@ -162,17 +209,17 @@ public sealed class LogicalReplicationServer : IDisposable
                 return;
             }
 
-            var dead = new List<TcpClient>();
+            var dead = new List<FollowerConn>();
             foreach (var f in _followers)
             {
-                try { f.GetStream().Write(record, 0, record.Length); }
+                try { f.Client.GetStream().Write(record, 0, record.Length); }
                 catch { dead.Add(f); }
             }
             foreach (var d in dead)
             {
                 _followers.Remove(d);
-                try { d.Close(); } catch { }
-                Console.WriteLine("[LogicalRep] Follower disconnected");
+                try { d.Client.Close(); } catch { }
+                Console.WriteLine($"[LogicalRep] Follower disconnected ({d.Endpoint})");
             }
         }
     }
@@ -258,8 +305,19 @@ public sealed class LogicalReplicationServer : IDisposable
                 catch { client.Close(); return; }
             }
 
-            // Add to live broadcast list
-            lock (_lock) _followers.Add(client);
+            // Add to live broadcast list with the metadata that the status
+            // endpoint will surface. RemoteEndPoint is captured now because
+            // it's only reachable while the socket is connected; once it
+            // closes, the endpoint is gone.
+            var endpoint = client.Client.RemoteEndPoint?.ToString() ?? "unknown";
+            var conn = new FollowerConn
+            {
+                Client = client,
+                Endpoint = endpoint,
+                ConnectedAtUtc = DateTime.UtcNow,
+                HandshakeSeq = followerLastSeq,
+            };
+            lock (_lock) _followers.Add(conn);
         }
         catch (Exception ex)
         {
@@ -323,7 +381,7 @@ public sealed class LogicalReplicationServer : IDisposable
         try { _listener.Stop(); } catch { }
         lock (_lock)
         {
-            foreach (var f in _followers) try { f.Close(); } catch { }
+            foreach (var f in _followers) try { f.Client.Close(); } catch { }
             _followers.Clear();
         }
         _disposed = true;
@@ -357,6 +415,9 @@ public sealed class LogicalReplicationFollower : IDisposable
     public long OpsApplied => Interlocked.Read(ref _opsApplied);
     public long GapsDetected => Interlocked.Read(ref _gapsDetected);
     public DateTimeOffset LastMessageAt { get { lock (this) return _lastMessageAt; } }
+
+    /// <summary>The leader this follower is configured to read from, as <c>"host:port"</c>.</summary>
+    public string LeaderEndpoint => $"{_host}:{_port}";
 
     public LogicalReplicationFollower(string host, int port, string seqFilePath, Action<LogicalOp> apply, string? secret = null)
     {
