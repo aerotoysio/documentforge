@@ -1009,6 +1009,54 @@ public sealed class DocumentForgeDb : IDisposable
         _pageCache.FlushAll();
     }
 
+    /// <summary>
+    /// Take a consistent on-disk snapshot of the database to <paramref name="targetPath"/>.
+    /// Acquires the write lock briefly: flushes every dirty page, fsyncs, then
+    /// copies the data file. New writes are blocked for the duration of the
+    /// flush + copy and resume on return.
+    ///
+    /// <para>
+    /// Result file is a self-contained <c>.dfdb</c> that <see cref="Open"/> can
+    /// load directly. The recovery log and WAL are NOT copied — the snapshot
+    /// is always taken at a checkpointed boundary, so the data file alone is
+    /// authoritative. Operators restoring from the snapshot just point a new
+    /// node at it; no recovery dance.
+    /// </para>
+    ///
+    /// <para>
+    /// For a multi-GB dataset the copy itself dominates the wall time. If the
+    /// pause is unacceptable, run the snapshot against a follower node — the
+    /// follower's pause doesn't affect the leader's write throughput.
+    /// </para>
+    /// </summary>
+    public void Snapshot(string targetPath)
+    {
+        if (string.Equals(Path.GetFullPath(targetPath), Path.GetFullPath(FilePath),
+                StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Snapshot targetPath must differ from the live data file.");
+
+        _transactionManager.AcquireWriteLock();
+        try
+        {
+            // FlushAll fsyncs the data file via OnAfterFlushComplete and
+            // truncates the recovery log. After this returns, the on-disk
+            // data file alone reflects the full committed state.
+            _pageCache.FlushAll();
+
+            // Copy under the write lock so no concurrent writer can race in
+            // between flush and copy. File.Copy on .NET reads with FileShare
+            // semantics that match a normal read — we still hold the data
+            // file's own handle, but Copy goes through a separate read path.
+            var targetDir = Path.GetDirectoryName(targetPath);
+            if (!string.IsNullOrEmpty(targetDir)) Directory.CreateDirectory(targetDir);
+            File.Copy(FilePath, targetPath, overwrite: true);
+        }
+        finally
+        {
+            _transactionManager.ReleaseWriteLock();
+        }
+    }
+
     public void Dispose()
     {
         if (!_disposed)
