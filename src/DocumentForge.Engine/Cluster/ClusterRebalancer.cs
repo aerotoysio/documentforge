@@ -183,12 +183,40 @@ public sealed class ClusterRebalancer
 
     /// <summary>
     /// Start an online rebalance: enables migration mode on the cluster (dual-read
-    /// fallback), then copies misplaced documents in the background without blocking
-    /// writes. Clients continue inserting and querying throughout. When the returned
-    /// Task completes, all misplaced documents have been moved and callers should
-    /// call <see cref="CompleteOnlineRebalance"/> to drop the previous ring.
+    /// fallback), then copies misplaced documents off the calling thread without
+    /// blocking writes. Clients continue inserting and querying throughout. When
+    /// the returned Task completes, all misplaced documents have been moved and
+    /// callers should call <see cref="CompleteOnlineRebalance"/> to drop the
+    /// previous ring.
+    ///
+    /// <para>
+    /// Pre-fix this was declared <c>async</c> but never awaited anything, so the
+    /// CS1998 warning aside, awaiting it ran the entire rebalance synchronously
+    /// on the calling thread. Now the body runs through <see cref="Task.Run"/>
+    /// and awaits genuinely yield. <see cref="RunOnline"/> is the synchronous
+    /// shape if you want explicit control over thread placement.
+    /// </para>
     /// </summary>
-    public static async Task<OnlineRebalanceReport> RunOnlineAsync(
+    public static Task<OnlineRebalanceReport> RunOnlineAsync(
+        DocumentForgeCluster cluster,
+        ClusterConfig oldConfig,
+        ClusterConfig newConfig,
+        List<IShardTransport> previousShards,
+        Action<Progress>? onProgress = null,
+        CancellationToken ct = default)
+    {
+        return Task.Run(
+            () => RunOnline(cluster, oldConfig, newConfig, previousShards, onProgress, ct),
+            ct);
+    }
+
+    /// <summary>
+    /// Synchronous form of <see cref="RunOnlineAsync"/>. Runs to completion on
+    /// the calling thread; throw <see cref="OperationCanceledException"/> if
+    /// <paramref name="ct"/> is cancelled mid-walk. Callers who want the work
+    /// off-thread should use the async wrapper.
+    /// </summary>
+    public static OnlineRebalanceReport RunOnline(
         DocumentForgeCluster cluster,
         ClusterConfig oldConfig,
         ClusterConfig newConfig,
