@@ -116,6 +116,7 @@ public static class ServeCommand
         Console.WriteLine("             GET|DELETE|PUT /collections/{name}/{id}                (by internal _id)");
         Console.WriteLine("             GET|DELETE|PUT /collections/{name}/by/{field}/{value}  (by any field)");
         Console.WriteLine("             DELETE /collections/{name} | GET /indexes/{collection} | POST /index");
+        Console.WriteLine("             POST /tx/batch                  (atomic multi-doc transaction)");
         Console.WriteLine("             POST /seed | GET /health");
         Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint");
         Console.WriteLine("             POST /admin/compact/{collection}");
@@ -524,6 +525,128 @@ public static class ServeCommand
                     message = $"Index '{request.Name}' on {request.Collection}({request.Path})", totalIndexes = indexes.Count });
             }
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        // Atomic multi-document transaction. Body is a JSON array of ops:
+        //   { "op": "insert",        "collection": "users", "doc": {...} }
+        //   { "op": "replace",       "collection": "users", "id": "<guid>", "doc": {...} }
+        //   { "op": "delete",        "collection": "users", "id": "<guid>" }
+        //   { "op": "deleteByField", "collection": "users", "field": "email", "value": "a@b.com" }
+        // The whole batch commits or none of it does. A unique-index conflict
+        // anywhere in the batch (including conflicts the batch itself creates)
+        // returns 400 with the failing op index. Cross-shard transactions and
+        // imperative session-style transactions are tracked separately as
+        // Phase 2/3 work.
+        app.MapPost("/tx/batch", async (HttpRequest request) =>
+        {
+            using var reader = new StreamReader(request.Body);
+            var body = await reader.ReadToEndAsync();
+            if (string.IsNullOrWhiteSpace(body))
+                return Results.BadRequest(new { error = "Empty body" });
+
+            JsonDocument? parsed;
+            try { parsed = JsonDocument.Parse(body); }
+            catch (Exception ex) { return Results.BadRequest(new { error = $"Invalid JSON: {ex.Message}" }); }
+
+            using (parsed)
+            {
+                if (parsed.RootElement.ValueKind != JsonValueKind.Array)
+                    return Results.BadRequest(new { error = "Body must be a JSON array of ops." });
+
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                using var tx = db.BeginTransaction();
+                var results = new List<object>();
+                int opIndex = 0;
+
+                try
+                {
+                    foreach (var el in parsed.RootElement.EnumerateArray())
+                    {
+                        var op = el.TryGetProperty("op", out var opEl) ? opEl.GetString() : null;
+                        var collection = el.TryGetProperty("collection", out var cEl) ? cEl.GetString() : null;
+                        if (string.IsNullOrEmpty(op) || string.IsNullOrEmpty(collection))
+                        {
+                            return Results.BadRequest(new { error = $"op[{opIndex}]: 'op' and 'collection' are required." });
+                        }
+
+                        switch (op)
+                        {
+                            case "insert":
+                            {
+                                if (!el.TryGetProperty("doc", out var docEl))
+                                    return Results.BadRequest(new { error = $"op[{opIndex}] insert: 'doc' is required." });
+                                var doc = BsonDocument.FromJson(docEl.GetRawText());
+                                var id = tx.Insert(collection!, doc);
+                                results.Add(new { op, collection, id = id.ToString() });
+                                break;
+                            }
+                            case "replace":
+                            {
+                                if (!el.TryGetProperty("id", out var idEl) || !Guid.TryParse(idEl.GetString(), out var rguid))
+                                    return Results.BadRequest(new { error = $"op[{opIndex}] replace: valid 'id' is required." });
+                                if (!el.TryGetProperty("doc", out var docEl))
+                                    return Results.BadRequest(new { error = $"op[{opIndex}] replace: 'doc' is required." });
+                                var rid = new DocumentId(rguid);
+                                var doc = BsonDocument.FromJson(docEl.GetRawText());
+                                var ok = tx.Replace(collection!, rid, doc);
+                                if (!ok)
+                                    return Results.BadRequest(new { error = $"op[{opIndex}] replace: id '{rid}' not found in {collection}." });
+                                results.Add(new { op, collection, id = rid.ToString() });
+                                break;
+                            }
+                            case "delete":
+                            {
+                                if (!el.TryGetProperty("id", out var idEl) || !Guid.TryParse(idEl.GetString(), out var dguid))
+                                    return Results.BadRequest(new { error = $"op[{opIndex}] delete: valid 'id' is required." });
+                                var did = new DocumentId(dguid);
+                                var ok = tx.Delete(collection!, did);
+                                results.Add(new { op, collection, id = did.ToString(), deleted = ok });
+                                break;
+                            }
+                            case "deleteByField":
+                            {
+                                var field = el.TryGetProperty("field", out var fEl) ? fEl.GetString() : null;
+                                var value = el.TryGetProperty("value", out var vEl) ? vEl.GetString() : null;
+                                if (string.IsNullOrEmpty(field) || value is null)
+                                    return Results.BadRequest(new { error = $"op[{opIndex}] deleteByField: 'field' and 'value' are required." });
+                                if (!IsValidFieldPath(field))
+                                    return Results.BadRequest(new { error = $"op[{opIndex}] deleteByField: 'field' must match [a-zA-Z_][a-zA-Z0-9_.\\[\\]]*" });
+                                int n = tx.DeleteByField(collection!, field, value);
+                                results.Add(new { op, collection, field, value, deleted = n });
+                                break;
+                            }
+                            default:
+                                return Results.BadRequest(new { error = $"op[{opIndex}]: unknown op '{op}' (expected insert|replace|delete|deleteByField)." });
+                        }
+                        opIndex++;
+                    }
+
+                    tx.Commit();
+                    sw.Stop();
+                    return Results.Ok(new
+                    {
+                        success = true,
+                        transactionId = tx.Id,
+                        operationCount = results.Count,
+                        results,
+                        timeMs = Math.Round(sw.Elapsed.TotalMilliseconds, 3)
+                    });
+                }
+                catch (DocumentForgeException ex)
+                {
+                    sw.Stop();
+                    // tx is auto-rolled back on dispose since Commit didn't reach.
+                    return Results.BadRequest(new
+                    {
+                        success = false,
+                        transactionId = tx.Id,
+                        failedOpIndex = opIndex,
+                        error = ex.Message,
+                        rolledBack = true,
+                        timeMs = Math.Round(sw.Elapsed.TotalMilliseconds, 3)
+                    });
+                }
+            }
         });
 
         app.MapPost("/seed", (SeedRequest? request) =>
