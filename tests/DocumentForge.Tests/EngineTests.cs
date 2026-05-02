@@ -2092,6 +2092,88 @@ public class EngineTests : IDisposable
         Assert.Equal(2, result.Documents.Count);
     }
 
+    // --- Index catalog: multi-page support (issue #22) ---
+
+    [Fact]
+    public void IndexCatalog_HandlesManyIndexesAcrossMultiplePages()
+    {
+        // Pre-fix Save threw "Index catalog overflow - too many indexes for one
+        // page (TODO: multi-page)" once the catalog page filled up — roughly
+        // 170 indexes on a 4 KB page depending on name length. That's a real
+        // ceiling for apps with many small collections.
+        //
+        // Create enough indexes to span at least 3 catalog pages (300 here is
+        // comfortably past the single-page cap). Verify we can save, reload,
+        // and that lookups against each index still plan correctly.
+        const int IndexCount = 300;
+
+        for (int i = 0; i < IndexCount; i++)
+        {
+            var coll = $"col{i:D3}";
+            _db.Insert(coll, $$"""{"k": "v{{i}}"}""");
+            _db.CreateIndex(coll, "k", $"idx_col{i:D3}_k");
+        }
+
+        // Spot-check: every index appears in GetIndexes for its collection.
+        for (int i = 0; i < IndexCount; i++)
+        {
+            var coll = $"col{i:D3}";
+            Assert.Single(_db.GetIndexes(coll));
+        }
+
+        // Round-trip: dispose + reopen reloads the entire chain. If any link
+        // in the chain were broken, indexes after the cap point would be lost.
+        _db.Flush();
+        _db.Dispose();
+        using var reopened = DocumentForgeDb.Open(_dbPath);
+
+        for (int i = 0; i < IndexCount; i++)
+        {
+            var coll = $"col{i:D3}";
+            Assert.Single(reopened.GetIndexes(coll));
+            // Indexed lookup proves the catalog row points at a real, intact index page.
+            var rows = reopened.Execute($"SELECT * FROM {coll} WHERE k = 'v{i}'").Documents;
+            Assert.Single(rows);
+        }
+    }
+
+    [Fact]
+    public void IndexCatalog_ShrinksAndReusesPagesAfterDropIndex()
+    {
+        // Catalog growing then shrinking should free the spare pages, not
+        // leak them. We can't directly inspect the free list, so the test
+        // verifies the engine stays functional through a grow/shrink cycle
+        // and a reopen comes back coherent.
+        for (int i = 0; i < 250; i++)
+        {
+            var coll = $"c{i:D3}";
+            _db.Insert(coll, $$"""{"k":{{i}}}""");
+            _db.CreateIndex(coll, "k", $"idx_c{i:D3}");
+        }
+
+        // Drop most of them — this rewrites the catalog smaller and frees
+        // the now-unneeded chain pages. The SQL DROP INDEX form requires
+        // an ON-clause: `DROP INDEX <name> ON <collection>`.
+        var dropResult = _db.Execute("DROP INDEX idx_c000 ON c000");
+        Assert.True(dropResult.Success, dropResult.Message);
+        for (int i = 50; i < 250; i++)
+        {
+            var r = _db.Execute($"DROP INDEX idx_c{i:D3} ON c{i:D3}");
+            Assert.True(r.Success, r.Message);
+        }
+
+        _db.Flush();
+        _db.Dispose();
+        using var reopened = DocumentForgeDb.Open(_dbPath);
+
+        // Indexes 1..49 survive; 0 was dropped; 50..249 dropped.
+        Assert.Empty(reopened.GetIndexes("c000"));
+        for (int i = 1; i < 50; i++)
+            Assert.Single(reopened.GetIndexes($"c{i:D3}"));
+        for (int i = 50; i < 250; i++)
+            Assert.Empty(reopened.GetIndexes($"c{i:D3}"));
+    }
+
     public void Dispose()
     {
         _db.Dispose();
