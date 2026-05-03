@@ -54,6 +54,7 @@ internal sealed class PreparedTxCoordinator : IDisposable
     private readonly DocumentForgeDb _db;
     private readonly TransactionManager _txManager;
     private readonly PreparedTxLog _log;
+    private readonly PreparedTxStats _stats;
     private readonly Channel<PreparedTxCommand> _queue;
     private Thread? _worker;
     private readonly object _startLock = new();
@@ -65,11 +66,12 @@ internal sealed class PreparedTxCoordinator : IDisposable
     // hold the write lock for writes only, not reads).
     private InFlightTx? _active;
 
-    public PreparedTxCoordinator(DocumentForgeDb db, TransactionManager txManager, PreparedTxLog log)
+    public PreparedTxCoordinator(DocumentForgeDb db, TransactionManager txManager, PreparedTxLog log, PreparedTxStats stats)
     {
         _db = db;
         _txManager = txManager;
         _log = log;
+        _stats = stats;
         _queue = Channel.CreateUnbounded<PreparedTxCommand>(new UnboundedChannelOptions
         {
             SingleReader = true,
@@ -173,8 +175,11 @@ internal sealed class PreparedTxCoordinator : IDisposable
 
     private void HandlePrepare(PrepareCommand cmd)
     {
+        Interlocked.Increment(ref _stats.PrepareTotal);
+
         if (_active is not null)
         {
+            Interlocked.Increment(ref _stats.PrepareAbortedTotal);
             cmd.Result.SetResult(PrepareResult.No(
                 $"another tx is already prepared on this shard ({_active.TxId})"));
             return;
@@ -206,6 +211,7 @@ internal sealed class PreparedTxCoordinator : IDisposable
             // and self-aborts on.
             var timeoutCts = new CancellationTokenSource();
             _active = new InFlightTx(cmd.TxId, cmd.CoordinatorShardId, cmd.Ops, workingSets, timeoutCts);
+            Interlocked.Increment(ref _stats.InFlightPrepared);
             cmd.Result.SetResult(PrepareResult.Yes());
             // Lock stays held — released by HandleResolve or HandleTimeout.
             lockHeld = false; // mark to avoid release in catch
@@ -221,6 +227,7 @@ internal sealed class PreparedTxCoordinator : IDisposable
         }
         catch (Exception ex)
         {
+            Interlocked.Increment(ref _stats.PrepareAbortedTotal);
             cmd.Result.SetResult(PrepareResult.No(ex.Message));
         }
         finally
@@ -252,6 +259,7 @@ internal sealed class PreparedTxCoordinator : IDisposable
             {
                 var workingSets = _db.BuildWorkingSetsFromShardTxOps(rec.Ops);
                 _active = new InFlightTx(rec.TxId, rec.CoordinatorShardId, rec.Ops, workingSets);
+                Interlocked.Increment(ref _stats.InFlightPrepared);
                 reacquiredFresh = true;
             }
             catch
@@ -271,29 +279,37 @@ internal sealed class PreparedTxCoordinator : IDisposable
             return;
         }
 
+        Exception? failure = null;
         try
         {
             if (cmd.Commit)
             {
                 _db.ApplyWorkingSetsLocked(_active.WorkingSets);
+                Interlocked.Increment(ref _stats.CommittedTotal);
+            }
+            else
+            {
+                Interlocked.Increment(ref _stats.RolledBackTotal);
             }
             _log.AppendResolved(_active.TxId, cmd.Commit);
-            cmd.Done.SetResult(null);
         }
-        catch (Exception ex)
-        {
-            cmd.Done.SetException(ex);
-        }
-        finally
-        {
-            // Cancel the pending timeout so we don't leak a Task.Delay or
-            // process a stale TimeoutCommand for a tx that's already
-            // resolved.
-            try { _active?.TimeoutCts?.Cancel(); } catch { }
-            try { _active?.TimeoutCts?.Dispose(); } catch { }
-            try { _txManager.ReleaseWriteLock(); } catch { }
-            _active = null;
-        }
+        catch (Exception ex) { failure = ex; }
+
+        // Cleanup BEFORE signaling the caller. With
+        // RunContinuationsAsynchronously the awaiter can resume on a
+        // different thread the instant SetResult is called — if cleanup
+        // ran in finally, an observer's GetPreparedTxStats() could race
+        // and see InFlightPrepared still at 1 even though the resolve
+        // returned. Cleaning up first means the observed state matches
+        // the API contract.
+        try { _active?.TimeoutCts?.Cancel(); } catch { }
+        try { _active?.TimeoutCts?.Dispose(); } catch { }
+        try { _txManager.ReleaseWriteLock(); } catch { }
+        _active = null;
+        Interlocked.Decrement(ref _stats.InFlightPrepared);
+
+        if (failure is not null) cmd.Done.SetException(failure);
+        else cmd.Done.SetResult(null);
     }
 
     /// <summary>
@@ -314,6 +330,7 @@ internal sealed class PreparedTxCoordinator : IDisposable
         try
         {
             _log.AppendResolved(_active.TxId, committed: false);
+            Interlocked.Increment(ref _stats.TimedOutTotal);
         }
         catch
         {
@@ -327,6 +344,7 @@ internal sealed class PreparedTxCoordinator : IDisposable
             try { _active?.TimeoutCts?.Dispose(); } catch { }
             try { _txManager.ReleaseWriteLock(); } catch { }
             _active = null;
+            Interlocked.Decrement(ref _stats.InFlightPrepared);
         }
     }
 

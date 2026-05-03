@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Sockets;
 using DocumentForge.Api;
+using DocumentForge.Core;
 using DocumentForge.Engine;
 using DocumentForge.Engine.Cluster;
 using Microsoft.AspNetCore.Builder;
@@ -241,6 +242,145 @@ public class HttpShardTransportTests : IDisposable
         var totalB = second.db.Execute("SELECT * FROM orders").Documents.Count;
         Assert.Equal(1, totalA);
         Assert.Equal(1, totalB);
+    }
+
+    // --- Phase E.2: operator endpoints + metrics ---
+
+    [Fact]
+    public void Stats_TrackPrepareCommitRollbackTransitions()
+    {
+        // Direct C# API (no HTTP) — quickest way to assert the counters
+        // increment on each transition without wire overhead.
+        var path = Path.Combine(Path.GetTempPath(), $"stats_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var db = DocumentForgeDb.Create(path);
+            var ops = new List<ShardTxOp>
+            {
+                ShardTxOp.ForInsert("orders", DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"S1"}""")),
+            };
+
+            // Initial counters all zero.
+            var s0 = db.GetPreparedTxStats();
+            Assert.Equal(0, s0.PrepareTotal);
+            Assert.Equal(0, s0.CommittedTotal);
+
+            // Prepare + Commit cycle.
+            db.PrepareTransaction("tx-s1", "self", ops, TimeSpan.FromSeconds(30));
+            db.CommitPreparedTransaction("tx-s1");
+
+            var s1 = db.GetPreparedTxStats();
+            Assert.Equal(1, s1.PrepareTotal);
+            Assert.Equal(1, s1.CommittedTotal);
+            Assert.Equal(0, s1.RolledBackTotal);
+            Assert.Equal(0, s1.InFlightPrepared);
+
+            // Prepare + Rollback cycle.
+            db.PrepareTransaction("tx-s2", "self", ops, TimeSpan.FromSeconds(30));
+            db.RollbackPreparedTransaction("tx-s2");
+
+            var s2 = db.GetPreparedTxStats();
+            Assert.Equal(2, s2.PrepareTotal);
+            Assert.Equal(1, s2.CommittedTotal);
+            Assert.Equal(1, s2.RolledBackTotal);
+            Assert.Equal(0, s2.InFlightPrepared);
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Stats_TrackTimedOutAbort()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"stats_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var db = DocumentForgeDb.Create(path);
+            var ops = new List<ShardTxOp>
+            {
+                ShardTxOp.ForInsert("orders", DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"T1"}""")),
+            };
+
+            db.PrepareTransaction("tx-timeout-stat", "self", ops, TimeSpan.FromMilliseconds(100));
+            Thread.Sleep(500);  // let the timeout fire
+
+            var stats = db.GetPreparedTxStats();
+            Assert.Equal(1, stats.PrepareTotal);
+            Assert.Equal(1, stats.TimedOutTotal);
+            Assert.Equal(0, stats.CommittedTotal);
+            Assert.Equal(0, stats.InFlightPrepared);
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void OperatorAbort_OverHttp_FreesLock()
+    {
+        // Operator hits POST /tx/{id}/abort to force-resolve a stuck
+        // PREPARED tx. After the abort, the participant must accept new
+        // PREPAREs again.
+        var (db, _, transport, _) = BootServer();
+
+        var ops = new List<ShardTxOp>
+        {
+            ShardTxOp.ForInsert("orders", DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"STUCK"}""")),
+        };
+
+        Assert.Equal(PrepareVote.Prepared, transport.Prepare("tx-stuck", "self", ops, TimeSpan.FromSeconds(30)).Vote);
+
+        // Operator force-aborts.
+        transport.OperatorAbort("tx-stuck");
+
+        // Lock released — a new Prepare succeeds and commits.
+        Assert.Equal(PrepareVote.Prepared, transport.Prepare("tx-after-abort", "self", ops, TimeSpan.FromSeconds(30)).Vote);
+        transport.CommitPrepared("tx-after-abort");
+
+        // The aborted tx never landed; only the post-abort one did.
+        var rows = db.Execute("SELECT * FROM orders").Documents;
+        Assert.Single(rows);
+    }
+
+    [Fact]
+    public void OperatorAbort_RefusedWhenCoordinatorDecided()
+    {
+        // Safety guard: if THIS shard recorded COMMIT_DECISION for the tx
+        // (it's the coordinator and decided), refuse the abort. Aborting
+        // after a decision would diverge from what the cluster committed.
+        var (_, _, transport, _) = BootServer();
+
+        // Simulate "this shard is the coordinator and decided COMMIT" by
+        // calling RecordCoordinatorDecision directly.
+        transport.RecordCoordinatorDecision("tx-decided", commit: true);
+
+        var ex = Assert.Throws<DocumentForgeException>(() => transport.OperatorAbort("tx-decided"));
+        Assert.Contains("COMMIT_DECISION", ex.Message);
+    }
+
+    [Fact]
+    public void Stats_OverHttp_RoundTrips()
+    {
+        var (_, _, transport, _) = BootServer();
+
+        var initial = transport.GetStats();
+        Assert.Equal(0, initial.PrepareTotal);
+
+        var ops = new List<ShardTxOp>
+        {
+            ShardTxOp.ForInsert("orders", DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"H-STAT"}""")),
+        };
+
+        Assert.Equal(PrepareVote.Prepared, transport.Prepare("tx-http-stat", "self", ops, TimeSpan.FromSeconds(30)).Vote);
+        transport.CommitPrepared("tx-http-stat");
+
+        var after = transport.GetStats();
+        Assert.Equal(1, after.PrepareTotal);
+        Assert.Equal(1, after.CommittedTotal);
+        Assert.Equal(0, after.InFlightPrepared);
     }
 
     private sealed class HostStopper : IDisposable

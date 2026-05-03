@@ -965,6 +965,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     private PreparedTxLog? _preparedTxLog;
     private PreparedTxCoordinator? _preparedTxCoordinator;
     private readonly object _preparedTxInitLock = new();
+    private readonly PreparedTxStats _preparedTxStats = new();
 
     // Phase C.1 — coordinator decision log. Only non-null on a shard that's
     // actually been asked to coordinate a cluster tx; lazy-initialized on
@@ -982,7 +983,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             if (_preparedTxCoordinator is not null) return _preparedTxCoordinator;
             ThrowIfReadOnly();
             _preparedTxLog = new PreparedTxLog(FilePath + ".prepared.log");
-            _preparedTxCoordinator = new PreparedTxCoordinator(this, _transactionManager, _preparedTxLog);
+            _preparedTxCoordinator = new PreparedTxCoordinator(this, _transactionManager, _preparedTxLog, _preparedTxStats);
             return _preparedTxCoordinator;
         }
     }
@@ -1089,6 +1090,14 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         using var transient = new PreparedTxLog(path);
         return transient.ScanInFlight();
     }
+
+    /// <summary>
+    /// Snapshot of the participant-side 2PC counters for this shard.
+    /// Returns zero-valued stats on a DB that has never participated in
+    /// a prepared tx. Phase E.2 — fed by the HTTP <c>GET /tx/stats</c>
+    /// endpoint for operator dashboards.
+    /// </summary>
+    public PreparedTxStats GetPreparedTxStats() => _preparedTxStats.Snapshot();
 
     /// <summary>
     /// Coordinator-side: what does this shard's coord log say about
