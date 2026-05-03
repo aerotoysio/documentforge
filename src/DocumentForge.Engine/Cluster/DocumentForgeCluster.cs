@@ -517,6 +517,16 @@ public sealed class DocumentForgeCluster : IDisposable
     internal void ExecuteOnShardForTx(int shardIndex, IReadOnlyList<ShardTxOp> ops) =>
         _shards[shardIndex].ExecuteTransaction(ops);
 
+    // 2PC participant calls (Phase B.2). The cluster relays these straight
+    // to the relevant shard's transport.
+    internal string GetShardNameForTx(int shardIndex) => _shardNames[shardIndex];
+    internal PrepareResult PrepareOnShardForTx(int shardIndex, string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops) =>
+        _shards[shardIndex].Prepare(txId, coordinatorShardId, ops);
+    internal void CommitOnShardForTx(int shardIndex, string txId) =>
+        _shards[shardIndex].CommitPrepared(txId);
+    internal void RollbackOnShardForTx(int shardIndex, string txId) =>
+        _shards[shardIndex].RollbackPrepared(txId);
+
     public void Dispose()
     {
         if (_disposed) return;

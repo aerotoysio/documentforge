@@ -122,19 +122,107 @@ public sealed class ClusterTransaction : IDisposable
                 return;
             }
 
-            if (_opsByShard.Count > 1)
-                throw new NotImplementedException(
-                    $"ClusterTransaction {Id} staged ops on {_opsByShard.Count} shards. " +
-                    $"Cross-shard commit (2PC) lands in Phase B of issue #14.");
+            if (_opsByShard.Count == 1)
+            {
+                // Single-shard fast path. Direct local commit on the participant —
+                // no PREPARE round-trip needed since there's only one participant.
+                var entry = _opsByShard.First();
+                _cluster.ExecuteOnShardForTx(entry.Key, entry.Value);
+                State = TransactionState.Committed;
+                return;
+            }
 
-            var entry = _opsByShard.First();
-            _cluster.ExecuteOnShardForTx(entry.Key, entry.Value);
+            // Multi-shard: drive 2PC across the participating shards.
+            CommitMultiShard();
             State = TransactionState.Committed;
         }
         catch
         {
             State = TransactionState.RolledBack;
             throw;
+        }
+    }
+
+    /// <summary>
+    /// 2PC across the participating shards.
+    ///
+    /// <para>
+    /// Phase B.2 happy path: PREPARE each participant in shard-id-sorted
+    /// order; if any returns ABORT, broadcast ROLLBACK to the ones that
+    /// did PREPARE and surface the abort reason. If all PREPARED, broadcast
+    /// COMMIT.
+    /// </para>
+    ///
+    /// <para>
+    /// Crash semantics in Phase B: if the coordinator (this client) dies
+    /// after some participants are PREPARED but before COMMIT/ROLLBACK is
+    /// broadcast, those participants stay PREPARED with their write lock
+    /// held — readers/writers on those shards block until manual cleanup.
+    /// Phase C will add the participant prepared-tx-log replay path and
+    /// the operator-facing forced-abort endpoint to fix this.
+    /// </para>
+    ///
+    /// <para>
+    /// Coordinator shard selection: the participant with the lowest shard
+    /// index. Phase C will use this to pick where the persisted decision
+    /// log lives. For B.2 we just record the name in the PREPARE message
+    /// so participants can later (Phase C) ask the coordinator shard for
+    /// the decision on restart.
+    /// </para>
+    /// </summary>
+    private void CommitMultiShard()
+    {
+        var shardIndices = _opsByShard.Keys.OrderBy(i => i).ToList();
+        var coordinatorShardId = _cluster.GetShardNameForTx(shardIndices[0]);
+        var txId = Id.ToString("N");
+
+        // PREPARE phase. Sequential — the participants are independent so
+        // parallelism is a perf optimization for later (Phase E). Sequential
+        // also gives us a clean abort: as soon as one shard says NO we stop
+        // calling PREPARE on the rest and only need to ROLLBACK the YESes
+        // we've already collected.
+        var preparedShards = new List<int>();
+        string? abortReason = null;
+        int abortShardIdx = -1;
+        foreach (var shardIdx in shardIndices)
+        {
+            var ops = _opsByShard[shardIdx];
+            var result = _cluster.PrepareOnShardForTx(shardIdx, txId, coordinatorShardId, ops);
+            if (result.Vote == PrepareVote.Prepared)
+            {
+                preparedShards.Add(shardIdx);
+            }
+            else
+            {
+                abortReason = result.AbortReason;
+                abortShardIdx = shardIdx;
+                break;
+            }
+        }
+
+        if (abortReason is not null)
+        {
+            // ROLLBACK every participant we successfully PREPARED. We
+            // best-effort each one — a rollback failure on one participant
+            // shouldn't prevent us from rolling back the others. The first
+            // failure's reason is what we surface to the caller.
+            foreach (var preparedIdx in preparedShards)
+            {
+                try { _cluster.RollbackOnShardForTx(preparedIdx, txId); }
+                catch { /* best effort during abort */ }
+            }
+            throw new TransactionException(
+                $"ClusterTransaction {Id} aborted on shard '{_cluster.GetShardNameForTx(abortShardIdx)}': {abortReason}");
+        }
+
+        // All voted PREPARED — commit each one. After this loop returns the
+        // tx is durable on every participant. If the coordinator dies in the
+        // middle of this loop (between two CommitPrepared calls), some
+        // participants are committed and some are still PREPARED — Phase C's
+        // recovery resolves them by querying the coordinator's decision.
+        foreach (var preparedIdx in preparedShards)
+        {
+            _cluster.CommitOnShardForTx(preparedIdx, txId);
         }
     }
 
