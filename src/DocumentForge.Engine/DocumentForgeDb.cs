@@ -1,5 +1,6 @@
 using DocumentForge.Core;
 using DocumentForge.Document;
+using DocumentForge.Engine.Cluster;
 using DocumentForge.Index;
 using DocumentForge.Query;
 using DocumentForge.Storage;
@@ -952,6 +953,193 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         return new Transaction(id, _transactionManager, this);
     }
 
+    // --- 2PC participant API (issue #14 Phase B) ---
+    //
+    // These are the wire-level operations the cluster coordinator drives:
+    // Prepare validates + stages + holds the write lock; CommitPrepared
+    // applies + releases; RollbackPrepared releases without applying. The
+    // hot non-tx paths above don't go through any of this — the worker
+    // thread that owns the lock during PREPARED state isn't even running
+    // unless something has called Prepare.
+
+    private PreparedTxLog? _preparedTxLog;
+    private PreparedTxCoordinator? _preparedTxCoordinator;
+    private readonly object _preparedTxInitLock = new();
+
+    // Phase C.1 — coordinator decision log. Only non-null on a shard that's
+    // actually been asked to coordinate a cluster tx; lazy-initialized on
+    // first decision write. The same DB can be both a participant (uses
+    // _preparedTxLog) and a coordinator (uses _coordinatorTxLog) for
+    // different transactions.
+    private CoordinatorTxLog? _coordinatorTxLog;
+    private readonly object _coordinatorTxInitLock = new();
+
+    private PreparedTxCoordinator EnsurePreparedTxCoordinator()
+    {
+        if (_preparedTxCoordinator is not null) return _preparedTxCoordinator;
+        lock (_preparedTxInitLock)
+        {
+            if (_preparedTxCoordinator is not null) return _preparedTxCoordinator;
+            ThrowIfReadOnly();
+            _preparedTxLog = new PreparedTxLog(FilePath + ".prepared.log");
+            _preparedTxCoordinator = new PreparedTxCoordinator(this, _transactionManager, _preparedTxLog);
+            return _preparedTxCoordinator;
+        }
+    }
+
+    /// <summary>
+    /// Phase 1 of 2PC. Validate the staged ops against the current state,
+    /// persist them to <c>{db}.prepared.log</c>, and hold the write lock
+    /// until <see cref="CommitPreparedTransaction"/> or
+    /// <see cref="RollbackPreparedTransaction"/> arrives. Returns
+    /// <see cref="PrepareVote.Prepared"/> on success or
+    /// <see cref="PrepareVote.Aborted"/> with a reason on conflict.
+    /// </summary>
+    public PrepareResult PrepareTransaction(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops)
+    {
+        ThrowIfReadOnly();
+        return EnsurePreparedTxCoordinator().Prepare(txId, coordinatorShardId, ops);
+    }
+
+    /// <summary>Phase 2 commit: apply the prepared ops and release the lock.</summary>
+    public void CommitPreparedTransaction(string txId)
+    {
+        ThrowIfReadOnly();
+        EnsurePreparedTxCoordinator().CommitPrepared(txId);
+    }
+
+    /// <summary>Phase 2 rollback: drop the prepared ops and release the lock.</summary>
+    public void RollbackPreparedTransaction(string txId)
+    {
+        ThrowIfReadOnly();
+        EnsurePreparedTxCoordinator().RollbackPrepared(txId);
+    }
+
+    private CoordinatorTxLog EnsureCoordinatorTxLog()
+    {
+        if (_coordinatorTxLog is not null) return _coordinatorTxLog;
+        lock (_coordinatorTxInitLock)
+        {
+            if (_coordinatorTxLog is not null) return _coordinatorTxLog;
+            ThrowIfReadOnly();
+            _coordinatorTxLog = new CoordinatorTxLog(FilePath + ".coord.log");
+            return _coordinatorTxLog;
+        }
+    }
+
+    /// <summary>
+    /// Coordinator-shard call: durably record the COMMIT decision (point of
+    /// no return). Issued by the cluster after every participant voted
+    /// PREPARED; recovery (Phase C.2) reads this on coordinator restart to
+    /// know it must replay the broadcast.
+    /// </summary>
+    public void RecordCoordinatorDecision(string txId, bool commit)
+    {
+        ThrowIfReadOnly();
+        // Phase C.1 only persists COMMIT — ABORT is implicit (no record). If
+        // we wanted to recover and finalize aborts deterministically (e.g.
+        // an operator-driven abort), we'd add an ABORT record. Out of scope.
+        if (commit)
+            EnsureCoordinatorTxLog().AppendCommitDecision(txId);
+    }
+
+    /// <summary>Coordinator-shard call: every participant ACK'd COMMIT — record DONE.</summary>
+    public void RecordCoordinatorDone(string txId)
+    {
+        ThrowIfReadOnly();
+        EnsureCoordinatorTxLog().AppendDone(txId);
+    }
+
+    /// <summary>
+    /// Snapshot of the coordinator decision log. txId → state. Empty if this
+    /// shard never coordinated a cluster tx. Phase C.2 reads this on
+    /// recovery to learn whether a tx was decided.
+    /// </summary>
+    public IReadOnlyDictionary<string, CoordinatorTxState> ScanCoordinatorTransactions()
+    {
+        if (_coordinatorTxLog is null) return new Dictionary<string, CoordinatorTxState>();
+        return _coordinatorTxLog.Scan();
+    }
+
+    /// <summary>
+    /// Snapshot of the participant prepared-tx log: every PREPARED record
+    /// without a matching RESOLVED record. Phase C.2 calls this on each
+    /// shard at recovery time to find tx slices that need resolution.
+    /// </summary>
+    public IReadOnlyList<PreparedTxRecord> ScanInFlightPreparedTransactions()
+    {
+        // The log is created lazily on first PREPARE. If it doesn't exist
+        // yet, we open it transiently to scan whatever's on disk from a
+        // previous process — without taking ownership for the lifetime of
+        // this DB instance (recovery shouldn't accidentally start a worker
+        // thread). On a freshly-created DB the file just doesn't exist
+        // and we return empty.
+        var path = FilePath + ".prepared.log";
+        if (_preparedTxLog is not null) return _preparedTxLog.ScanInFlight();
+        if (!File.Exists(path)) return Array.Empty<PreparedTxRecord>();
+        using var transient = new PreparedTxLog(path);
+        return transient.ScanInFlight();
+    }
+
+    /// <summary>
+    /// Coordinator-side: what does this shard's coord log say about
+    /// <paramref name="txId"/>? Returns null if absent (which the cluster
+    /// recovery treats as "abort").
+    /// </summary>
+    public CoordinatorTxState? GetCoordinatorTxState(string txId)
+    {
+        var path = FilePath + ".coord.log";
+        if (_coordinatorTxLog is not null)
+        {
+            var states = _coordinatorTxLog.Scan();
+            return states.TryGetValue(txId, out var s) ? s : null;
+        }
+        if (!File.Exists(path)) return null;
+        using var transient = new CoordinatorTxLog(path);
+        var transientStates = transient.Scan();
+        return transientStates.TryGetValue(txId, out var ts) ? ts : null;
+    }
+
+    /// <summary>
+    /// Convert wire-level <see cref="ShardTxOp"/>s into the working-set
+    /// shape the engine's apply/validate path consumes. Visible only to
+    /// <see cref="PreparedTxCoordinator"/>; called while it holds the
+    /// write lock so the per-collection scans for DeleteByField are safe.
+    /// </summary>
+    internal Dictionary<string, CollectionWorkingSet> BuildWorkingSetsFromShardTxOps(IReadOnlyList<ShardTxOp> ops)
+    {
+        var result = new Dictionary<string, CollectionWorkingSet>(StringComparer.OrdinalIgnoreCase);
+        foreach (var op in ops)
+        {
+            if (!result.TryGetValue(op.Collection, out var ws))
+            {
+                ws = new CollectionWorkingSet(op.Collection);
+                result[op.Collection] = ws;
+            }
+            switch (op.Kind)
+            {
+                case ShardTxOpKind.Insert:
+                    op.Doc!.EnsureId();
+                    ws.Inserts[op.Doc.GetId()] = op.Doc;
+                    break;
+                case ShardTxOpKind.DeleteByField:
+                    var coll = _catalog.GetCollection(op.Collection);
+                    if (coll is null) break;
+                    var target = BsonValue.FromString(op.Value!);
+                    foreach (var doc in coll.FindAll())
+                    {
+                        var actual = JsonPathExtractor.Extract(doc, op.Field!);
+                        if (!actual.IsNull && actual.CompareTo(target) == 0)
+                            ws.Deletes.Add(doc.GetId());
+                    }
+                    break;
+                default:
+                    throw new InvalidOperationException($"Unsupported ShardTxOpKind {op.Kind}");
+            }
+        }
+        return result;
+    }
+
     // --- ITransactionScope ---
     // Callbacks the Transaction handle uses to read live state and commit
     // a fully-staged batch under the engine's write lock.
@@ -1002,9 +1190,26 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     /// callers see the throw and can re-check the state. See the Phase-2
     /// crash-atomicity tracking issue for the durable rollback story.
     /// </summary>
-    private void ApplyTransactionLocked(Transaction tx)
+    private void ApplyTransactionLocked(Transaction tx) =>
+        ApplyWorkingSetsLocked(tx.WorkingSets);
+
+    /// <summary>
+    /// Apply a fully-staged set of per-collection working sets under the
+    /// caller-held write lock. Same atomicity contract as the public
+    /// <see cref="Transaction"/> path — validation runs first, the apply is
+    /// best-effort reversible on a non-uniqueness failure, and followers see
+    /// a single TxBatch broadcast at the end.
+    ///
+    /// <para>
+    /// Issue #14 Phase B factored this out of <c>ApplyTransactionLocked</c>
+    /// so the participant-side prepared-tx flow can call it with working
+    /// sets built from <see cref="ShardTxOp"/> instead of from a Transaction
+    /// handle. Both callers expect the lock to be held.
+    /// </para>
+    /// </summary>
+    internal void ApplyWorkingSetsLocked(IReadOnlyDictionary<string, CollectionWorkingSet> workingSets)
     {
-        ValidateUniqueIndexesForTx(tx);
+        ValidateUniqueIndexesForWorkingSets(workingSets);
 
         // Issue #23: snapshot every doc we touch so a non-uniqueness failure
         // mid-Apply (IOException, an unexpected throw from Collection.Insert,
@@ -1017,7 +1222,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
 
         try
         {
-            foreach (var (collectionName, ws) in tx.WorkingSets)
+            foreach (var (collectionName, ws) in workingSets)
             {
                 var collection = _catalog.GetCollection(collectionName);
                 if (collection is null)
@@ -1120,7 +1325,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         if (_logicalServer is not null)
         {
             var subOps = new List<TxBatchPayload.SubOp>();
-            foreach (var (collectionName, ws) in tx.WorkingSets)
+            foreach (var (collectionName, ws) in workingSets)
             {
                 // Order matches the apply order so followers see the same
                 // semantics: deletes, replaces, inserts.
@@ -1175,9 +1380,17 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     /// <see cref="DuplicateKeyException"/> on the first key that ends up
     /// pointing at two distinct doc ids.
     /// </summary>
-    private void ValidateUniqueIndexesForTx(Transaction tx)
+    private void ValidateUniqueIndexesForTx(Transaction tx) =>
+        ValidateUniqueIndexesForWorkingSets(tx.WorkingSets);
+
+    /// <summary>
+    /// Working-set-shaped overload so the Phase B prepared-tx path can
+    /// validate without holding a Transaction handle. Identical semantics
+    /// — just takes the working sets directly.
+    /// </summary>
+    internal void ValidateUniqueIndexesForWorkingSets(IReadOnlyDictionary<string, CollectionWorkingSet> workingSets)
     {
-        foreach (var (collectionName, ws) in tx.WorkingSets)
+        foreach (var (collectionName, ws) in workingSets)
         {
             var collection = _catalog.GetCollection(collectionName);
             foreach (var index in _indexManager.GetIndexes(collectionName))
@@ -1753,6 +1966,13 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             try { _replicationFollower?.Dispose(); } catch { }
             try { _logicalServer?.Dispose(); } catch { }
             try { _logicalFollower?.Dispose(); } catch { }
+            // Stop the prepared-tx worker thread + close its log before the
+            // page cache flush. Any in-flight prepared tx that hasn't been
+            // resolved gets its lock released by the worker on shutdown
+            // (Phase C will replay it on next Open).
+            try { _preparedTxCoordinator?.Dispose(); } catch { }
+            try { _preparedTxLog?.Dispose(); } catch { }
+            try { _coordinatorTxLog?.Dispose(); } catch { }
             try { _pageCache.FlushAll(); } // also truncates the recovery log
             catch (Exception ex) { deferredFlushError = ex; }
             try { _walWriter?.Dispose(); } catch { }
