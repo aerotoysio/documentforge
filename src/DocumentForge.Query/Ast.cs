@@ -43,7 +43,22 @@ public sealed class JoinClause
 public sealed class InsertStatement : Statement
 {
     public string Collection { get; set; } = "";
+
+    /// <summary>
+    /// Classic JSON form: <c>INSERT INTO users VALUES { "email": "..." }</c>.
+    /// When <see cref="Columns"/> is non-empty, this is empty and the
+    /// SQL-tuple form is used instead.
+    /// </summary>
     public string JsonDocument { get; set; } = "";
+
+    /// <summary>
+    /// SQL-tuple form: <c>INSERT INTO users (email, _id) VALUES ('a@b.com', NEWID())</c>.
+    /// <see cref="Columns"/> and <see cref="Values"/> are populated together
+    /// and have the same length; values can be literals, paths, or function
+    /// calls (composing with the #16 ValueExpression hierarchy).
+    /// </summary>
+    public List<string> Columns { get; set; } = new();
+    public List<ValueExpression> Values { get; set; } = new();
 }
 
 public sealed class UpdateStatement : Statement

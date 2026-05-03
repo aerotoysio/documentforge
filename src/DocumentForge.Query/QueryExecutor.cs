@@ -694,8 +694,37 @@ public sealed class QueryExecutor
 
     private QueryResult ExecuteInsert(InsertStatement stmt)
     {
+        BsonDocument doc;
+        if (stmt.Columns.Count > 0)
+        {
+            // SQL-tuple form: build a fresh document by evaluating each
+            // ValueExpression. No row context (this is INSERT, there's no
+            // pre-existing row), so PathValueExpression args would throw —
+            // that's the right behaviour: `INSERT INTO t (x) VALUES (y.z)`
+            // is meaningless without a source row, and the parser doesn't
+            // accept it via SELECT-INTO yet.
+            doc = new BsonDocument();
+            for (int i = 0; i < stmt.Columns.Count; i++)
+            {
+                var val = ValueEvaluator.Evaluate(stmt.Values[i], docContext: null);
+                doc[stmt.Columns[i]] = val;
+            }
+        }
+        else
+        {
+            // Classic JSON-literal form. No function-call support here —
+            // BsonDocument.FromJson is a strict JSON parser and we don't
+            // pre-process its input.
+            doc = BsonDocument.FromJson(stmt.JsonDocument);
+        }
+
         var collection = _catalog.GetOrCreateCollection(stmt.Collection);
-        var doc = BsonDocument.FromJson(stmt.JsonDocument);
+        // Pre-validate uniqueness so a function-generated value (e.g. a NEWID
+        // collision against an existing _id, vanishingly rare but possible if
+        // someone used a fixed-seed RNG client-side and then NEWID() from
+        // server) doesn't half-commit. Mirrors the discipline DocumentForgeDb
+        // uses on its own Insert path.
+        _indexManager.ValidateUniqueInsert(stmt.Collection, doc);
         var id = collection.Insert(doc);
         _indexManager.OnDocumentInserted(stmt.Collection, id, doc);
         return QueryResult.Affected(1, $"Inserted document {id}");
