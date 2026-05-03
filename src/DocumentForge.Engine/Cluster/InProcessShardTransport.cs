@@ -54,11 +54,14 @@ public sealed class InProcessShardTransport : IShardTransport
                 case ShardTxOpKind.Insert:
                     tx.Insert(op.Collection, op.Doc!);
                     break;
+                case ShardTxOpKind.Replace:
+                    tx.Replace(op.Collection, op.DocId, op.Doc!);
+                    break;
                 case ShardTxOpKind.DeleteByField:
                     tx.DeleteByField(op.Collection, op.Field!, op.Value!);
                     break;
                 default:
-                    throw new NotSupportedException($"ShardTxOpKind.{op.Kind} not supported in Phase A");
+                    throw new NotSupportedException($"ShardTxOpKind.{op.Kind} not supported");
             }
         }
         tx.Commit();
