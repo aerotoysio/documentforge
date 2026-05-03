@@ -2664,6 +2664,217 @@ public class EngineTests : IDisposable
         finally { CleanupClusterPaths(paths); }
     }
 
+    // --- 2PC participant API (issue #14, Phase B.1: prepare/commit/rollback on a single shard) ---
+    //
+    // Phase B.1 lands the participant-side wire ops on IShardTransport:
+    // Prepare validates + persists to {db}.prepared.log and holds the write
+    // lock; CommitPrepared applies and releases; RollbackPrepared releases
+    // without applying. The cluster coordinator (Phase B.2) drives these.
+    //
+    // These tests exercise one shard at a time (via InProcessShardTransport)
+    // — enough to lock in the participant contract before the cluster-level
+    // multi-shard machinery lands on top.
+
+    [Fact]
+    public void Participant_PreparedThenCommit_AppliesOps()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var db = DocumentForgeDb.Create(path);
+            var shard = new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db);
+
+            var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+            {
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"ABC","leg":1}""")),
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"ABC","leg":2}""")),
+            };
+
+            var tx = "tx-001";
+            var result = shard.Prepare(tx, "A", ops);
+            Assert.Equal(PrepareVote.Prepared, result.Vote);
+
+            // NB: while PREPARED the participant holds the write lock, so a
+            // SELECT here would block on the reader lock — that's the
+            // canonical 2PC read-blocking-during-prepared semantics. We
+            // verify the post-commit visibility instead.
+
+            shard.CommitPrepared(tx);
+
+            // After commit the inserts are visible.
+            Assert.Equal(2, db.Execute("SELECT * FROM orders").Documents.Count);
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Participant_PreparedThenRollback_DiscardsOps()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var db = DocumentForgeDb.Create(path);
+            var shard = new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db);
+
+            var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+            {
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"X"}""")),
+            };
+
+            Assert.Equal(PrepareVote.Prepared, shard.Prepare("tx-rb", "A", ops).Vote);
+            shard.RollbackPrepared("tx-rb");
+
+            Assert.Empty(db.Execute("SELECT * FROM orders").Documents);
+
+            // After rollback the participant must accept new prepares again.
+            Assert.Equal(PrepareVote.Prepared, shard.Prepare("tx-after-rb", "A", ops).Vote);
+            shard.CommitPrepared("tx-after-rb");
+            Assert.Single(db.Execute("SELECT * FROM orders").Documents);
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Participant_PrepareUniqueConflict_ReturnsAborted()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var db = DocumentForgeDb.Create(path);
+            db.GetOrCreateCollection("users");
+            db.CreateIndex("users", "email", "idx_email", unique: true);
+            db.Insert("users", """{"email":"a@b.com","v":1}""");
+
+            var shard = new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db);
+
+            // Conflicting insert in the prepared tx — must come back as ABORT,
+            // NOT throw. The coordinator needs the vote-shape so it can issue
+            // ROLLBACK to the other participants cleanly.
+            var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+            {
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("users",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"email":"a@b.com","v":2}""")),
+            };
+
+            var result = shard.Prepare("tx-dup", "A", ops);
+            Assert.Equal(PrepareVote.Aborted, result.Vote);
+            Assert.NotNull(result.AbortReason);
+
+            // Non-tx writes still work — Prepare's lock was released on abort.
+            db.Insert("users", """{"email":"new@x.com","v":3}""");
+            Assert.Equal(2, db.Execute("SELECT * FROM users").Documents.Count);
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Participant_SecondPrepareWhileFirstPrepared_ReturnsAborted()
+    {
+        // Phase B.1 simplification: at most one prepared tx per shard at a
+        // time. A racing second Prepare gets ABORT(busy); it's a clean retry
+        // signal for the coordinator.
+        var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var db = DocumentForgeDb.Create(path);
+            var shard = new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db);
+
+            var ops1 = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+            {
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"ONE"}""")),
+            };
+            var ops2 = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+            {
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"TWO"}""")),
+            };
+
+            Assert.Equal(PrepareVote.Prepared, shard.Prepare("tx-1", "A", ops1).Vote);
+
+            var second = shard.Prepare("tx-2", "A", ops2);
+            Assert.Equal(PrepareVote.Aborted, second.Vote);
+            Assert.Contains("already prepared", second.AbortReason);
+
+            // Resolve tx-1 to free the slot, then tx-2 should succeed.
+            shard.CommitPrepared("tx-1");
+            Assert.Equal(PrepareVote.Prepared, shard.Prepare("tx-2", "A", ops2).Vote);
+            shard.CommitPrepared("tx-2");
+
+            Assert.Equal(2, db.Execute("SELECT * FROM orders").Documents.Count);
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Participant_CommitUnknownTx_Throws()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var db = DocumentForgeDb.Create(path);
+            var shard = new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db);
+            // No prepared tx — this txId never existed.
+            Assert.ThrowsAny<Exception>(() => shard.CommitPrepared("ghost-tx"));
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Participant_PreparedTxLog_PersistsAcrossClose()
+    {
+        // Place a prepared record and dispose without resolving. The log
+        // file must contain it on reopen (Phase C reads this for recovery).
+        var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using (var db = DocumentForgeDb.Create(path))
+            {
+                var shard = new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db);
+                var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+                {
+                    DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                        DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"ORPHAN"}""")),
+                };
+                Assert.Equal(PrepareVote.Prepared, shard.Prepare("tx-orphan", "A", ops).Vote);
+                // Dispose without committing or rolling back — simulates a
+                // process exit while a tx was PREPARED.
+            }
+
+            // The prepared.log file exists and is non-empty.
+            var logPath = path + ".prepared.log";
+            Assert.True(File.Exists(logPath));
+            Assert.True(new FileInfo(logPath).Length > 0);
+
+            // Reopening doesn't auto-recover (that's Phase C), but the log
+            // file is still there for the next phase to pick up.
+            using var db2 = DocumentForgeDb.Open(path);
+            Assert.Empty(db2.Execute("SELECT * FROM orders").Documents);
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
     // --- Index catalog: multi-page support (issue #22) ---
 
     [Fact]
