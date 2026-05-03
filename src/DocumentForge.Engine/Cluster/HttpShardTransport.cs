@@ -190,6 +190,50 @@ public sealed class HttpShardTransport : IShardTransport
         throw new DocumentForgeException($"[{ShardName}] {opName} failed: HTTP {(int)response.StatusCode}: {body}");
     }
 
+    // --- Operator endpoints (Phase E.2) ---
+    // Not on IShardTransport — these are administrative, not routing.
+    // Available on the concrete HttpShardTransport for ergonomics; the
+    // C# API has equivalents on DocumentForgeDb directly.
+
+    /// <summary>
+    /// Operator-driven manual abort. For the rare case where a participant
+    /// is stuck PREPARED past the timeout and an operator wants to free
+    /// the lock manually. The server refuses (409 Conflict) if this shard
+    /// recorded COMMIT_DECISION for the tx — aborting after a decision
+    /// would make the cluster inconsistent.
+    /// </summary>
+    public void OperatorAbort(string txId)
+    {
+        var response = _client.PostAsync($"/tx/{txId}/abort", null).GetAwaiter().GetResult();
+        if (response.StatusCode == System.Net.HttpStatusCode.Conflict)
+        {
+            var body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            throw new DocumentForgeException($"[{ShardName}] OperatorAbort refused: {body}");
+        }
+        ThrowIfNotSuccess(response, nameof(OperatorAbort));
+    }
+
+    /// <summary>Operator-facing snapshot of participant-side 2PC counters.</summary>
+    public PreparedTxStats GetStats()
+    {
+        var response = _client.GetAsync("/tx/stats").GetAwaiter().GetResult();
+        var body = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+        if (!response.IsSuccessStatusCode)
+            throw new DocumentForgeException($"[{ShardName}] GetStats failed: HTTP {(int)response.StatusCode}: {body}");
+        using var json = JsonDocument.Parse(body);
+        var root = json.RootElement;
+        long Read(string name) => root.TryGetProperty(name, out var p) && p.ValueKind == JsonValueKind.Number ? p.GetInt64() : 0;
+        return new PreparedTxStats
+        {
+            PrepareTotal = Read("prepareTotal"),
+            PrepareAbortedTotal = Read("prepareAbortedTotal"),
+            CommittedTotal = Read("committedTotal"),
+            RolledBackTotal = Read("rolledBackTotal"),
+            TimedOutTotal = Read("timedOutTotal"),
+            InFlightPrepared = Read("inFlightPrepared")
+        };
+    }
+
     public DatabaseStatistics GetStatistics()
     {
         var response = _client.GetAsync("/stats").GetAwaiter().GetResult();
