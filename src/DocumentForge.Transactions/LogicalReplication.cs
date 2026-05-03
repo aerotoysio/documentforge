@@ -18,6 +18,29 @@ public enum LogicalOpType : byte
     /// observe a partial mid-tx state.
     /// </summary>
     TxBatch = 0x05,
+
+    /// <summary>
+    /// Start of a full-database snapshot transfer (issue #20). Sent by the
+    /// leader when a follower handshakes at seq 0 — or at any seq before the
+    /// OpLog's oldest entry — so the follower can bootstrap without a manual
+    /// scp. Data payload: [TotalSize:8][SnapshotSeq:8].
+    /// </summary>
+    SnapshotStart = 0x10,
+
+    /// <summary>
+    /// One chunk of snapshot data. Multiple of these follow a SnapshotStart
+    /// in order; the follower writes them sequentially to a temp file.
+    /// Data payload: raw bytes.
+    /// </summary>
+    SnapshotChunk = 0x11,
+
+    /// <summary>
+    /// End of snapshot transfer. The follower writes a marker so its next
+    /// Open integrates the snapshot in place of the existing data file.
+    /// Data payload: empty.
+    /// </summary>
+    SnapshotEnd = 0x12,
+
     Heartbeat = 0xFE,
     Handshake = 0xFF,
 }
@@ -232,6 +255,22 @@ public sealed class LogicalReplicationServer : IDisposable
         public required ulong HandshakeSeq { get; init; }
     }
 
+    /// <summary>
+    /// Optional snapshot provider — invoked when a follower handshakes with
+    /// a seq the OpLog can't catch up from. The provider takes a consistent
+    /// snapshot of the engine's data file and returns its path + the seq
+    /// at which the snapshot was taken. The server streams the file as
+    /// chunked SnapshotStart/Chunk/End messages, then resumes catch-up from
+    /// snapshotSeq+1. Issue #20.
+    ///
+    /// <para>
+    /// Returns null when no provider is wired — the server falls back to the
+    /// pre-#20 behaviour (logs a warning, sends nothing, leaves the follower
+    /// to manually scp the file).
+    /// </para>
+    /// </summary>
+    public Func<(string TempPath, ulong SnapshotSeq)>? SnapshotProvider { get; set; }
+
     public LogicalReplicationServer(int port, int opLogCapacity = 10_000, string? secret = null)
     {
         Port = port;
@@ -342,20 +381,54 @@ public sealed class LogicalReplicationServer : IDisposable
                 }
             }
 
-            // Figure out what we need to catchup
+            // Figure out what we need to catchup. If the OpLog can't help
+            // (follower seq < oldest buffered, or follower is at seq 0 and
+            // we have a snapshot provider — covers the case where the
+            // leader had data BEFORE the replication server started, so
+            // the OpLog never saw it), try a full snapshot transfer
+            // (issue #20).
             var catchupOps = OpLog.GetOpsAfter(followerLastSeq);
-            if (catchupOps is null)
+            ulong streamFromSeq = followerLastSeq;
+            bool needSnapshot = catchupOps is null
+                || (followerLastSeq == 0 && SnapshotProvider is not null);
+            if (needSnapshot)
             {
-                // Follower is too far behind - we can't catchup from buffer.
-                // For MVP, send a marker and let the follower decide what to do.
-                // A full snapshot would go here in a more complete system.
-                Console.WriteLine($"[LogicalRep] Follower at seq {followerLastSeq} is too far behind " +
-                                  $"(oldest buffered: {OpLog.OldestSeq}). Sending empty stream - follower should reset.");
-                catchupOps = new List<LogicalOp>();
+                if (SnapshotProvider is not null)
+                {
+                    Console.WriteLine($"[LogicalRep] Follower at seq {followerLastSeq} is too far behind " +
+                                      $"(oldest buffered: {OpLog.OldestSeq}). Streaming snapshot.");
+                    var (snapPath, snapSeq) = SnapshotProvider();
+                    try
+                    {
+                        StreamSnapshotToFollower(stream, snapPath, snapSeq);
+                        streamFromSeq = snapSeq;
+                        // After the snapshot, refetch catchup from snapshotSeq.
+                        // Anything written on the leader during the snapshot
+                        // copy is in the OpLog and gets streamed next.
+                        catchupOps = OpLog.GetOpsAfter(snapSeq) ?? new List<LogicalOp>();
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[LogicalRep] Snapshot stream failed: {ex.Message}. Dropping follower.");
+                        client.Close();
+                        return;
+                    }
+                    finally
+                    {
+                        try { File.Delete(snapPath); } catch { /* best effort cleanup */ }
+                    }
+                }
+                else
+                {
+                    Console.WriteLine($"[LogicalRep] Follower at seq {followerLastSeq} is too far behind " +
+                                      $"(oldest buffered: {OpLog.OldestSeq}) and no snapshot provider wired. " +
+                                      "Sending empty stream — follower must reset manually.");
+                    catchupOps = new List<LogicalOp>();
+                }
             }
 
-            Console.WriteLine($"[LogicalRep] Follower connected at seq {followerLastSeq}, " +
-                              $"replaying {catchupOps.Count} ops to reach current seq {OpLog.NewestSeq}");
+            Console.WriteLine($"[LogicalRep] Follower connected (seq {streamFromSeq} → {OpLog.NewestSeq}), " +
+                              $"replaying {catchupOps.Count} ops");
 
             // Send catchup ops first
             foreach (var op in catchupOps)
@@ -415,6 +488,38 @@ public sealed class LogicalReplicationServer : IDisposable
         int diff = 0;
         for (int i = 0; i < a.Length; i++) diff |= a[i] ^ b[i];
         return diff == 0;
+    }
+
+    /// <summary>
+    /// Stream a snapshot file to one specific follower as SnapshotStart →
+    /// SnapshotChunk* → SnapshotEnd. Synchronous because we hold the write
+    /// path in HandleFollowerHandshakeAsync — keeping the I/O sync there
+    /// keeps the per-follower state machine readable.
+    /// </summary>
+    private static void StreamSnapshotToFollower(NetworkStream stream, string snapshotPath, ulong snapshotSeq)
+    {
+        var fi = new FileInfo(snapshotPath);
+        var startPayload = new byte[16];
+        BitConverter.TryWriteBytes(startPayload.AsSpan(0, 8), (long)fi.Length);
+        BitConverter.TryWriteBytes(startPayload.AsSpan(8, 8), snapshotSeq);
+        stream.Write(BuildRecord(new LogicalOp(snapshotSeq, LogicalOpType.SnapshotStart, "", startPayload)));
+
+        // 64 KB chunks: matches the OS pagecache read-ahead unit and keeps
+        // per-record overhead reasonable. Each chunk is one LogicalOp.
+        const int ChunkSize = 64 * 1024;
+        var buffer = new byte[ChunkSize];
+        using (var fs = new FileStream(snapshotPath, FileMode.Open, FileAccess.Read, FileShare.Read))
+        {
+            int read;
+            while ((read = fs.Read(buffer, 0, ChunkSize)) > 0)
+            {
+                var chunk = new byte[read];
+                Array.Copy(buffer, chunk, read);
+                stream.Write(BuildRecord(new LogicalOp(snapshotSeq, LogicalOpType.SnapshotChunk, "", chunk)));
+            }
+        }
+
+        stream.Write(BuildRecord(new LogicalOp(snapshotSeq, LogicalOpType.SnapshotEnd, "", Array.Empty<byte>())));
     }
 
     private static byte[] BuildRecord(LogicalOp op)
@@ -477,6 +582,24 @@ public sealed class LogicalReplicationFollower : IDisposable
 
     /// <summary>The leader this follower is configured to read from, as <c>"host:port"</c>.</summary>
     public string LeaderEndpoint => $"{_host}:{_port}";
+
+    /// <summary>Path the follower writes a snapshot to during a transfer
+    /// (issue #20). When non-null and a SnapshotEnd arrives, the follower
+    /// writes a sibling marker file (<c>{path}.seq</c>) holding the snapshot
+    /// seq so the next Open of the data file can integrate it.</summary>
+    public string? SnapshotTempPath { get; init; }
+
+    /// <summary>Fired after SnapshotEnd, with the temp path holding the
+    /// received snapshot bytes and the seq it represents. Subscribers
+    /// (e.g. the engine) can use this to atomically swap the data file
+    /// in-process. If unset, the snapshot just lands at SnapshotTempPath
+    /// and the next Open integrates via the marker.</summary>
+    public Action<string, ulong>? OnSnapshotReceived { get; set; }
+
+    // In-flight snapshot reception state. Only valid between SnapshotStart
+    // and SnapshotEnd; reset on End or on disconnect mid-transfer.
+    private FileStream? _snapshotWriter;
+    private ulong _snapshotInFlightSeq;
 
     public LogicalReplicationFollower(string host, int port, string seqFilePath, Action<LogicalOp> apply, string? secret = null)
     {
@@ -565,6 +688,17 @@ public sealed class LogicalReplicationFollower : IDisposable
                 if (opType == LogicalOpType.Heartbeat)
                     continue; // just keeps the connection alive
 
+                // Snapshot transfer (#20). Intercept before the apply
+                // callback so the engine doesn't try to interpret these
+                // as user ops. Snapshot transfer pauses normal seq
+                // tracking; the SnapshotEnd handler resumes it at the
+                // snapshot's seq.
+                if (opType is LogicalOpType.SnapshotStart or LogicalOpType.SnapshotChunk or LogicalOpType.SnapshotEnd)
+                {
+                    HandleSnapshotOp(opType, data);
+                    continue;
+                }
+
                 // Gap detection
                 if (seq != _lastAppliedSeq + 1 && _lastAppliedSeq != 0)
                 {
@@ -583,6 +717,68 @@ public sealed class LogicalReplicationFollower : IDisposable
         }
         catch (OperationCanceledException) { }
         catch (Exception ex) { Console.WriteLine($"[LogicalRep] Follower stream error: {ex.Message}"); }
+    }
+
+    private void HandleSnapshotOp(LogicalOpType opType, byte[] data)
+    {
+        if (SnapshotTempPath is null)
+        {
+            // No snapshot path configured — drop the bytes. The follower's
+            // operator hasn't opted in to snapshot transfer, so the only
+            // sensible behaviour is to log + ignore. Catch-up via OpLog
+            // catches up the rest if reachable.
+            if (opType == LogicalOpType.SnapshotStart)
+                Console.WriteLine("[LogicalRep] Snapshot offered by leader but no SnapshotTempPath configured — dropping.");
+            return;
+        }
+
+        switch (opType)
+        {
+            case LogicalOpType.SnapshotStart:
+                {
+                    // Payload: [TotalSize:8][SnapshotSeq:8]. We don't actually
+                    // need TotalSize for streaming, but log it for diagnostics.
+                    long totalSize = BitConverter.ToInt64(data, 0);
+                    _snapshotInFlightSeq = BitConverter.ToUInt64(data, 8);
+                    Console.WriteLine($"[LogicalRep] Snapshot transfer started: {totalSize} bytes @ seq {_snapshotInFlightSeq}");
+                    // Truncate any stale half-snapshot from a prior failed transfer.
+                    _snapshotWriter?.Dispose();
+                    _snapshotWriter = new FileStream(SnapshotTempPath, FileMode.Create, FileAccess.Write, FileShare.None);
+                    break;
+                }
+            case LogicalOpType.SnapshotChunk:
+                _snapshotWriter?.Write(data, 0, data.Length);
+                break;
+            case LogicalOpType.SnapshotEnd:
+                {
+                    if (_snapshotWriter is null)
+                    {
+                        Console.WriteLine("[LogicalRep] SnapshotEnd received without prior Start — ignoring.");
+                        return;
+                    }
+                    _snapshotWriter.Flush(true);
+                    _snapshotWriter.Dispose();
+                    _snapshotWriter = null;
+                    Console.WriteLine($"[LogicalRep] Snapshot received at {SnapshotTempPath} (seq {_snapshotInFlightSeq})");
+
+                    // Drop a marker so the next Open of the data file
+                    // integrates the snapshot. The marker's content is the
+                    // 8-byte snapshot seq.
+                    var markerPath = SnapshotTempPath + ".seq";
+                    try { File.WriteAllBytes(markerPath, BitConverter.GetBytes(_snapshotInFlightSeq)); }
+                    catch (Exception ex) { Console.WriteLine($"[LogicalRep] Failed to write snapshot seq marker: {ex.Message}"); }
+
+                    // Update our in-memory seq + persisted seq. Subsequent
+                    // ops on the wire are assumed to be from snapshotSeq+1.
+                    _lastAppliedSeq = _snapshotInFlightSeq;
+                    SaveSeq(_snapshotInFlightSeq);
+
+                    // Optional in-process hook (e.g. engine integrating live).
+                    try { OnSnapshotReceived?.Invoke(SnapshotTempPath, _snapshotInFlightSeq); }
+                    catch (Exception ex) { Console.WriteLine($"[LogicalRep] OnSnapshotReceived handler threw: {ex.Message}"); }
+                    break;
+                }
+        }
     }
 
     private static async Task<bool> ReadExactAsync(NetworkStream stream, byte[] buffer, CancellationToken ct)
