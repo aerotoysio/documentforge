@@ -86,6 +86,42 @@ public sealed class CountStatement : Statement
     public Expression? Where { get; set; }
 }
 
+// --- Value expressions (right-hand side of comparisons, UPDATE SET, etc.) ---
+//
+// Used to be represented inline as `object? Value + TokenType ValueType`; the
+// abstraction makes room for scalar function calls (`NEWID()`, `LOWER(email)`)
+// and document-relative paths without re-typing every call site. Existing
+// callers store one of these in the legacy Value field and the evaluator
+// switches on the concrete type.
+public abstract class ValueExpression { }
+
+/// <summary>A SQL literal: string, number, true/false, null.</summary>
+public sealed class LiteralValueExpression : ValueExpression
+{
+    public object? Value { get; init; }
+    public TokenType ValueType { get; init; }
+}
+
+/// <summary>
+/// A document-relative path (e.g. <c>email</c>, <c>passenger.lastName</c>).
+/// Resolved against the current row by the evaluator.
+/// </summary>
+public sealed class PathValueExpression : ValueExpression
+{
+    public string Path { get; init; } = "";
+}
+
+/// <summary>
+/// A scalar function call: <c>NEWID()</c>, <c>GETDATE()</c>, <c>LOWER(email)</c>,
+/// <c>COALESCE(nickname, name)</c>. Args can themselves be values, paths, or
+/// nested function calls — composition is just recursive evaluation.
+/// </summary>
+public sealed class FunctionCallValueExpression : ValueExpression
+{
+    public string Name { get; init; } = "";
+    public List<ValueExpression> Args { get; init; } = new();
+}
+
 // --- Expressions (WHERE clause) ---
 public abstract class Expression { }
 
@@ -95,6 +131,16 @@ public sealed class ComparisonExpression : Expression
     public TokenType Operator { get; set; }
     public object? Value { get; set; }
     public TokenType ValueType { get; set; }
+
+    /// <summary>
+    /// When non-null, the comparison's LHS is computed from this expression
+    /// against the current row instead of via <see cref="JsonPath"/>. Used for
+    /// `WHERE LOWER(email) = 'alice'` and similar function-on-LHS shapes.
+    /// JsonPath stays empty (or holds the underlying path of a single
+    /// PathValueExpression) — index probes that need a literal field name
+    /// fall back to a collection scan when this is set.
+    /// </summary>
+    public ValueExpression? LhsExpression { get; set; }
 }
 
 public sealed class LogicalExpression : Expression

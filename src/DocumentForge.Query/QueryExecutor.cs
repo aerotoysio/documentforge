@@ -657,6 +657,16 @@ public sealed class QueryExecutor
 
     private BsonValue ConvertToSearchValue(object? value, TokenType type)
     {
+        // ValueExpression case: a function call (NEWID(), GETDATE()) or a path
+        // captured in a value position. Evaluate against no document — the
+        // index-probe call sites have no row context, so a path-in-value here
+        // would throw. That's intentional; an indexed lookup of `WHERE x = y.z`
+        // is ambiguous (which row's `y.z`?) and the user wants either a literal,
+        // a constant function, or a row-scoped UPDATE SET (which goes through
+        // the ConvertToSearchValueFor variant below).
+        if (type == TokenType.ValueExpression && value is ValueExpression vexpr)
+            return ValueEvaluator.Evaluate(vexpr, docContext: null);
+
         return type switch
         {
             TokenType.StringLiteral => BsonValue.FromString((string)value!),
@@ -668,6 +678,18 @@ public sealed class QueryExecutor
             TokenType.Null => BsonValue.Null,
             _ => BsonValue.Null
         };
+    }
+
+    /// <summary>
+    /// Row-scoped variant of <see cref="ConvertToSearchValue"/>. Used by UPDATE
+    /// SET so <c>UPDATE users SET name = LOWER(name)</c> can resolve the path
+    /// argument against the row being updated.
+    /// </summary>
+    private BsonValue ConvertToSearchValueFor(object? value, TokenType type, BsonDocument doc)
+    {
+        if (type == TokenType.ValueExpression && value is ValueExpression vexpr)
+            return ValueEvaluator.Evaluate(vexpr, docContext: doc);
+        return ConvertToSearchValue(value, type);
     }
 
     private QueryResult ExecuteInsert(InsertStatement stmt)
@@ -699,7 +721,10 @@ public sealed class QueryExecutor
             var newDoc = CloneDocument(oldDoc);
             foreach (var clause in stmt.SetClauses)
             {
-                var val = ConvertToSearchValue(clause.Value, clause.ValueType);
+                // Pass the OLD doc as the path-resolution context so
+                // `SET name = LOWER(name)` reads the pre-update value, not
+                // the half-built newDoc.
+                var val = ConvertToSearchValueFor(clause.Value, clause.ValueType, oldDoc);
                 SetNestedValue(newDoc, clause.Path, val);
             }
             if (collection.Update(id, newDoc))

@@ -22,11 +22,26 @@ public static class ExpressionEvaluator
 
     private static bool EvaluateComparison(ComparisonExpression expr, BsonDocument doc)
     {
-        var docValue = JsonPathExtractor.Extract(doc, expr.JsonPath);
+        // LHS resolution: a function-call LHS (`WHERE LOWER(email) = ...`) is
+        // evaluated against the current row instead of pulled from a path.
+        // The path-LHS case stays the historical fast path so existing queries
+        // hit zero overhead.
+        BsonValue docValue = expr.LhsExpression is not null
+            ? ValueEvaluator.Evaluate(expr.LhsExpression, doc)
+            : JsonPathExtractor.Extract(doc, expr.JsonPath);
+
+        // Function-call (or path-in-value-position, or any other ValueExpression)
+        // RHS: evaluate against the current row, then compare on BsonValue
+        // semantics. The legacy primitive-literal path stays untouched below.
+        if (expr.ValueType == TokenType.ValueExpression && expr.Value is ValueExpression vexpr)
+        {
+            var rhs = ValueEvaluator.Evaluate(vexpr, doc);
+            return CompareBsonValues(docValue, rhs, expr.Operator);
+        }
+
         if (docValue.IsNull && expr.Value is not null)
             return false;
 
-        var compareValue = ConvertToComparable(expr.Value, expr.ValueType);
         int cmp;
 
         if (expr.Operator == TokenType.Like)
@@ -70,6 +85,34 @@ public static class ExpressionEvaluator
             TokenType.GreaterThanOrEqual => cmp >= 0,
             TokenType.LessThanOrEqual => cmp <= 0,
             _ => false
+        };
+    }
+
+    /// <summary>
+    /// Compare two already-evaluated <see cref="BsonValue"/>s using the
+    /// engine's CompareTo semantics (Null &lt; Bool &lt; Number &lt; String &lt; DateTime).
+    /// Used by the ValueExpression-RHS path where we know both sides as BsonValue
+    /// up front; the legacy literal-RHS path threads CLR-typed object through
+    /// the type-aware switch above and stays as-is to preserve its quirks.
+    /// </summary>
+    private static bool CompareBsonValues(BsonValue lhs, BsonValue rhs, TokenType op)
+    {
+        // SQL semantics: any comparison with NULL is false (not "null", just
+        // false) — matches what the legacy path returns when docValue.IsNull
+        // and expr.Value is non-null.
+        if (lhs.IsNull || rhs.IsNull) return false;
+
+        int cmp = lhs.CompareTo(rhs);
+        return op switch
+        {
+            TokenType.Equals => cmp == 0,
+            TokenType.NotEquals => cmp != 0,
+            TokenType.GreaterThan => cmp > 0,
+            TokenType.LessThan => cmp < 0,
+            TokenType.GreaterThanOrEqual => cmp >= 0,
+            TokenType.LessThanOrEqual => cmp <= 0,
+            TokenType.Like => lhs.Type == BsonType.String && EvaluateLike(lhs, rhs.ToString()),
+            _ => false,
         };
     }
 
