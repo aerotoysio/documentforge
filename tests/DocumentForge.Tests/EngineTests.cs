@@ -3,6 +3,7 @@ using DocumentForge.Core;
 using DocumentForge.Document;
 using DocumentForge.Engine;
 using DocumentForge.Index;
+using DocumentForge.Transactions;
 
 namespace DocumentForge.Tests;
 
@@ -2090,6 +2091,268 @@ public class EngineTests : IDisposable
 
         Assert.True(result.Success);
         Assert.Equal(2, result.Documents.Count);
+    }
+
+    // --- Multi-document transactions (Phase 1: single-node) ---
+
+    [Fact]
+    public void Tx_Insert_Commit_AppliesAllStagedDocs()
+    {
+        using (var tx = _db.BeginTransaction())
+        {
+            tx.Insert("orders", """{"pnr":"ABC","seat":"12A"}""");
+            tx.Insert("orders", """{"pnr":"DEF","seat":"14B"}""");
+            tx.Commit();
+        }
+
+        var rows = _db.Execute("SELECT * FROM orders").Documents;
+        Assert.Equal(2, rows.Count);
+    }
+
+    [Fact]
+    public void Tx_Insert_Rollback_DiscardsStagedDocs()
+    {
+        using (var tx = _db.BeginTransaction())
+        {
+            tx.Insert("orders", """{"pnr":"ABC"}""");
+            tx.Rollback();
+        }
+
+        Assert.Empty(_db.Execute("SELECT * FROM orders").Documents);
+    }
+
+    [Fact]
+    public void Tx_DisposeWithoutCommit_RollsBack()
+    {
+        // The natural shape — `using var tx = ...; ...; tx.Commit();` — must
+        // be safe under exceptions. If something throws between BeginTx and
+        // Commit, dispose has to discard the staged work.
+        using (var tx = _db.BeginTransaction())
+        {
+            tx.Insert("orders", """{"pnr":"ABC"}""");
+            // no Commit
+        }
+
+        Assert.Empty(_db.Execute("SELECT * FROM orders").Documents);
+    }
+
+    [Fact]
+    public void Tx_Reads_ReadYourWrites_StagedInsertVisibleViaTxFind()
+    {
+        using var tx = _db.BeginTransaction();
+        var id = tx.Insert("orders", """{"pnr":"XYZ"}""");
+
+        var seen = tx.Find("orders", id);
+        Assert.NotNull(seen);
+        Assert.Equal("XYZ", seen!["pnr"].AsString);
+
+        // Outside the txn the doc is invisible until commit.
+        Assert.Empty(_db.Execute("SELECT * FROM orders").Documents);
+    }
+
+    [Fact]
+    public void Tx_OutsideReader_DoesNotSeeUncommittedWrites()
+    {
+        _db.Insert("orders", """{"pnr":"BASE"}""");
+
+        using var tx = _db.BeginTransaction();
+        tx.Insert("orders", """{"pnr":"PENDING"}""");
+
+        var rows = _db.Execute("SELECT * FROM orders").Documents;
+        Assert.Single(rows);
+        Assert.Equal("BASE", rows[0]["pnr"].AsString);
+    }
+
+    [Fact]
+    public void Tx_DeleteThenInsertSameUniqueKey_CommitsAtomically()
+    {
+        // Issue #11's auth-service upsert pattern — the whole reason for
+        // multi-doc transactions. Pre-Phase-1 callers had to delete then insert
+        // as separate REST calls, leaving a window where the row didn't exist.
+        // Inside one txn, the unique-index validator considers the pending
+        // delete when checking the pending insert, so the same business key
+        // round-trips cleanly.
+        _db.Insert("users", """{"email":"a@b.com","v":1}""");
+        _db.CreateIndex("users", "email", "idx_users_email", unique: true);
+
+        using (var tx = _db.BeginTransaction())
+        {
+            tx.DeleteByField("users", "email", "a@b.com");
+            tx.Insert("users", """{"email":"a@b.com","v":2}""");
+            tx.Commit();
+        }
+
+        var rows = _db.Execute("SELECT * FROM users WHERE email = 'a@b.com'").Documents;
+        Assert.Single(rows);
+        Assert.Equal(2, rows[0]["v"].AsInt32);
+    }
+
+    [Fact]
+    public void Tx_Commit_UniqueIndexConflict_ThrowsAndPersistsNothing()
+    {
+        _db.Insert("users", """{"email":"a@b.com","v":1}""");
+        _db.CreateIndex("users", "email", "idx_users_email", unique: true);
+
+        var tx = _db.BeginTransaction();
+        tx.Insert("users", """{"email":"new@x.com","v":2}""");
+        // Conflict: another doc with email=a@b.com already exists.
+        tx.Insert("users", """{"email":"a@b.com","v":99}""");
+
+        Assert.Throws<DuplicateKeyException>(() => tx.Commit());
+        Assert.Equal(TransactionState.RolledBack, tx.State);
+
+        // The non-conflicting insert in the same txn must NOT have been
+        // applied either — atomicity, not best-effort.
+        var rows = _db.Execute("SELECT * FROM users").Documents;
+        Assert.Single(rows);
+        Assert.Equal(1, rows[0]["v"].AsInt32);
+    }
+
+    [Fact]
+    public void Tx_ConcurrentDuplicateInserts_DetectedWithinSameTx()
+    {
+        _db.Insert("users", """{"email":"seed@x.com"}""");
+        _db.CreateIndex("users", "email", "idx_users_email", unique: true);
+        _db.Execute("DELETE FROM users WHERE email = 'seed@x.com'");
+
+        using var tx = _db.BeginTransaction();
+        tx.Insert("users", """{"email":"dup@x.com","v":1}""");
+        tx.Insert("users", """{"email":"dup@x.com","v":2}""");
+
+        // Both inserts collide within the same txn — neither was visible to
+        // ValidateUniqueInsert at staging time, but the simulated post-commit
+        // index sees the conflict.
+        Assert.Throws<DuplicateKeyException>(() => tx.Commit());
+        Assert.Empty(_db.Execute("SELECT * FROM users").Documents);
+    }
+
+    [Fact]
+    public void Tx_MultiCollection_CommitsAllAtomically()
+    {
+        // The motivating case: "transfer money" — two writes across two
+        // collections that must succeed together. Phase 1 makes this
+        // expressible without a custom locking dance.
+        _db.Insert("accounts", """{"id":"A","balance":100}""");
+        _db.Insert("accounts", """{"id":"B","balance":50}""");
+        _db.CreateIndex("accounts", "id", "idx_accounts_id", unique: true);
+
+        var fromId = _db.Execute("SELECT * FROM accounts WHERE id = 'A'").Documents[0].GetId();
+        var toId   = _db.Execute("SELECT * FROM accounts WHERE id = 'B'").Documents[0].GetId();
+
+        using (var tx = _db.BeginTransaction())
+        {
+            tx.Replace("accounts", fromId, """{"id":"A","balance":75}""");
+            tx.Replace("accounts", toId,   """{"id":"B","balance":75}""");
+            tx.Insert("ledger", $$"""{"from":"A","to":"B","amount":25}""");
+            tx.Commit();
+        }
+
+        var a = _db.Execute("SELECT * FROM accounts WHERE id = 'A'").Documents[0]["balance"].AsInt32;
+        var b = _db.Execute("SELECT * FROM accounts WHERE id = 'B'").Documents[0]["balance"].AsInt32;
+        var ledger = _db.Execute("SELECT * FROM ledger").Documents;
+
+        Assert.Equal(75, a);
+        Assert.Equal(75, b);
+        Assert.Single(ledger);
+    }
+
+    [Fact]
+    public void Tx_Replace_ThenDelete_NetEffectIsDelete()
+    {
+        var id = _db.Insert("orders", """{"pnr":"ABC","seat":"12A"}""");
+
+        using (var tx = _db.BeginTransaction())
+        {
+            tx.Replace("orders", id, """{"pnr":"ABC","seat":"99Z"}""");
+            tx.Delete("orders", id);
+            tx.Commit();
+        }
+
+        Assert.Empty(_db.Execute("SELECT * FROM orders").Documents);
+    }
+
+    [Fact]
+    public void Tx_DeleteByField_DropsSameTxStagedInsertsToo()
+    {
+        // A pending insert plus a DeleteByField for the same value should
+        // cancel — not commit the insert and then "delete" something that
+        // never made it to disk.
+        _db.Insert("users", """{"email":"existing@x.com"}""");
+
+        using (var tx = _db.BeginTransaction())
+        {
+            tx.Insert("users", """{"email":"pending@x.com"}""");
+            int n = tx.DeleteByField("users", "email", "pending@x.com");
+            Assert.Equal(1, n);
+            tx.Commit();
+        }
+
+        var rows = _db.Execute("SELECT * FROM users").Documents;
+        Assert.Single(rows);
+        Assert.Equal("existing@x.com", rows[0]["email"].AsString);
+    }
+
+    [Fact]
+    public void Tx_OperationAfterCommit_Throws()
+    {
+        var tx = _db.BeginTransaction();
+        tx.Commit();
+        Assert.Throws<TransactionException>(() => tx.Insert("orders", """{"x":1}"""));
+    }
+
+    [Fact]
+    public void Tx_DoubleCommit_Throws()
+    {
+        var tx = _db.BeginTransaction();
+        tx.Commit();
+        Assert.Throws<TransactionException>(() => tx.Commit());
+    }
+
+    [Fact]
+    public void Tx_EmptyCommit_IsNoOp()
+    {
+        using var tx = _db.BeginTransaction();
+        tx.Commit();
+        Assert.Equal(TransactionState.Committed, tx.State);
+        Assert.Equal(0, tx.StagedOperationCount);
+    }
+
+    [Fact]
+    public void Tx_ConcurrentReadersDuringStagingAreNotBlocked()
+    {
+        _db.Insert("orders", """{"pnr":"BASE"}""");
+
+        using var tx = _db.BeginTransaction();
+        tx.Insert("orders", """{"pnr":"PENDING"}""");
+
+        // Reads through the live db continue without blocking — the txn only
+        // takes the write lock briefly during commit, not for the full handle
+        // lifetime. (Smoke test rather than contention test; this just runs
+        // a read while the txn is open.)
+        var rows = _db.Execute("SELECT * FROM orders").Documents;
+        Assert.Single(rows);
+        Assert.Equal("BASE", rows[0]["pnr"].AsString);
+
+        tx.Commit();
+        Assert.Equal(2, _db.Execute("SELECT * FROM orders").Documents.Count);
+    }
+
+    [Fact]
+    public void Tx_RestartAfterCommit_StateIsPersisted()
+    {
+        // Multi-doc commits must outlive the process. Apply via tx, flush,
+        // dispose, reopen — the writes must still be there.
+        using (var tx = _db.BeginTransaction())
+        {
+            tx.Insert("orders", """{"pnr":"ABC"}""");
+            tx.Insert("orders", """{"pnr":"DEF"}""");
+            tx.Commit();
+        }
+        _db.Flush();
+        _db.Dispose();
+
+        using var db2 = DocumentForgeDb.Open(_dbPath);
+        Assert.Equal(2, db2.Execute("SELECT * FROM orders").Documents.Count);
     }
 
     // --- Index catalog: multi-page support (issue #22) ---
