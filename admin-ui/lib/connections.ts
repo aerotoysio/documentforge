@@ -10,6 +10,7 @@ export interface Connection {
   apiKey?: string;       // bearer token for /admin/* and authenticated routes
   color?: string;        // optional accent (used for status-bar / swarm-cards)
   tags?: string[];       // free-form labels: 'prod', 'shard-a', 'leader', 'staging'
+  shard?: string;        // groups connections in the Swarm topology view; nodes with the same value stack as one shard's leader+followers
   createdAt: string;     // ISO timestamp
 }
 
