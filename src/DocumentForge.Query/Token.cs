@@ -9,7 +9,7 @@ public enum TokenType
     OrderBy, Asc, Desc, Limit, Offset,
     Like, In, Between, Is,
     True, False, Null,
-    Count, Join,
+    Count, Join, Left, Right, Cross, Outer,
     Sum, Avg, Min, Max, Group, By,
     Distinct,
 

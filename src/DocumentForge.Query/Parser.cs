@@ -92,30 +92,80 @@ public sealed class Parser
         Expect(TokenType.From);
         stmt.Collection = ReadIdentifierPath();
 
-        // JOIN ... ON leftPath = rightPath
-        if (Current.Type == TokenType.Join)
+        // JOIN family. Recognised shapes (issue #17 Phase A):
+        //   JOIN t ON ...                   — INNER JOIN (default)
+        //   INNER JOIN t ON ...             — explicit INNER
+        //   LEFT [OUTER] JOIN t ON ...      — null-pad missing right rows
+        //   RIGHT [OUTER] JOIN t ON ...     — null-pad missing left rows
+        //   CROSS JOIN t                    — cartesian product, no ON clause
+        // Multi-join chaining (a JOIN b JOIN c) is Phase B; today we still
+        // allow only one JOIN. The parser exits cleanly after the first.
+        var joinType = JoinType.Inner;
+        bool hasJoin = false;
+        if (Current.Type == TokenType.Left)
         {
             _pos++;
+            if (Current.Type == TokenType.Outer) _pos++;
+            Expect(TokenType.Join);
+            joinType = JoinType.Left;
+            hasJoin = true;
+        }
+        else if (Current.Type == TokenType.Right)
+        {
+            _pos++;
+            if (Current.Type == TokenType.Outer) _pos++;
+            Expect(TokenType.Join);
+            joinType = JoinType.Right;
+            hasJoin = true;
+        }
+        else if (Current.Type == TokenType.Cross)
+        {
+            _pos++;
+            Expect(TokenType.Join);
+            joinType = JoinType.Cross;
+            hasJoin = true;
+        }
+        else if (Current.Type == TokenType.Join)
+        {
+            _pos++;
+            joinType = JoinType.Inner;
+            hasJoin = true;
+        }
+
+        if (hasJoin)
+        {
             var joinCollection = ReadIdentifierPath();
-            Expect(TokenType.On);
 
-            // Parse left side: must be prefixed with collection name (e.g., orders.flights[0].flightNumber)
-            var leftFullPath = ReadIdentifierPath();
-            Expect(TokenType.Equals);
-            var rightFullPath = ReadIdentifierPath();
-
-            // Split the prefix.path notation
-            var (leftColl, leftPath) = SplitCollectionPath(leftFullPath, stmt.Collection, joinCollection);
-            var (rightColl, rightPath) = SplitCollectionPath(rightFullPath, stmt.Collection, joinCollection);
-
-            stmt.Join = new JoinClause
+            if (joinType == JoinType.Cross)
             {
-                Collection = joinCollection,
-                LeftCollection = leftColl,
-                LeftPath = leftPath,
-                RightCollection = rightColl,
-                RightPath = rightPath
-            };
+                // CROSS JOIN takes no ON — the join condition is "everything".
+                // Path fields stay empty; the executor recognises the type
+                // and switches to the nested-loop cartesian path.
+                stmt.Join = new JoinClause
+                {
+                    Collection = joinCollection,
+                    Type = joinType,
+                };
+            }
+            else
+            {
+                Expect(TokenType.On);
+                var leftFullPath = ReadIdentifierPath();
+                Expect(TokenType.Equals);
+                var rightFullPath = ReadIdentifierPath();
+                var (leftColl, leftPath) = SplitCollectionPath(leftFullPath, stmt.Collection, joinCollection);
+                var (rightColl, rightPath) = SplitCollectionPath(rightFullPath, stmt.Collection, joinCollection);
+
+                stmt.Join = new JoinClause
+                {
+                    Collection = joinCollection,
+                    LeftCollection = leftColl,
+                    LeftPath = leftPath,
+                    RightCollection = rightColl,
+                    RightPath = rightPath,
+                    Type = joinType,
+                };
+            }
         }
 
         // WHERE
