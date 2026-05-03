@@ -3269,6 +3269,150 @@ public class EngineTests : IDisposable
         }
     }
 
+    // --- 2PC PREPARE timeout (issue #14, Phase D) ---
+    //
+    // Without timeouts, a coordinator that dies before broadcasting COMMIT
+    // would leave participants PREPARED with their write lock held until
+    // someone runs cluster.Recover() manually. Phase D adds a per-tx
+    // deadline: the participant's worker thread schedules a Task.Delay
+    // that, on expiry, posts a TimeoutCommand to its own queue and self-
+    // aborts (releases the lock, writes a RESOLVED-aborted record).
+    // A late CommitPrepared for that txId then throws.
+
+    [Fact]
+    public void Participant_PreparedTimeout_SelfAborts()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var db = DocumentForgeDb.Create(path);
+            var shard = new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db);
+
+            var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+            {
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"WILL-EXPIRE"}""")),
+            };
+
+            // 100ms timeout. Don't resolve — let the timer fire.
+            Assert.Equal(PrepareVote.Prepared,
+                shard.Prepare("tx-timeout", "A", ops, TimeSpan.FromMilliseconds(100)).Vote);
+
+            // Wait long enough for the timeout to fire and the abort to
+            // propagate through the worker queue.
+            Thread.Sleep(500);
+
+            // The abort should have released the write lock — a fresh
+            // PREPARE on a new tx must succeed.
+            var ops2 = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+            {
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"AFTER"}""")),
+            };
+            var second = shard.Prepare("tx-after-timeout", "A", ops2, TimeSpan.FromSeconds(30));
+            Assert.Equal(PrepareVote.Prepared, second.Vote);
+            shard.CommitPrepared("tx-after-timeout");
+
+            // The expired tx never landed.
+            Assert.Single(db.Execute("SELECT * FROM orders").Documents);
+            Assert.Empty(db.Execute("SELECT * FROM orders WHERE pnr = 'WILL-EXPIRE'").Documents);
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Participant_LateCommitAfterTimeout_Throws()
+    {
+        // Coordinator decided COMMIT and called CommitPrepared, but the
+        // participant's timeout had already fired. The late commit must
+        // fail — the participant already wrote RESOLVED-aborted to its
+        // log. (In a real cluster this would surface as a tx failure on
+        // the coordinator-side broadcast loop; the next Recover would
+        // then see no in-flight on this shard and confirm aborted.)
+        var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var db = DocumentForgeDb.Create(path);
+            var shard = new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db);
+
+            var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+            {
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"X"}""")),
+            };
+
+            Assert.Equal(PrepareVote.Prepared,
+                shard.Prepare("tx-late", "A", ops, TimeSpan.FromMilliseconds(100)).Vote);
+            Thread.Sleep(500);  // let the timeout fire and abort
+
+            Assert.ThrowsAny<Exception>(() => shard.CommitPrepared("tx-late"));
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Participant_FastResolveBeforeTimeout_NoAbort()
+    {
+        // Sanity: a timeout that's far enough out doesn't fire if
+        // we resolve quickly. The CTS cancellation should cleanly
+        // dispose the pending Task.Delay.
+        var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var db = DocumentForgeDb.Create(path);
+            var shard = new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db);
+
+            var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+            {
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"FAST"}""")),
+            };
+
+            Assert.Equal(PrepareVote.Prepared,
+                shard.Prepare("tx-fast", "A", ops, TimeSpan.FromSeconds(30)).Vote);
+            shard.CommitPrepared("tx-fast");
+
+            // Wait briefly to make sure no stale TimeoutCommand fires.
+            Thread.Sleep(200);
+
+            // Doc visible from the commit.
+            Assert.Single(db.Execute("SELECT * FROM orders").Documents);
+
+            // A second Prepare/Commit cycle should still work cleanly
+            // (no stale state from the first tx's timeout machinery).
+            var ops2 = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+            {
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"SECOND"}""")),
+            };
+            Assert.Equal(PrepareVote.Prepared,
+                shard.Prepare("tx-fast-2", "A", ops2, TimeSpan.FromSeconds(30)).Vote);
+            shard.CommitPrepared("tx-fast-2");
+            Assert.Equal(2, db.Execute("SELECT * FROM orders").Documents.Count);
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void ClusterTx_PrepareTimeout_PropertyHasReasonableDefault()
+    {
+        // The cluster exposes a configurable per-tx timeout. Default 30s,
+        // matching the issue's design decision.
+        using var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster();
+        Assert.Equal(TimeSpan.FromSeconds(30), cluster.PrepareTimeout);
+        cluster.PrepareTimeout = TimeSpan.FromSeconds(5);
+        Assert.Equal(TimeSpan.FromSeconds(5), cluster.PrepareTimeout);
+    }
+
     // --- Index catalog: multi-page support (issue #22) ---
 
     [Fact]

@@ -994,12 +994,21 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     /// <see cref="RollbackPreparedTransaction"/> arrives. Returns
     /// <see cref="PrepareVote.Prepared"/> on success or
     /// <see cref="PrepareVote.Aborted"/> with a reason on conflict.
+    ///
+    /// <para>
+    /// If <paramref name="timeout"/> elapses before the resolve arrives,
+    /// the participant self-aborts (Phase D). Default overload uses 30s.
+    /// </para>
     /// </summary>
-    public PrepareResult PrepareTransaction(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops)
+    public PrepareResult PrepareTransaction(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops, TimeSpan timeout)
     {
         ThrowIfReadOnly();
-        return EnsurePreparedTxCoordinator().Prepare(txId, coordinatorShardId, ops);
+        return EnsurePreparedTxCoordinator().Prepare(txId, coordinatorShardId, ops, timeout);
     }
+
+    /// <summary>Convenience: prepare with the default 30-second timeout.</summary>
+    public PrepareResult PrepareTransaction(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops) =>
+        PrepareTransaction(txId, coordinatorShardId, ops, TimeSpan.FromSeconds(30));
 
     /// <summary>Phase 2 commit: apply the prepared ops and release the lock.</summary>
     public void CommitPreparedTransaction(string txId)

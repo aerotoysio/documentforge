@@ -103,9 +103,12 @@ public sealed class HttpShardTransport : IShardTransport
         throw new NotSupportedException(
             $"[{ShardName}] HttpShardTransport.ExecuteTransaction is not implemented yet — cluster transactions over HTTP need a wire endpoint that hasn't shipped (issue #14).");
 
-    public PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops) =>
+    public PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops, TimeSpan timeout) =>
         throw new NotSupportedException(
             $"[{ShardName}] HttpShardTransport.Prepare is not implemented yet — cross-shard 2PC over HTTP needs a wire endpoint that hasn't shipped (issue #14).");
+
+    public PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops) =>
+        Prepare(txId, coordinatorShardId, ops, TimeSpan.FromSeconds(30));
 
     public void CommitPrepared(string txId) =>
         throw new NotSupportedException(

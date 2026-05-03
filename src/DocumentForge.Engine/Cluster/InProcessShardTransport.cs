@@ -64,8 +64,12 @@ public sealed class InProcessShardTransport : IShardTransport
         tx.Commit();
     }
 
+    public PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops, TimeSpan timeout) =>
+        _db.PrepareTransaction(txId, coordinatorShardId, ops, timeout);
+
+    /// <summary>Convenience: Prepare with the default 30-second timeout.</summary>
     public PrepareResult Prepare(string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops) =>
-        _db.PrepareTransaction(txId, coordinatorShardId, ops);
+        Prepare(txId, coordinatorShardId, ops, TimeSpan.FromSeconds(30));
 
     public void CommitPrepared(string txId) => _db.CommitPreparedTransaction(txId);
 
