@@ -146,6 +146,13 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         var lockHandle = DatabaseLock.Acquire(filePath, options.ForceUnlock);
         try
         {
+            // Issue #20: integrate a snapshot delivered by the replication
+            // follower path before the data file opens. The marker file
+            // (`.snapshot.incoming.seq`) is dropped after the snapshot bytes
+            // are durable; if it exists, swap the snapshot in place of the
+            // current data file. The data file goes away with whatever
+            // crashed-but-recoverable state it had — the snapshot supersedes.
+            IntegratePendingSnapshot(filePath);
             // CRASH RECOVERY: before opening the data file, check for an unfinished recovery log.
             // If it exists and has records, it means we crashed mid-flush.
             // Replay the log entries directly onto the data file to restore durability.
@@ -211,6 +218,45 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         {
             lockHandle.Dispose();
             throw;
+        }
+    }
+
+    /// <summary>
+    /// Issue #20: if the replication follower has dropped a snapshot in our
+    /// data directory and marked it ready (sibling <c>.seq</c> file), atomically
+    /// swap it over the live data file before Open proceeds. The recovery log,
+    /// WAL, and follower-seq are all reset because the snapshot represents a
+    /// consistent point-in-time that supersedes any prior in-flight writes.
+    /// </summary>
+    private static void IntegratePendingSnapshot(string filePath)
+    {
+        var snapshotPath = filePath + ".snapshot.incoming";
+        var markerPath = snapshotPath + ".seq";
+        if (!File.Exists(markerPath) || !File.Exists(snapshotPath)) return;
+
+        ulong snapshotSeq;
+        try { snapshotSeq = BitConverter.ToUInt64(File.ReadAllBytes(markerPath)); }
+        catch { return; /* corrupt marker — leave both files for operator inspection */ }
+
+        Console.WriteLine($"[DocumentForge] Integrating snapshot from {snapshotPath} at seq {snapshotSeq}");
+
+        // Move the snapshot over the live data file. File.Move with overwrite
+        // is a single rename on most filesystems — atomic vs concurrent
+        // readers (which we don't have at this stage of Open anyway). Then
+        // delete the recovery log + WAL since the snapshot subsumes them.
+        try
+        {
+            File.Move(snapshotPath, filePath, overwrite: true);
+            try { File.Delete(filePath + ".recovery"); } catch { }
+            try { File.Delete(filePath + ".wal"); } catch { }
+            // Persist the seq the snapshot represents into the follower-seq
+            // file so the next replication catchup picks up from there.
+            try { File.WriteAllBytes(filePath + ".followerseq", BitConverter.GetBytes(snapshotSeq)); } catch { }
+            File.Delete(markerPath);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[DocumentForge] Snapshot integration failed: {ex.Message}");
         }
     }
 
@@ -1260,6 +1306,29 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         if (_logicalServer is not null)
             throw new DocumentForgeException("Logical replication server already running.");
         _logicalServer = new LogicalReplicationServer(port, opLogCapacity: 10_000, secret: sharedSecret);
+        // Issue #20: provide a snapshot when a fresh follower needs to
+        // bootstrap. We reuse db.Snapshot from #27 — same atomic semantics
+        // (write lock, flush, copy). The snapshot path is a sibling of the
+        // data file and gets cleaned up by the leader after streaming.
+        _logicalServer.SnapshotProvider = () =>
+        {
+            var snapPath = Path.Combine(
+                Path.GetDirectoryName(FilePath) ?? ".",
+                $"{Path.GetFileName(FilePath)}.snapshot.{Guid.NewGuid():N}");
+            // Snapshot under the engine's write lock; capture CurrentSeq
+            // in the same lock window so the follower starts from a
+            // consistent (snapshot, seq) pair.
+            ulong seqAtSnapshot;
+            _transactionManager.AcquireWriteLock();
+            try
+            {
+                _pageCache.FlushAll();
+                File.Copy(FilePath, snapPath, overwrite: true);
+                seqAtSnapshot = _logicalServer?.CurrentSeq ?? 0;
+            }
+            finally { _transactionManager.ReleaseWriteLock(); }
+            return (snapPath, seqAtSnapshot);
+        };
         _logicalServer.Start();
     }
 
@@ -1289,10 +1358,20 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             throw new DocumentForgeException("Logical replication follower already running.");
 
         var seqFilePath = FilePath + ".followerseq";
+        var snapshotPath = FilePath + ".snapshot.incoming";
         _logicalFollower = new LogicalReplicationFollower(host, port, seqFilePath, op =>
         {
             ApplyFollowerOp(op);
-        }, secret: sharedSecret);
+        }, secret: sharedSecret)
+        {
+            // Issue #20: opt in to snapshot transfer. The leader streams a
+            // full data file when this follower can't catch up via the OpLog
+            // (fresh follower, or one that's been down longer than the buffer
+            // capacity). Bytes land at this path; the next Open of the data
+            // file integrates by detecting the sibling .snapshot.incoming.seq
+            // marker.
+            SnapshotTempPath = snapshotPath,
+        };
         _logicalFollower.Start();
     }
 

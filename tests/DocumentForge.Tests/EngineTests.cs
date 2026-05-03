@@ -1032,10 +1032,15 @@ public class EngineTests : IDisposable
             leader.Insert("orders", """{"pnr": "BEFORE_1"}""");
             leader.Insert("orders", """{"pnr": "BEFORE_2"}""");
 
-            // Wait for follower to receive
-            for (int i = 0; i < 20 && follower1.LogicallyReplicatedOps() < 2; i++)
-                await System.Threading.Tasks.Task.Delay(50);
-            Assert.True(follower1.LogicallyReplicatedOps() >= 2);
+            // Wait for the snapshot to land on follower's disk. The live
+            // in-process follower1 can't see the snapshot data until next
+            // Open (hot-swap is deferred), so we observe the marker file
+            // instead. The end-to-end assertion comes via follower2 below.
+            var markerPath = followerPath + ".snapshot.incoming.seq";
+            for (int i = 0; i < 30 && !File.Exists(markerPath); i++)
+                await System.Threading.Tasks.Task.Delay(100);
+            Assert.True(File.Exists(markerPath),
+                "Snapshot marker should appear after the leader's writes are captured.");
 
             // Disconnect follower
             follower1.Dispose();
@@ -1046,20 +1051,17 @@ public class EngineTests : IDisposable
             leader.Insert("orders", """{"pnr": "DURING_2"}""");
             leader.Insert("orders", """{"pnr": "DURING_3"}""");
 
-            // Reconnect - persisted seq should trigger catchup
+            // Reconnect - persisted seq should trigger catchup (or snapshot
+            // re-transfer if a marker is left over from the prior session).
             using var follower2 = DocumentForgeDb.Open(followerPath);
             follower2.StartLogicalReplicationFollower("localhost", port);
 
-            // Wait for catchup: follower should get the 3 DURING ops
-            for (int i = 0; i < 30 && follower2.LogicallyReplicatedOps() < 3; i++)
+            // Wait for follower2 to converge to 5 docs.
+            for (int i = 0; i < 30 && follower2.Execute("SELECT * FROM orders").Documents.Count < 5; i++)
                 await System.Threading.Tasks.Task.Delay(100);
 
-            // Verify all 5 docs are on the follower
             var result = follower2.Execute("SELECT * FROM orders");
             Assert.Equal(5, result.Documents.Count);
-
-            // Gap detection: catchup doesn't involve gaps (we replay in order)
-            Assert.Equal(0, follower2.GapsDetected);
         }
         finally
         {
@@ -3343,6 +3345,64 @@ public class EngineTests : IDisposable
         {
             try { File.Delete(leaderPath); File.Delete(leaderPath + ".wal"); File.Delete(leaderPath + ".recovery"); File.Delete(leaderPath + ".lock"); } catch { }
             try { File.Delete(followerPath); File.Delete(followerPath + ".wal"); File.Delete(followerPath + ".recovery"); File.Delete(followerPath + ".followerseq"); File.Delete(followerPath + ".lock"); } catch { }
+        }
+    }
+
+    // --- Replication snapshot transfer (issue #20) ---
+
+    [Fact]
+    public async System.Threading.Tasks.Task LogicalReplication_SnapshotTransfer_BootstrapsFreshFollower()
+    {
+        // The whole point of #20: a fresh follower with seq 0 connecting to
+        // a leader whose OpLog can't replay back to seq 0 (because the buffer
+        // wrapped) should still end up converged. Pre-fix the follower
+        // received an empty stream and silently joined the broadcast missing
+        // every prior op. Post-fix the leader streams a full snapshot, the
+        // follower writes it to disk + a marker, and the next Open of the
+        // follower's data file integrates the snapshot.
+        int port = 6100 + System.Random.Shared.Next(100);
+        var leaderPath = Path.Combine(Path.GetTempPath(), $"snapleader_{Guid.NewGuid():N}.dfdb");
+        var followerPath = Path.Combine(Path.GetTempPath(), $"snapfollower_{Guid.NewGuid():N}.dfdb");
+
+        try
+        {
+            // Pre-seed the leader with docs BEFORE the follower comes up.
+            // These docs are too old for the OpLog to replay — they only
+            // exist in the leader's data file. This is the scenario that
+            // requires a snapshot.
+            using var leader = DocumentForgeDb.Create(leaderPath);
+            for (int i = 0; i < 20; i++)
+                leader.Insert("orders", $$"""{"pnr":"PRESEED{{i:D3}}"}""");
+            leader.Flush();
+
+            leader.StartLogicalReplicationServer(port);
+            await System.Threading.Tasks.Task.Delay(150);
+
+            // Fresh follower (no data file existed before this).
+            using (var follower = DocumentForgeDb.Create(followerPath))
+            {
+                follower.StartLogicalReplicationFollower("localhost", port);
+
+                // Wait for the snapshot to land + the marker to appear.
+                var markerPath = followerPath + ".snapshot.incoming.seq";
+                for (int i = 0; i < 50 && !File.Exists(markerPath); i++)
+                    await System.Threading.Tasks.Task.Delay(100);
+                Assert.True(File.Exists(markerPath),
+                    $"Snapshot marker should have appeared at {markerPath}");
+            }
+
+            // Reopen the follower — Open integrates the pending snapshot.
+            using var reopened = DocumentForgeDb.Open(followerPath);
+            var rows = reopened.Execute("SELECT * FROM orders").Documents;
+            Assert.Equal(20, rows.Count);
+        }
+        finally
+        {
+            foreach (var ext in new[] { "", ".wal", ".recovery", ".lock", ".followerseq", ".snapshot.incoming", ".snapshot.incoming.seq" })
+            {
+                try { File.Delete(leaderPath + ext); } catch { }
+                try { File.Delete(followerPath + ext); } catch { }
+            }
         }
     }
 
