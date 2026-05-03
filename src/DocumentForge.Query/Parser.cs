@@ -301,11 +301,31 @@ public sealed class Parser
 
     private Expression ParseComparison()
     {
-        var path = ReadIdentifierPath();
+        // Function-call LHS: `LOWER(email) = 'alice'`. Detected by
+        // `Identifier '('` lookahead — same pattern as the value-position path.
+        // Captured as a ValueExpression on the comparison; the evaluator picks
+        // it up via ComparisonExpression.LhsExpression.
+        ValueExpression? lhsExpr = null;
+        string path;
+        if (Current.Type == TokenType.Identifier && Peek().Type == TokenType.LeftParen)
+        {
+            lhsExpr = ReadFunctionCallValueExpression();
+            // JsonPath stays empty so index probes that key on the column name
+            // see no candidate and fall back to a collection scan — the
+            // function-LHS form can't go through an indexed lookup without
+            // a function-aware index, which is its own (much larger) feature.
+            path = "";
+        }
+        else
+        {
+            path = ReadIdentifierPath();
+        }
 
-        // IS NULL / IS NOT NULL
+        // IS NULL / IS NOT NULL — only valid against a path LHS today.
         if (Current.Type == TokenType.Is)
         {
+            if (lhsExpr is not null)
+                throw new QueryParseException("IS NULL / IS NOT NULL is only supported on path expressions, not function calls.", Current.Position);
             _pos++;
             bool isNotNull = Match(TokenType.Not);
             Expect(TokenType.Null);
@@ -366,7 +386,8 @@ public sealed class Parser
             JsonPath = path,
             Operator = op,
             Value = value,
-            ValueType = valueType
+            ValueType = valueType,
+            LhsExpression = lhsExpr,
         };
     }
 
@@ -407,6 +428,20 @@ public sealed class Parser
 
     private (object? value, TokenType type) ReadLiteralValue()
     {
+        // Function-call form: `Identifier '(' ... ')'`. Captured as an opaque
+        // ValueExpression carried through the legacy (object? value, TokenType type)
+        // tuple so existing callers don't need to be re-typed; the evaluator
+        // dispatches on the concrete type at runtime. Bare identifiers (no
+        // following paren) are not valid in the literal position — this is the
+        // historical "expected literal value" path and we keep that strictness
+        // so a typo'd identifier surfaces clearly instead of silently being
+        // interpreted as a path.
+        if (Current.Type == TokenType.Identifier && Peek().Type == TokenType.LeftParen)
+        {
+            var fnCall = ReadFunctionCallValueExpression();
+            return (fnCall, TokenType.ValueExpression);
+        }
+
         var token = Current;
         _pos++;
 
@@ -418,6 +453,59 @@ public sealed class Parser
             TokenType.False => (false, TokenType.False),
             TokenType.Null => (null, TokenType.Null),
             _ => throw new QueryParseException($"Expected literal value, got {token.Type}", token.Position)
+        };
+    }
+
+    /// <summary>
+    /// Parse a value position: a literal, a path, a function call, or a nested
+    /// function call. Used by function-argument parsing (so <c>LOWER(email)</c>
+    /// passes the path <c>email</c>) and reachable from any value site that
+    /// chooses to opt in. The legacy <see cref="ReadLiteralValue"/> entry point
+    /// still exists for callers that haven't moved over.
+    /// </summary>
+    private ValueExpression ReadValueExpression()
+    {
+        // Function call: `Identifier '(' ... ')'`.
+        if (Current.Type == TokenType.Identifier && Peek().Type == TokenType.LeftParen)
+            return ReadFunctionCallValueExpression();
+
+        // Bare identifier (or dotted/indexed path): treat as a document path.
+        // Distinguishing this from a function call is the lookahead above —
+        // path is the fall-through.
+        if (Current.Type == TokenType.Identifier)
+            return new PathValueExpression { Path = ReadIdentifierPath() };
+
+        var token = Current;
+        _pos++;
+        return token.Type switch
+        {
+            TokenType.StringLiteral => new LiteralValueExpression { Value = token.Value, ValueType = TokenType.StringLiteral },
+            TokenType.NumberLiteral => new LiteralValueExpression { Value = double.Parse(token.Value), ValueType = TokenType.NumberLiteral },
+            TokenType.True => new LiteralValueExpression { Value = true, ValueType = TokenType.True },
+            TokenType.False => new LiteralValueExpression { Value = false, ValueType = TokenType.False },
+            TokenType.Null => new LiteralValueExpression { Value = null, ValueType = TokenType.Null },
+            _ => throw new QueryParseException($"Expected value (literal, path, or function call), got {token.Type}", token.Position)
+        };
+    }
+
+    private FunctionCallValueExpression ReadFunctionCallValueExpression()
+    {
+        var nameTok = Expect(TokenType.Identifier);
+        Expect(TokenType.LeftParen);
+
+        var args = new List<ValueExpression>();
+        if (Current.Type != TokenType.RightParen)
+        {
+            args.Add(ReadValueExpression());
+            while (Match(TokenType.Comma))
+                args.Add(ReadValueExpression());
+        }
+        Expect(TokenType.RightParen);
+
+        return new FunctionCallValueExpression
+        {
+            Name = nameTok.Value,
+            Args = args,
         };
     }
 
