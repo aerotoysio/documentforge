@@ -1064,32 +1064,43 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             throw;
         }
 
-        // Replicate as individual ops for now; logical-replication follower
-        // ordering already preserves intra-write-lock atomicity. Phase 2
-        // upgrades this to a single transactional batch.
+        // Issue #13: replicate the transaction as a single TxBatch so
+        // followers apply all sub-ops under one write lock and can never
+        // observe a partial mid-tx state. Pre-fix this loop broadcast each
+        // op individually — followers applied them with separate locks, so
+        // a read on the follower between two ops of the same tx saw a
+        // half-committed state (e.g. the delete of a delete-then-insert
+        // upsert briefly visible).
         if (_logicalServer is not null)
         {
+            var subOps = new List<TxBatchPayload.SubOp>();
             foreach (var (collectionName, ws) in tx.WorkingSets)
             {
+                // Order matches the apply order so followers see the same
+                // semantics: deletes, replaces, inserts.
                 foreach (var id in ws.Deletes)
                 {
-                    // We've already deleted from storage; reconstruct the doc
-                    // from the staged delete list isn't possible here, so we
-                    // broadcast a delete-by-id surrogate. Followers replay by
-                    // _id, which is enough for index maintenance + storage.
                     var idBytes = System.Text.Encoding.UTF8.GetBytes(id.ToString());
-                    _logicalServer.BroadcastNewOp(LogicalOpType.Delete, collectionName, idBytes);
+                    subOps.Add(new TxBatchPayload.SubOp(LogicalOpType.Delete, collectionName, idBytes));
                 }
                 foreach (var (_, newDoc) in ws.Replaces)
                 {
                     var bytes = BsonSerializer.Serialize(newDoc);
-                    _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, bytes);
+                    subOps.Add(new TxBatchPayload.SubOp(LogicalOpType.Insert, collectionName, bytes));
                 }
                 foreach (var (_, doc) in ws.Inserts)
                 {
                     var bytes = BsonSerializer.Serialize(doc);
-                    _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, bytes);
+                    subOps.Add(new TxBatchPayload.SubOp(LogicalOpType.Insert, collectionName, bytes));
                 }
+            }
+            if (subOps.Count > 0)
+            {
+                var payload = TxBatchPayload.Serialize(subOps);
+                // Empty collection field — TxBatch is engine-wide, not
+                // per-collection. The follower routes each sub-op by its own
+                // Collection field.
+                _logicalServer.BroadcastNewOp(LogicalOpType.TxBatch, "", payload);
             }
         }
     }
@@ -1280,25 +1291,88 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         var seqFilePath = FilePath + ".followerseq";
         _logicalFollower = new LogicalReplicationFollower(host, port, seqFilePath, op =>
         {
-            switch (op.OpType)
-            {
-                case LogicalOpType.Insert:
-                    var doc = BsonSerializer.Deserialize(op.Data);
-                    // Use Insert directly; it acquires write lock internally.
-                    // The doc's _id is already set, so EnsureId is a no-op and we preserve the leader's id.
-                    InsertOnFollower(op.Collection, doc);
-                    break;
-                case LogicalOpType.Delete:
-                    var docId = DocumentId.FromBytes(op.Data);
-                    DeleteOnFollower(op.Collection, docId);
-                    break;
-                case LogicalOpType.CreateIndex:
-                    var (name, path, unique) = DeserializeIndexDefinition(op.Data);
-                    try { CreateIndex(op.Collection, path, name, unique); } catch { /* already exists */ }
-                    break;
-            }
+            ApplyFollowerOp(op);
         }, secret: sharedSecret);
         _logicalFollower.Start();
+    }
+
+    private void ApplyFollowerOp(LogicalOp op)
+    {
+        switch (op.OpType)
+        {
+            case LogicalOpType.Insert:
+                var doc = BsonSerializer.Deserialize(op.Data);
+                // Use Insert directly; it acquires write lock internally.
+                // The doc's _id is already set, so EnsureId is a no-op and we preserve the leader's id.
+                InsertOnFollower(op.Collection, doc);
+                break;
+            case LogicalOpType.Delete:
+                var docId = DocumentId.FromBytes(op.Data);
+                DeleteOnFollower(op.Collection, docId);
+                break;
+            case LogicalOpType.CreateIndex:
+                var (name, path, unique) = DeserializeIndexDefinition(op.Data);
+                try { CreateIndex(op.Collection, path, name, unique); } catch { /* already exists */ }
+                break;
+            case LogicalOpType.TxBatch:
+                ApplyTxBatchOnFollower(op.Data);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Apply a TxBatch's serialized sub-ops atomically — single write lock,
+    /// all sub-ops, then release. Issue #13. Pre-fix the leader broadcast each
+    /// sub-op as a separate LogicalOp, the follower applied each under its own
+    /// lock, and a read on the follower between sub-ops saw a mid-tx state.
+    /// </summary>
+    private void ApplyTxBatchOnFollower(byte[] payload)
+    {
+        var subOps = TxBatchPayload.Deserialize(payload);
+        _transactionManager.AcquireWriteLock();
+        try
+        {
+            foreach (var sub in subOps)
+            {
+                switch (sub.OpType)
+                {
+                    case LogicalOpType.Insert:
+                        var doc = BsonSerializer.Deserialize(sub.Data);
+                        // Bypass the public Insert/Delete (which would re-acquire
+                        // the lock); use the locked-internal helpers.
+                        InsertOnFollowerLocked(sub.Collection, doc);
+                        break;
+                    case LogicalOpType.Delete:
+                        var docId = DocumentId.FromBytes(sub.Data);
+                        DeleteOnFollowerLocked(sub.Collection, docId);
+                        break;
+                    // CreateIndex / DropIndex aren't expected in tx batches today
+                    // (transactions only stage Insert/Replace/Delete) but the
+                    // dispatch is here for future symmetry.
+                }
+            }
+        }
+        finally
+        {
+            _transactionManager.ReleaseWriteLock();
+        }
+    }
+
+    private void InsertOnFollowerLocked(string collectionName, BsonDocument doc)
+    {
+        var collection = _catalog.GetOrCreateCollection(collectionName);
+        var id = collection.Insert(doc);
+        _indexManager.OnDocumentInserted(collectionName, id, doc);
+    }
+
+    private void DeleteOnFollowerLocked(string collectionName, DocumentId docId)
+    {
+        var collection = _catalog.GetCollection(collectionName);
+        if (collection is null) return;
+        var doc = collection.FindById(docId);
+        if (doc is null) return;
+        collection.Delete(docId);
+        _indexManager.OnDocumentDeleted(collectionName, docId, doc);
     }
 
     public long LogicallyReplicatedOps() => _logicalFollower?.OpsApplied ?? 0;
