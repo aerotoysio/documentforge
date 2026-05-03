@@ -41,6 +41,10 @@ public sealed class Lexer
         ["NULL"] = TokenType.Null,
         ["COUNT"] = TokenType.Count,
         ["JOIN"] = TokenType.Join,
+        ["LEFT"] = TokenType.Left,
+        ["RIGHT"] = TokenType.Right,
+        ["CROSS"] = TokenType.Cross,
+        ["OUTER"] = TokenType.Outer, // optional sugar in `LEFT OUTER JOIN` / `RIGHT OUTER JOIN`
         ["SUM"] = TokenType.Sum,
         ["AVG"] = TokenType.Avg,
         ["MIN"] = TokenType.Min,
