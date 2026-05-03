@@ -304,6 +304,12 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         {
             var collection = _catalog.GetOrCreateCollection(collectionName);
             doc.EnsureId(); // ensure _id is set BEFORE we broadcast, so followers get the same id
+            // Stamp the optimistic-concurrency token. Issue #18: every doc the
+            // engine writes carries an `_etag`; clients use it for If-Match
+            // PUTs without inventing their own version field. Caller-supplied
+            // _etag values are intentionally overwritten — clients shouldn't
+            // forge them.
+            doc.StampFreshEtag();
 
             // Pre-validate uniqueness. If any unique index would reject the doc,
             // throw BEFORE the page write so the on-disk state is untouched.
@@ -388,6 +394,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                 {
                     var doc = documents[i];
                     doc.EnsureId();
+                    doc.StampFreshEtag(); // issue #18 — same discipline as single Insert
                     // Validate before the page write so a unique-index conflict
                     // doesn't leave a stranded doc behind (issue #9).
                     _indexManager.ValidateUniqueInsert(collectionName, doc);
@@ -455,6 +462,9 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
 
             // Always preserve the original _id so the replacement is in place.
             newDoc["_id"] = oldDoc["_id"];
+            // Re-stamp the optimistic-concurrency token. Issue #18: every Replace
+            // mints a fresh _etag so subsequent If-Match clients see the change.
+            newDoc.StampFreshEtag();
 
             // Validate + apply index changes FIRST. If validation throws (e.g. a
             // unique-index collision with a different doc), the page is untouched -
@@ -486,6 +496,67 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             _transactionManager.ReleaseWriteLock();
         }
     }
+
+    /// <summary>
+    /// Optimistic-concurrency replace. Reads the current document, compares
+    /// its <c>_etag</c> against <paramref name="expectedEtag"/>, and only
+    /// replaces if they match. Returns the new <c>_etag</c> on success;
+    /// throws <see cref="EtagMismatchException"/> on mismatch (the doc
+    /// changed since the caller GET'd it). Returns null on not-found —
+    /// distinguishable from mismatch because not-found doesn't throw.
+    ///
+    /// <para>
+    /// The check + write happens under a single write-lock window, so a
+    /// concurrent writer racing in between cannot create a TOCTOU window
+    /// that lets two If-Match clients both succeed against the same
+    /// pre-image. Issue #18.
+    /// </para>
+    /// </summary>
+    public string? ReplaceIfEtag(string collectionName, DocumentId id, BsonDocument newDoc, string expectedEtag)
+    {
+        ThrowIfReadOnly();
+        _transactionManager.AcquireWriteLock();
+        try
+        {
+            var collection = _catalog.GetCollection(collectionName);
+            if (collection is null) return null;
+            var oldDoc = collection.FindById(id);
+            if (oldDoc is null) return null;
+
+            var actualEtag = oldDoc.GetEtag();
+            if (!string.Equals(actualEtag, expectedEtag, StringComparison.Ordinal))
+                throw new EtagMismatchException(expectedEtag, actualEtag);
+
+            // Same as the unguarded Replace from here — preserve _id, stamp
+            // a fresh _etag, validate index transitions, write the page,
+            // broadcast.
+            newDoc["_id"] = oldDoc["_id"];
+            newDoc.StampFreshEtag();
+            _indexManager.OnDocumentUpdated(collectionName, id, oldDoc, newDoc);
+            if (!collection.Update(id, newDoc))
+            {
+                try { _indexManager.OnDocumentUpdated(collectionName, id, newDoc, oldDoc); } catch { }
+                return null;
+            }
+
+            if (_logicalServer is not null)
+            {
+                var oldBytes = BsonSerializer.Serialize(oldDoc);
+                _logicalServer.BroadcastNewOp(LogicalOpType.Delete, collectionName, oldBytes);
+                var newBytes = BsonSerializer.Serialize(newDoc);
+                _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, newBytes);
+            }
+            return newDoc.GetEtag();
+        }
+        finally
+        {
+            _transactionManager.ReleaseWriteLock();
+        }
+    }
+
+    /// <summary>JSON convenience overload of <see cref="ReplaceIfEtag(string, DocumentId, BsonDocument, string)"/>.</summary>
+    public string? ReplaceIfEtag(string collectionName, DocumentId id, string json, string expectedEtag) =>
+        ReplaceIfEtag(collectionName, id, BsonDocument.FromJson(json), expectedEtag);
 
     /// <summary>
     /// Convenience overload: parse JSON then replace.

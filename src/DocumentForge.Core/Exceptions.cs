@@ -40,6 +40,23 @@ public class TransactionException : DocumentForgeException
 }
 
 /// <summary>
+/// Thrown by <c>ReplaceIfEtag</c> when the document's stored <c>_etag</c>
+/// doesn't match the value the caller asserted. The HTTP layer turns this
+/// into a 412 Precondition Failed (issue #18 — optimistic concurrency).
+/// </summary>
+public class EtagMismatchException : DocumentForgeException
+{
+    public string ExpectedEtag { get; }
+    public string ActualEtag { get; }
+    public EtagMismatchException(string expected, string actual)
+        : base($"ETag mismatch: caller asserted '{expected}', current is '{actual}'.")
+    {
+        ExpectedEtag = expected;
+        ActualEtag = actual;
+    }
+}
+
+/// <summary>
 /// Thrown when DocumentForgeDb.Open / Create cannot acquire the on-disk
 /// lock for the data file because another process is holding it. The
 /// message names the holder (pid + hostname + open time) so operators can
