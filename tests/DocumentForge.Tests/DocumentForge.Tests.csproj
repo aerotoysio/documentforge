@@ -15,5 +15,6 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\DocumentForge.Engine\DocumentForge.Engine.csproj" />
     <ProjectReference Include="..\..\samples\DocumentForge.Api\DocumentForge.Api.csproj" />
+    <ProjectReference Include="..\..\src\DocumentForge.Cli\DocumentForge.Cli.csproj" />
   </ItemGroup>
 </Project>

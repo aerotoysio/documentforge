@@ -201,7 +201,15 @@ public sealed class OpLogBuffer
 /// callers reading lag should compare this against
 /// <see cref="LogicalReplicationServer.CurrentSeq"/> with the understanding
 /// that it's a worst-case lower bound, not a live ack.</param>
-public readonly record struct FollowerInfo(string Endpoint, DateTime ConnectedAtUtc, ulong HandshakeSeq);
+/// <param name="HttpEndpoint">The follower's HTTP base URL, advertised
+/// during the handshake (issue #51). Null if the follower is running an
+/// older build that doesn't send the field — the admin-UI falls back to
+/// guessing the HTTP port from the replication endpoint in that case.</param>
+public readonly record struct FollowerInfo(
+    string Endpoint,
+    DateTime ConnectedAtUtc,
+    ulong HandshakeSeq,
+    string? HttpEndpoint);
 
 public sealed class LogicalReplicationServer : IDisposable
 {
@@ -236,7 +244,7 @@ public sealed class LogicalReplicationServer : IDisposable
         {
             var list = new List<FollowerInfo>(_followers.Count);
             foreach (var f in _followers)
-                list.Add(new FollowerInfo(f.Endpoint, f.ConnectedAtUtc, f.HandshakeSeq));
+                list.Add(new FollowerInfo(f.Endpoint, f.ConnectedAtUtc, f.HandshakeSeq, f.HttpEndpoint));
             return list;
         }
     }
@@ -253,6 +261,8 @@ public sealed class LogicalReplicationServer : IDisposable
         public required string Endpoint { get; init; }
         public required DateTime ConnectedAtUtc { get; init; }
         public required ulong HandshakeSeq { get; init; }
+        /// <summary>HTTP base URL the follower advertised; null if it's running an older build. Issue #51.</summary>
+        public string? HttpEndpoint { get; init; }
     }
 
     /// <summary>
@@ -381,6 +391,37 @@ public sealed class LogicalReplicationServer : IDisposable
                 }
             }
 
+            // Issue #51 — read the optional httpEndpoint suffix.
+            // New followers write [endpointLen:2][endpointUtf8] right after
+            // the secret block (or right after the basic handshake when no
+            // secret is configured). Old followers don't write anything more,
+            // so we use a short timeout to detect them and treat httpEndpoint
+            // as null. The bytes from new followers arrive immediately on a
+            // local network, so 200ms is plenty of headroom.
+            string? followerHttpEndpoint = null;
+            try
+            {
+                using var endpointTimeoutCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+                using var linkedEndpointCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, endpointTimeoutCts.Token);
+                var endpointLenBuf = new byte[2];
+                if (await ReadExactBytes(stream, endpointLenBuf, linkedEndpointCts.Token))
+                {
+                    var endpointLen = BitConverter.ToUInt16(endpointLenBuf);
+                    if (endpointLen > 0 && endpointLen <= 1024)
+                    {
+                        var endpointBuf = new byte[endpointLen];
+                        if (await ReadExactBytes(stream, endpointBuf, linkedEndpointCts.Token))
+                            followerHttpEndpoint = System.Text.Encoding.UTF8.GetString(endpointBuf);
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Legacy follower — didn't send the endpoint suffix. That's
+                // fine; httpEndpoint stays null and the admin-UI falls back
+                // to its existing port-guess behaviour.
+            }
+
             // Figure out what we need to catchup. If the OpLog can't help
             // (follower seq < oldest buffered, or follower is at seq 0 and
             // we have a snapshot provider — covers the case where the
@@ -448,6 +489,7 @@ public sealed class LogicalReplicationServer : IDisposable
                 Endpoint = endpoint,
                 ConnectedAtUtc = DateTime.UtcNow,
                 HandshakeSeq = followerLastSeq,
+                HttpEndpoint = followerHttpEndpoint,
             };
             lock (_lock) _followers.Add(conn);
         }
@@ -566,6 +608,7 @@ public sealed class LogicalReplicationFollower : IDisposable
     private readonly string _seqFilePath;
     private readonly Action<LogicalOp> _apply;
     private readonly string? _secret;
+    private readonly string? _ownHttpEndpoint;
     private TcpClient? _client;
     private Task? _streamTask;
     private readonly CancellationTokenSource _cts = new();
@@ -601,13 +644,14 @@ public sealed class LogicalReplicationFollower : IDisposable
     private FileStream? _snapshotWriter;
     private ulong _snapshotInFlightSeq;
 
-    public LogicalReplicationFollower(string host, int port, string seqFilePath, Action<LogicalOp> apply, string? secret = null)
+    public LogicalReplicationFollower(string host, int port, string seqFilePath, Action<LogicalOp> apply, string? secret = null, string? ownHttpEndpoint = null)
     {
         _host = host;
         _port = port;
         _seqFilePath = seqFilePath;
         _apply = apply;
         _secret = secret;
+        _ownHttpEndpoint = ownHttpEndpoint;
         _lastAppliedSeq = LoadSeq();
     }
 
@@ -659,6 +703,20 @@ public sealed class LogicalReplicationFollower : IDisposable
                 await stream.WriteAsync(prefix, _cts.Token);
                 await stream.WriteAsync(secretBytes, _cts.Token);
             }
+
+            // Issue #51 — advertise this follower's own HTTP base URL so
+            // the leader can expose it on /replication/status. Always write
+            // the 2-byte length prefix; legacy leaders that don't expect it
+            // simply leave the bytes in their socket buffer and proceed
+            // with catchup. Empty string when no endpoint is configured.
+            var endpointBytes = _ownHttpEndpoint is null
+                ? Array.Empty<byte>()
+                : System.Text.Encoding.UTF8.GetBytes(_ownHttpEndpoint);
+            var endpointLenPrefix = new byte[2];
+            BitConverter.TryWriteBytes(endpointLenPrefix, (ushort)endpointBytes.Length);
+            await stream.WriteAsync(endpointLenPrefix, _cts.Token);
+            if (endpointBytes.Length > 0)
+                await stream.WriteAsync(endpointBytes, _cts.Token);
 
             while (!_cts.IsCancellationRequested)
             {

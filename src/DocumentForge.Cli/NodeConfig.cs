@@ -21,6 +21,24 @@ public sealed class NodeConfig
     public bool BindAllInterfaces { get; set; } = false;
     public SecurityConfig? Security { get; set; }
     public ReplicationConfig? Replication { get; set; }
+    public NetworkConfig? Network { get; set; }
+
+    /// <summary>
+    /// The HTTP base URL by which other nodes (and the admin-UI) should
+    /// reach this node's REST API. If <c>Network.PublicBaseUrl</c> is set,
+    /// that wins; otherwise we derive it from <see cref="BindAllInterfaces"/>,
+    /// the resolved scheme, and <see cref="Port"/>. Used in the replication
+    /// handshake so peers learn each other's HTTP addresses without the
+    /// admin-UI having to guess (issue #51).
+    /// </summary>
+    public string ResolveHttpEndpoint()
+    {
+        if (!string.IsNullOrEmpty(Network?.PublicBaseUrl))
+            return Network.PublicBaseUrl.TrimEnd('/');
+        var scheme = Security?.Tls is not null ? "https" : "http";
+        var host = BindAllInterfaces ? Environment.MachineName : "localhost";
+        return $"{scheme}://{host}:{Port}";
+    }
 
     public static NodeConfig Load(string[] args)
     {
@@ -75,6 +93,10 @@ public sealed class NodeConfig
                     c.Replication ??= new ReplicationConfig();
                     c.Replication.AutoFailover ??= new AutoFailoverConfig();
                     c.Replication.AutoFailover.NewLeaderPort = int.Parse(args[i + 1]);
+                    break;
+                case "--public-base-url":
+                    c.Network ??= new NetworkConfig();
+                    c.Network.PublicBaseUrl = args[i + 1];
                     break;
             }
         }
@@ -132,8 +154,33 @@ public sealed class NodeConfig
             if (c.Replication.AutoFailover.SilenceSeconds is null) c.Replication.AutoFailover.SilenceSeconds = fs;
         }
 
+        var envBaseUrl = Environment.GetEnvironmentVariable("DFDB_PUBLIC_BASE_URL");
+        if (!string.IsNullOrEmpty(envBaseUrl))
+        {
+            c.Network ??= new NetworkConfig();
+            c.Network.PublicBaseUrl ??= envBaseUrl;
+        }
+
         return c;
     }
+}
+
+/// <summary>
+/// Network-level config. Currently just <see cref="PublicBaseUrl"/>, the
+/// HTTP base URL this node advertises to peers during the replication
+/// handshake (issue #51). Override when the node sits behind a reverse
+/// proxy (e.g. <c>https://dfdb.example.com</c>) — otherwise we derive it
+/// from the bind address + port.
+/// </summary>
+public sealed class NetworkConfig
+{
+    /// <summary>
+    /// HTTP base URL this node is reachable at, e.g. <c>http://10.0.0.5:5000</c>
+    /// or <c>https://dfdb.example.com</c>. Trailing slash is normalized away.
+    /// Sent on the replication handshake so peers + the admin-UI can
+    /// auto-discover the topology without guessing port/scheme.
+    /// </summary>
+    public string? PublicBaseUrl { get; set; }
 }
 
 public sealed class SecurityConfig
