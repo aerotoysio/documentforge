@@ -9,6 +9,7 @@ namespace DocumentForge.Engine;
 
 public sealed class DocumentForgeDb : IDisposable
 {
+    private readonly DatabaseLock _lock;
     private readonly DataFile _dataFile;
     private readonly PageCache _pageCache;
     private readonly PageAllocator _allocator;
@@ -28,9 +29,10 @@ public sealed class DocumentForgeDb : IDisposable
 
     public string FilePath { get; }
 
-    private DocumentForgeDb(string filePath, DataFile dataFile, DatabaseOptions options)
+    private DocumentForgeDb(string filePath, DataFile dataFile, DatabaseLock lockHandle, DatabaseOptions options)
     {
         FilePath = filePath;
+        _lock = lockHandle;
         _dataFile = dataFile;
         _pageCache = new PageCache(dataFile, options.CacheSizeInPages);
         _allocator = new PageAllocator(dataFile, _pageCache);
@@ -102,37 +104,63 @@ public sealed class DocumentForgeDb : IDisposable
     public static DocumentForgeDb Create(string filePath, DatabaseOptions? options = null)
     {
         options ??= new DatabaseOptions();
-        var dataFile = DataFile.Create(filePath);
-        var db = new DocumentForgeDb(filePath, dataFile, options);
-        db._catalog.Load();
-        // New DB has no indexes yet
-        return db;
+        // Acquire the on-disk lock BEFORE creating the data file so two
+        // concurrent Create calls don't both succeed and end up with
+        // overlapping writes. If the data file exists already and is locked
+        // by someone else, the FileMode.CreateNew below would fail anyway —
+        // checking the lock first gives a clearer error.
+        var lockHandle = DatabaseLock.Acquire(filePath, options.ForceUnlock);
+        try
+        {
+            var dataFile = DataFile.Create(filePath);
+            var db = new DocumentForgeDb(filePath, dataFile, lockHandle, options);
+            db._catalog.Load();
+            // New DB has no indexes yet
+            return db;
+        }
+        catch
+        {
+            lockHandle.Dispose();
+            throw;
+        }
     }
 
     public static DocumentForgeDb Open(string filePath, DatabaseOptions? options = null)
     {
         options ??= new DatabaseOptions();
 
-        // CRASH RECOVERY: before opening the data file, check for an unfinished recovery log.
-        // If it exists and has records, it means we crashed mid-flush.
-        // Replay the log entries directly onto the data file to restore durability.
-        var recoveryPath = filePath + ".recovery";
-        int recoveredPages = ReplayRecoveryLog(filePath, recoveryPath);
-
-        var dataFile = DataFile.Open(filePath);
-        var db = new DocumentForgeDb(filePath, dataFile, options);
-        db._catalog.Load();
-        // Load persistent indexes (no rebuild from scratch!)
-        db._indexManager.LoadFromCatalog();
-        // Eagerly build location maps for all collections - avoids 1s lag on first query
-        foreach (var collName in db._catalog.GetCollectionNames())
+        // Acquire the on-disk lock BEFORE recovery replay or any data-file
+        // mutation. The recovery log is rewritten by replay, so two processes
+        // racing on Open could each clobber the other's recovery progress.
+        var lockHandle = DatabaseLock.Acquire(filePath, options.ForceUnlock);
+        try
         {
-            db._catalog.GetCollection(collName)?.BuildLocationMap();
-        }
+            // CRASH RECOVERY: before opening the data file, check for an unfinished recovery log.
+            // If it exists and has records, it means we crashed mid-flush.
+            // Replay the log entries directly onto the data file to restore durability.
+            var recoveryPath = filePath + ".recovery";
+            int recoveredPages = ReplayRecoveryLog(filePath, recoveryPath);
 
-        if (recoveredPages > 0)
-            Console.WriteLine($"[DocumentForge] Recovered {recoveredPages} page(s) from crash recovery log.");
-        return db;
+            var dataFile = DataFile.Open(filePath);
+            var db = new DocumentForgeDb(filePath, dataFile, lockHandle, options);
+            db._catalog.Load();
+            // Load persistent indexes (no rebuild from scratch!)
+            db._indexManager.LoadFromCatalog();
+            // Eagerly build location maps for all collections - avoids 1s lag on first query
+            foreach (var collName in db._catalog.GetCollectionNames())
+            {
+                db._catalog.GetCollection(collName)?.BuildLocationMap();
+            }
+
+            if (recoveredPages > 0)
+                Console.WriteLine($"[DocumentForge] Recovered {recoveredPages} page(s) from crash recovery log.");
+            return db;
+        }
+        catch
+        {
+            lockHandle.Dispose();
+            throw;
+        }
     }
 
     public static DocumentForgeDb OpenOrCreate(string filePath, DatabaseOptions? options = null)
@@ -1072,6 +1100,10 @@ public sealed class DocumentForgeDb : IDisposable
             _dataFile.Dispose();
             var recoveryPath = FilePath + ".recovery";
             try { if (File.Exists(recoveryPath) && new FileInfo(recoveryPath).Length == 0) File.Delete(recoveryPath); } catch { }
+            // Release the on-disk lock LAST so a crash mid-shutdown still leaves
+            // the lock visible. Releasing earlier would briefly let a second
+            // opener race in while we're still flushing/closing.
+            _lock.Dispose();
             _disposed = true;
         }
     }
