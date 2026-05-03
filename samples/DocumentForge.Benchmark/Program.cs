@@ -3,9 +3,12 @@ using DocumentForge.Document;
 using DocumentForge.Engine;
 using DocumentForge.Index;
 
-const int TARGET_DOCS = 10_000_000;
-const int BATCH_SIZE = 25_000;
-const int QUERY_DURATION_SECONDS = 30; // 30s per query type to keep total runtime sane
+// Quick smoke (env DFDB_BENCH_QUICK=1): 100k docs, 6s per query benchmark.
+// Full stress (default): 10M docs, 30s per query.
+bool QUICK = string.Equals(Environment.GetEnvironmentVariable("DFDB_BENCH_QUICK"), "1");
+int TARGET_DOCS = QUICK ? 100_000 : 10_000_000;
+int BATCH_SIZE = QUICK ? 5_000 : 25_000;
+int QUERY_DURATION_SECONDS = QUICK ? 6 : 30;
 
 Console.WriteLine("╔═══════════════════════════════════════════════════════════════╗");
 Console.WriteLine("║     DocumentForge - STRESS TEST BENCHMARK                    ║");
