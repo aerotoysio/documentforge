@@ -3058,6 +3058,129 @@ public class EngineTests : IDisposable
         finally { CleanupClusterPaths(paths); }
     }
 
+    // --- ClusterTransaction Replace + DeleteByField (issue #14, Phase B-deferred) ---
+    //
+    // Phase A only shipped Insert + Find on ClusterTransaction. Replace
+    // and DeleteByField (and the scatter case for non-shard-key fields)
+    // need the multi-shard 2PC machinery from Phase B/C, so they came
+    // back here once that landed.
+    //
+    // Replace routes by extracting the shard key from the new doc — same
+    // shard as the existing doc means single-shard fast path. Changing
+    // the shard-key value is a semantically different operation that
+    // we don't currently handle.
+    //
+    // DeleteByField: if the field IS the shard key, single-shard. If
+    // not, the matching docs could be anywhere — scatter to every shard.
+
+    [Fact]
+    public void ClusterTx_Replace_SingleShard_Commits()
+    {
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            var insertedId = cluster.Insert("orders", """{"pnr":"BASE","seat":"12A"}""");
+
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Replace("orders", insertedId, """{"pnr":"BASE","seat":"99Z"}""");
+                tx.Commit();
+            }
+
+            var rows = cluster.Execute("SELECT * FROM orders WHERE pnr = 'BASE'").Documents;
+            Assert.Single(rows);
+            Assert.Equal("99Z", rows[0]["seat"].AsString);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_DeleteByField_OnShardKey_IsSingleShard()
+    {
+        // field == shard key → cluster knows exactly which shard owns the
+        // matching docs. Should be a single-shard tx (fast path).
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            cluster.Insert("orders", """{"pnr":"GONE","leg":1}""");
+            cluster.Insert("orders", """{"pnr":"GONE","leg":2}""");
+
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.DeleteByField("orders", "pnr", "GONE");
+                Assert.Equal(1, tx.ParticipantCount);  // single-shard
+                tx.Commit();
+            }
+
+            Assert.Empty(cluster.Execute("SELECT * FROM orders WHERE pnr = 'GONE'").Documents);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_DeleteByField_OnNonShardKey_ScattersToAllShards()
+    {
+        // field != shard key → matching docs could be anywhere. Op fans
+        // out to every shard. The 2PC machinery handles the multi-shard
+        // commit; participants with no matches no-op cleanly.
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            // Seed docs across shards. status=CANCELLED on each.
+            for (int i = 0; i < 30; i++)
+                cluster.Insert("orders", $$"""{"pnr":"P{{i:D3}}","status":"CANCELLED"}""");
+            for (int i = 0; i < 30; i++)
+                cluster.Insert("orders", $$"""{"pnr":"K{{i:D3}}","status":"CONFIRMED"}""");
+
+            // Sanity — at least 2 shards have CANCELLED docs (consistent
+            // hashing across 60 unique pnrs).
+            int shardsWithCancelled = 0;
+            for (int s = 0; s < dbs.Length; s++)
+                if (dbs[s].Execute("SELECT * FROM orders WHERE status = 'CANCELLED'").Documents.Count > 0)
+                    shardsWithCancelled++;
+            Assert.True(shardsWithCancelled >= 2, $"Test setup expected ≥2 shards with CANCELLED, got {shardsWithCancelled}");
+
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.DeleteByField("orders", "status", "CANCELLED");
+                Assert.Equal(3, tx.ParticipantCount);  // scattered to all shards
+                tx.Commit();
+            }
+
+            Assert.Empty(cluster.Execute("SELECT * FROM orders WHERE status = 'CANCELLED'").Documents);
+            Assert.Equal(30, cluster.Execute("SELECT * FROM orders WHERE status = 'CONFIRMED'").Documents.Count);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_Replace_RollsBackWithRestOfTransaction()
+    {
+        // Replace inside a multi-op transaction — when the tx aborts,
+        // the replace must not land. (The atomicity story is what makes
+        // tx.Replace genuinely useful over cluster.Execute("UPDATE ...").)
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            var id = cluster.Insert("orders", """{"pnr":"KEEP","status":"CONFIRMED"}""");
+
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Replace("orders", id, """{"pnr":"KEEP","status":"CANCELLED"}""");
+                tx.Rollback();
+            }
+
+            var rows = cluster.Execute("SELECT * FROM orders WHERE pnr = 'KEEP'").Documents;
+            Assert.Single(rows);
+            Assert.Equal("CONFIRMED", rows[0]["status"].AsString);  // unchanged
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
     // --- 2PC participant API (issue #14, Phase B.1: prepare/commit/rollback on a single shard) ---
     //
     // Phase B.1 lands the participant-side wire ops on IShardTransport:

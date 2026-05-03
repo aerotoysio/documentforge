@@ -191,6 +191,12 @@ internal sealed class PreparedTxLog : IDisposable
                     bw.Write(bytes.Length);
                     bw.Write(bytes);
                     break;
+                case ShardTxOpKind.Replace:
+                    bw.Write(op.DocId.ToBytes());  // 16 bytes
+                    var rBytes = BsonSerializer.Serialize(op.Doc!);
+                    bw.Write(rBytes.Length);
+                    bw.Write(rBytes);
+                    break;
                 case ShardTxOpKind.DeleteByField:
                     WriteShortString(bw, op.Field!);
                     WriteLongString(bw, op.Value!);
@@ -221,6 +227,14 @@ internal sealed class PreparedTxLog : IDisposable
                     var bsonBytes = br.ReadBytes(bsonLen);
                     var doc = BsonSerializer.Deserialize(bsonBytes);
                     ops.Add(ShardTxOp.ForInsert(coll, doc));
+                    break;
+                case ShardTxOpKind.Replace:
+                    var idBytes = br.ReadBytes(16);
+                    var docId = DocumentForge.Core.DocumentId.FromBytes(idBytes);
+                    int rBsonLen = br.ReadInt32();
+                    var rBsonBytes = br.ReadBytes(rBsonLen);
+                    var rDoc = BsonSerializer.Deserialize(rBsonBytes);
+                    ops.Add(ShardTxOp.ForReplace(coll, docId, rDoc));
                     break;
                 case ShardTxOpKind.DeleteByField:
                     var field = ReadShortString(br);
