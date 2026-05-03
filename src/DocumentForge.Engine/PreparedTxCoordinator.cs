@@ -210,10 +210,43 @@ internal sealed class PreparedTxCoordinator : IDisposable
 
     private void HandleResolve(ResolveCommand cmd)
     {
-        if (_active is null || _active.TxId != cmd.TxId)
+        // Recovery path: if there's no in-memory _active state but the txId
+        // appears in the on-disk prepared.log, rebuild and acquire the
+        // write lock fresh. This is what the cluster Recover sweep takes
+        // after a restart — the worker thread that originally held the
+        // lock is gone, but the durable PREPARED record is still on disk.
+        bool reacquiredFresh = false;
+        if (_active is null)
+        {
+            var inFlight = _log.ScanInFlight();
+            var rec = inFlight.FirstOrDefault(r => r.TxId == cmd.TxId);
+            if (rec is null)
+            {
+                cmd.Done.SetException(new InvalidOperationException(
+                    $"No prepared tx with id '{cmd.TxId}' on this shard."));
+                return;
+            }
+            _txManager.AcquireWriteLock();
+            try
+            {
+                var workingSets = _db.BuildWorkingSetsFromShardTxOps(rec.Ops);
+                _active = new InFlightTx(rec.TxId, rec.CoordinatorShardId, rec.Ops, workingSets);
+                reacquiredFresh = true;
+            }
+            catch
+            {
+                _txManager.ReleaseWriteLock();
+                throw;
+            }
+        }
+
+        if (_active.TxId != cmd.TxId)
         {
             cmd.Done.SetException(new InvalidOperationException(
-                $"No prepared tx with id '{cmd.TxId}' on this shard."));
+                $"Prepared tx on this shard is '{_active.TxId}', not '{cmd.TxId}'."));
+            // Don't release the lock — the OTHER prepared tx still holds it.
+            // Just don't touch _active either.
+            if (reacquiredFresh) { /* unreachable: we just set _active to cmd.TxId */ }
             return;
         }
 

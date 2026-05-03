@@ -1052,13 +1052,52 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
 
     /// <summary>
     /// Snapshot of the coordinator decision log. txId → state. Empty if this
-    /// shard never coordinated a cluster tx. Phase C.2 will use this on
-    /// cluster open to find and replay decided-but-not-DONE broadcasts.
+    /// shard never coordinated a cluster tx. Phase C.2 reads this on
+    /// recovery to learn whether a tx was decided.
     /// </summary>
     public IReadOnlyDictionary<string, CoordinatorTxState> ScanCoordinatorTransactions()
     {
         if (_coordinatorTxLog is null) return new Dictionary<string, CoordinatorTxState>();
         return _coordinatorTxLog.Scan();
+    }
+
+    /// <summary>
+    /// Snapshot of the participant prepared-tx log: every PREPARED record
+    /// without a matching RESOLVED record. Phase C.2 calls this on each
+    /// shard at recovery time to find tx slices that need resolution.
+    /// </summary>
+    public IReadOnlyList<PreparedTxRecord> ScanInFlightPreparedTransactions()
+    {
+        // The log is created lazily on first PREPARE. If it doesn't exist
+        // yet, we open it transiently to scan whatever's on disk from a
+        // previous process — without taking ownership for the lifetime of
+        // this DB instance (recovery shouldn't accidentally start a worker
+        // thread). On a freshly-created DB the file just doesn't exist
+        // and we return empty.
+        var path = FilePath + ".prepared.log";
+        if (_preparedTxLog is not null) return _preparedTxLog.ScanInFlight();
+        if (!File.Exists(path)) return Array.Empty<PreparedTxRecord>();
+        using var transient = new PreparedTxLog(path);
+        return transient.ScanInFlight();
+    }
+
+    /// <summary>
+    /// Coordinator-side: what does this shard's coord log say about
+    /// <paramref name="txId"/>? Returns null if absent (which the cluster
+    /// recovery treats as "abort").
+    /// </summary>
+    public CoordinatorTxState? GetCoordinatorTxState(string txId)
+    {
+        var path = FilePath + ".coord.log";
+        if (_coordinatorTxLog is not null)
+        {
+            var states = _coordinatorTxLog.Scan();
+            return states.TryGetValue(txId, out var s) ? s : null;
+        }
+        if (!File.Exists(path)) return null;
+        using var transient = new CoordinatorTxLog(path);
+        var transientStates = transient.Scan();
+        return transientStates.TryGetValue(txId, out var ts) ? ts : null;
     }
 
     /// <summary>
