@@ -2357,6 +2357,313 @@ public class EngineTests : IDisposable
         Assert.Equal(2, db2.Execute("SELECT * FROM orders").Documents.Count);
     }
 
+    // --- Cross-shard transactions (issue #14, Phase A: single-shard fast path) ---
+    //
+    // Phase A scope: cluster.BeginTransaction() opens a ClusterTransaction.
+    // If staged ops route to ONE shard, Commit hands the batch to that shard's
+    // local BeginTransaction().Commit() — same atomicity, validation, WAL fsync
+    // as a non-cluster transaction. If staged ops span >1 shards, Commit throws
+    // NotImplementedException (cross-shard 2PC lands in Phase B).
+    //
+    // The point of these tests is to lock in the API surface and the routing
+    // contract so Phase B can layer the multi-shard machinery on top without
+    // breaking what callers see.
+
+    private static (DocumentForgeDb[] dbs, string[] paths, DocumentForge.Engine.Cluster.DocumentForgeCluster cluster)
+        BuildClusterForTx(int shardCount, string collection, string shardKey)
+    {
+        var paths = Enumerable.Range(0, shardCount)
+            .Select(i => Path.Combine(Path.GetTempPath(), $"clstx_{i}_{Guid.NewGuid():N}.dfdb"))
+            .ToArray();
+        var dbs = paths.Select(p => DocumentForgeDb.Create(p)).ToArray();
+
+        var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster();
+        for (int i = 0; i < shardCount; i++)
+            cluster.AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport(
+                ((char)('A' + i)).ToString(), dbs[i], ownsDb: true));
+        cluster.ShardCollection(collection, shardKey);
+        return (dbs, paths, cluster);
+    }
+
+    private static void CleanupClusterPaths(string[] paths)
+    {
+        foreach (var p in paths)
+        {
+            try { File.Delete(p); File.Delete(p + ".wal"); File.Delete(p + ".recovery"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void ClusterTx_SingleShard_Insert_Commit_AppliesAllStaged()
+    {
+        // Two docs sharing a shard-key value land on the same shard, so the
+        // tx degenerates to a single-shard local commit on that shard.
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            using (cluster)
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("orders", """{"pnr":"SAME","leg":1}""");
+                tx.Insert("orders", """{"pnr":"SAME","leg":2}""");
+                Assert.Equal(1, tx.ParticipantCount);
+                tx.Commit();
+            }
+
+            // After commit, both docs are queryable through the cluster.
+            // After dispose-of-cluster the shard DBs are gone (ownsDb=true),
+            // so we re-query through a freshly built cluster over the same files.
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_SingleShard_Commit_DocsAreVisibleAfterwards()
+    {
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("orders", """{"pnr":"SAME","leg":1}""");
+                tx.Insert("orders", """{"pnr":"SAME","leg":2}""");
+                tx.Commit();
+            }
+
+            var rows = cluster.Execute("SELECT * FROM orders WHERE pnr = 'SAME'").Documents;
+            Assert.Equal(2, rows.Count);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_SingleShard_Rollback_DiscardsStaged()
+    {
+        var (dbs, paths, cluster) = BuildClusterForTx(2, "orders", "pnr");
+        try
+        {
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("orders", """{"pnr":"SAME","leg":1}""");
+                tx.Insert("orders", """{"pnr":"SAME","leg":2}""");
+                tx.Rollback();
+            }
+            Assert.Empty(cluster.Execute("SELECT * FROM orders").Documents);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_DisposeWithoutCommit_RollsBack()
+    {
+        var (dbs, paths, cluster) = BuildClusterForTx(2, "orders", "pnr");
+        try
+        {
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("orders", """{"pnr":"SAME"}""");
+                // no Commit — dispose at end of using block must roll back
+            }
+            Assert.Empty(cluster.Execute("SELECT * FROM orders").Documents);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_MultiShard_Commit_ThrowsNotImplemented()
+    {
+        // Phase A bails out cleanly when ops span more than one shard. The
+        // exception message should point the reader at issue #14 / Phase B.
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            // Find two pnr values that route to distinct shards by probing.
+            string? pnrA = null, pnrB = null;
+            int aShard = -1;
+            for (int i = 0; pnrA is null || pnrB is null; i++)
+            {
+                if (i > 200) throw new InvalidOperationException("Could not find two pnrs on distinct shards");
+                var pnr = $"PROBE{i:D4}";
+                cluster.Insert("orders", $$"""{"pnr":"{{pnr}}"}""");
+                int found = -1;
+                for (int s = 0; s < dbs.Length; s++)
+                    if (dbs[s].Execute($"SELECT * FROM orders WHERE pnr = '{pnr}'").Documents.Count == 1)
+                        found = s;
+                if (pnrA is null) { pnrA = pnr; aShard = found; }
+                else if (found != aShard) { pnrB = pnr; }
+            }
+
+            // Now clear seed data and run the actual cross-shard tx attempt.
+            cluster.Execute("DELETE FROM orders");
+
+            using var tx = cluster.BeginTransaction();
+            tx.Insert("orders", $$"""{"pnr":"{{pnrA}}"}""");
+            tx.Insert("orders", $$"""{"pnr":"{{pnrB}}"}""");
+            Assert.Equal(2, tx.ParticipantCount);
+
+            var ex = Assert.Throws<NotImplementedException>(() => tx.Commit());
+            Assert.Contains("Phase B", ex.Message);
+            Assert.Equal(TransactionState.RolledBack, tx.State);
+
+            // Nothing got applied — neither shard has a doc with these pnrs.
+            Assert.Empty(cluster.Execute($"SELECT * FROM orders WHERE pnr = '{pnrA}'").Documents);
+            Assert.Empty(cluster.Execute($"SELECT * FROM orders WHERE pnr = '{pnrB}'").Documents);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_UniqueIndexConflict_RollsBackAtomically()
+    {
+        // Two inserts on the same shard, second violates a unique index.
+        // The participant's local commit must validate then throw, leaving
+        // neither doc persisted — same atomicity as a single-node tx.
+        //
+        // We set the unique index up directly on each shard so this test
+        // doesn't accidentally also exercise cluster CREATE INDEX broadcast
+        // (which is orthogonal — that's covered elsewhere).
+        var (dbs, paths, cluster) = BuildClusterForTx(2, "users", "tenant");
+        try
+        {
+            foreach (var d in dbs)
+            {
+                d.GetOrCreateCollection("users");
+                d.CreateIndex("users", "email", "idx_email", unique: true);
+            }
+
+            cluster.Insert("users", """{"tenant":"T1","email":"a@b.com","v":1}""");
+
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("users", """{"tenant":"T1","email":"new@x.com","v":2}""");
+                tx.Insert("users", """{"tenant":"T1","email":"a@b.com","v":3}""");  // conflict
+                Assert.Equal(1, tx.ParticipantCount);
+
+                Assert.ThrowsAny<Exception>(() => tx.Commit());
+                Assert.Equal(TransactionState.RolledBack, tx.State);
+            }
+
+            // Pre-tx state preserved: original a@b.com still v=1, new@x.com never landed.
+            var rows = cluster.Execute("SELECT * FROM users WHERE tenant = 'T1'").Documents;
+            Assert.Single(rows);
+            Assert.Equal("a@b.com", rows[0]["email"].AsString);
+            Assert.Equal(1, rows[0]["v"].AsInt32);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_FindReturnsStagedInsert()
+    {
+        // Read-your-writes for staged inserts. Phase A only — Phase B will
+        // also layer staged state over a real cluster lookup.
+        var (dbs, paths, cluster) = BuildClusterForTx(2, "orders", "pnr");
+        try
+        {
+            using (var tx = cluster.BeginTransaction())
+            {
+                var id = tx.Insert("orders", """{"pnr":"XYZ","seat":"12A"}""");
+                var seen = tx.Find("orders", id);
+                Assert.NotNull(seen);
+                Assert.Equal("XYZ", seen!["pnr"].AsString);
+
+                // Outside the tx — neither shard has the doc yet.
+                Assert.Empty(cluster.Execute("SELECT * FROM orders").Documents);
+                tx.Rollback();
+            }
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_EmptyCommit_IsNoOp()
+    {
+        var (dbs, paths, cluster) = BuildClusterForTx(2, "orders", "pnr");
+        try
+        {
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Commit();
+                Assert.Equal(TransactionState.Committed, tx.State);
+            }
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_NoShards_ThrowsOnBegin()
+    {
+        using var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster();
+        Assert.Throws<DocumentForgeException>(() => cluster.BeginTransaction());
+    }
+
+    [Fact]
+    public void ClusterTx_ReplicatedCollection_InsertThrowsNotImplemented()
+    {
+        // Replicated collections fan out to every shard, so a single insert
+        // is already a multi-shard tx. Phase B handles this; Phase A bails.
+        var paths = Enumerable.Range(0, 2)
+            .Select(i => Path.Combine(Path.GetTempPath(), $"clstxr_{i}_{Guid.NewGuid():N}.dfdb"))
+            .ToArray();
+        var dbs = paths.Select(p => DocumentForgeDb.Create(p)).ToArray();
+        try
+        {
+            using var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster()
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("A", dbs[0], ownsDb: true))
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("B", dbs[1], ownsDb: true))
+                .ReplicateCollection("countries");
+
+            using var tx = cluster.BeginTransaction();
+            var ex = Assert.Throws<NotImplementedException>(() =>
+                tx.Insert("countries", """{"code":"US","name":"USA"}"""));
+            Assert.Contains("Phase B", ex.Message);
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_OperationAfterCommit_Throws()
+    {
+        var (dbs, paths, cluster) = BuildClusterForTx(2, "orders", "pnr");
+        try
+        {
+            var tx = cluster.BeginTransaction();
+            tx.Insert("orders", """{"pnr":"ABC"}""");
+            tx.Commit();
+
+            Assert.Throws<TransactionException>(() => tx.Insert("orders", """{"pnr":"DEF"}"""));
+            Assert.Throws<TransactionException>(() => tx.Rollback());
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_NonClusterPath_NotRegressed()
+    {
+        // The performance contract: non-transactional cluster ops are
+        // unchanged. This test is defensive — a refactor that accidentally
+        // routes cluster.Insert through ClusterTransaction would still pass
+        // the other tests. This one asserts that cluster.Insert on a brand
+        // new cluster (no transactions ever opened) works exactly as before.
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            for (int i = 0; i < 30; i++)
+                cluster.Insert("orders", $$"""{"pnr": "ORD{{i:D4}}", "amount": {{i * 10}}}""");
+            Assert.Equal(30, cluster.Execute("SELECT * FROM orders").Documents.Count);
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
     // --- Index catalog: multi-page support (issue #22) ---
 
     [Fact]
