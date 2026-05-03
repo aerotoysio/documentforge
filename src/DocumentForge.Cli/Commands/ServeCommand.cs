@@ -117,7 +117,7 @@ public static class ServeCommand
         Console.WriteLine("             GET|DELETE|PUT /collections/{name}/by/{field}/{value}  (by any field)");
         Console.WriteLine("             DELETE /collections/{name} | GET /indexes/{collection} | POST /index");
         Console.WriteLine("             POST /tx/batch                  (atomic multi-doc transaction)");
-        Console.WriteLine("             POST /seed | GET /health");
+        Console.WriteLine("             POST /seed | GET /health | GET /version");
         Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint | POST /admin/snapshot");
         Console.WriteLine("             POST /admin/compact/{collection}");
         Console.WriteLine("             POST /admin/rebuild-indexes/{collection}");
@@ -685,6 +685,18 @@ public static class ServeCommand
             version = "0.1.0",
             readOnly = db.IsReadOnly,
             uptimeSeconds = Math.Round((DateTime.UtcNow - _startedAt).TotalSeconds, 1)
+        }));
+
+        // Build-identification info — returns the SHA, build timestamp, and
+        // (when running in a container) the image identifier so deploy
+        // verifiers can confirm what's running. See BuildInfo.cs for the
+        // resolution chain (assembly metadata → env vars → fallbacks). Issue #36.
+        app.MapGet("/version", () => Results.Ok(new
+        {
+            sha = BuildInfo.Sha,
+            builtAt = BuildInfo.BuiltAtUtc,
+            image = BuildInfo.Image,
+            node = config.NodeName,
         }));
 
         // Force a cache flush (all dirty pages to disk, truncate recovery log)
