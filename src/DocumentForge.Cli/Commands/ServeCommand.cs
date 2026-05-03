@@ -117,7 +117,7 @@ public static class ServeCommand
         Console.WriteLine("             GET|DELETE|PUT /collections/{name}/by/{field}/{value}  (by any field)");
         Console.WriteLine("             DELETE /collections/{name} | GET /indexes/{collection} | POST /index");
         Console.WriteLine("             POST /seed | GET /health");
-        Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint");
+        Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint | POST /admin/snapshot");
         Console.WriteLine("             POST /admin/compact/{collection}");
         Console.WriteLine("             POST /admin/rebuild-indexes/{collection}");
         Console.WriteLine("             POST /admin/rebuild-index/{collection}/{indexName}");
@@ -582,6 +582,36 @@ public static class ServeCommand
             return Results.Ok(new { success = true, timeMs = sw.Elapsed.TotalMilliseconds });
         });
 
+        // Take a consistent snapshot of the data file. Blocks writes briefly
+        // (the duration of FlushAll + the file copy) and returns when the
+        // snapshot is durable. The result file at targetPath is a
+        // self-contained .dfdb that DocumentForgeDb.Open can load directly.
+        //
+        // For multi-GB datasets the copy dominates wall time; consider
+        // running this against a follower instead so the leader's writes
+        // aren't paused.
+        app.MapPost("/admin/snapshot", (SnapshotRequest req) =>
+        {
+            if (string.IsNullOrWhiteSpace(req.TargetPath))
+                return Results.BadRequest(new { error = "targetPath is required." });
+            try
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                db.Snapshot(req.TargetPath);
+                sw.Stop();
+                long bytes = 0;
+                try { bytes = new FileInfo(req.TargetPath).Length; } catch { }
+                return Results.Ok(new
+                {
+                    success = true,
+                    targetPath = req.TargetPath,
+                    bytesCopied = bytes,
+                    timeMs = Math.Round(sw.Elapsed.TotalMilliseconds, 1)
+                });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
         // Rebuild every index on a collection from scratch.
         // Needed after a bulk insert that used ?skipIndexes=true, or any time
         // an operator suspects index corruption.
@@ -793,6 +823,7 @@ public static class ServeCommand
 public record QueryRequest(string Sql);
 public record SeedRequest(int? Orders);
 public record CreateIndexRequest(string Collection, string Path, string? Name = null, bool Unique = false);
+public record SnapshotRequest(string TargetPath);
 public record StartLeaderRequest(int Port, string? SharedSecret = null);
 public record StartFollowerRequest(string Host, int Port, string? SharedSecret = null);
 public record PromoteRequest(int Port);
