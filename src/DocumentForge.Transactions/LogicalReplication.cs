@@ -10,8 +10,67 @@ public enum LogicalOpType : byte
     Delete = 0x02,
     CreateIndex = 0x03,
     DropIndex = 0x04,
+    /// <summary>
+    /// A multi-doc transaction broadcast as a single atomic batch. The Data
+    /// payload is a length-prefixed list of sub-ops; followers deserialize
+    /// and apply them all under one write lock. Issue #13 — pre-fix
+    /// transactions were broadcast as individual ops, so followers could
+    /// observe a partial mid-tx state.
+    /// </summary>
+    TxBatch = 0x05,
     Heartbeat = 0xFE,
     Handshake = 0xFF,
+}
+
+/// <summary>
+/// Serialization helpers for the <see cref="LogicalOpType.TxBatch"/> payload.
+/// On-disk layout:
+/// <code>
+///   [SubOpCount:4]
+///   for each:
+///     [SubOpType:1][CollLen:2][CollBytes][DataLen:4][DataBytes]
+/// </code>
+/// Mirrors the per-op wire framing so the follower can reuse the same
+/// dispatch logic on each sub-op.
+/// </summary>
+public static class TxBatchPayload
+{
+    public sealed record SubOp(LogicalOpType OpType, string Collection, byte[] Data);
+
+    public static byte[] Serialize(IReadOnlyList<SubOp> ops)
+    {
+        using var ms = new MemoryStream();
+        using var w = new BinaryWriter(ms);
+        w.Write(ops.Count);
+        foreach (var op in ops)
+        {
+            w.Write((byte)op.OpType);
+            var cb = System.Text.Encoding.UTF8.GetBytes(op.Collection);
+            w.Write((short)cb.Length);
+            w.Write(cb);
+            w.Write(op.Data.Length);
+            w.Write(op.Data);
+        }
+        return ms.ToArray();
+    }
+
+    public static List<SubOp> Deserialize(byte[] payload)
+    {
+        using var ms = new MemoryStream(payload);
+        using var r = new BinaryReader(ms);
+        int count = r.ReadInt32();
+        var list = new List<SubOp>(count);
+        for (int i = 0; i < count; i++)
+        {
+            var opType = (LogicalOpType)r.ReadByte();
+            int collLen = r.ReadInt16();
+            var collBytes = r.ReadBytes(collLen);
+            int dataLen = r.ReadInt32();
+            var data = r.ReadBytes(dataLen);
+            list.Add(new SubOp(opType, System.Text.Encoding.UTF8.GetString(collBytes), data));
+        }
+        return list;
+    }
 }
 
 /// <summary>A single logical operation with monotonic sequence number.</summary>
