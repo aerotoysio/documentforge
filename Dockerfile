@@ -26,6 +26,16 @@
 FROM mcr.microsoft.com/dotnet/sdk:9.0-bookworm-slim AS build
 WORKDIR /src
 
+# Build-identification info embedded into the binary and surfaced by GET /version
+# (issue #36). Pass with --build-arg DFDB_GIT_SHA=$(git rev-parse HEAD); the
+# compose file / CI workflow does this automatically. DFDB_BUILT_AT defaults to
+# now if not set, so even local `docker build` produces a recognisable timestamp.
+ARG DFDB_GIT_SHA=
+ARG DFDB_BUILT_AT=
+ARG DFDB_IMAGE=
+ENV DFDB_GIT_SHA=${DFDB_GIT_SHA} \
+    DFDB_BUILT_AT=${DFDB_BUILT_AT}
+
 # Copy project files first so `dotnet restore` is cached separately from sources.
 COPY Directory.Build.props ./
 COPY src/DocumentForge.Core/*.csproj          src/DocumentForge.Core/
@@ -74,6 +84,11 @@ WORKDIR /app
 
 # Persistent data lives here; mount a volume or a managed disk onto this path.
 VOLUME /data
+
+# Carry the image identifier into the runtime so GET /version can report it.
+# Override at `docker run` time with -e DFDB_IMAGE=ghcr.io/yourorg/dfdb:tag.
+ARG DFDB_IMAGE=
+ENV DFDB_IMAGE=${DFDB_IMAGE}
 
 # Defaults; every one of these can be overridden at `docker run` time.
 ENV DFDB_NODE_NAME=dfdb-1 \

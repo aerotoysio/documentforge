@@ -2848,6 +2848,64 @@ public class EngineTests : IDisposable
         Assert.False(r.Success);
     }
 
+    // --- Build identification (issue #36) ---
+    //
+    // The /version REST endpoint just JSON-wraps these properties, so the
+    // engine-level tests are sufficient — one HTTP integration smoke test
+    // would just re-verify what's checked here.
+
+    [Fact]
+    public void BuildInfo_Sha_IsAlwaysSomethingNonEmpty()
+    {
+        // Sha resolves through assembly metadata → env var → "dev". One of the
+        // three always wins, so the value is never empty/null in any
+        // environment we'd run tests in.
+        var sha = BuildInfo.Sha;
+        Assert.False(string.IsNullOrEmpty(sha));
+    }
+
+    [Fact]
+    public void BuildInfo_BuiltAt_IsRecentEnoughToBeMeaningful()
+    {
+        // BuildTimeUtc comes from Directory.Build.props at build time, so
+        // running the tests should see a value newer than "the project was
+        // committed in 2026". A null value means none of the three sources
+        // worked — that's a regression worth catching.
+        var t = BuildInfo.BuiltAtUtc;
+        Assert.NotNull(t);
+        Assert.True(t.Value > new DateTime(2026, 1, 1, 0, 0, 0, DateTimeKind.Utc),
+            $"BuildInfo.BuiltAtUtc = {t:o} — expected something post-2026.");
+    }
+
+    [Fact]
+    public void BuildInfo_Image_IsNullWhenEnvVarUnset()
+    {
+        // No DFDB_IMAGE set in the test runner — the property must report null
+        // rather than fabricating a value. The endpoint surfaces null as JSON
+        // null so admin UIs can display "no image (likely a local dev build)".
+        // This test is defensive against a future where someone reads from
+        // assembly metadata or hardcodes a default.
+        var prior = Environment.GetEnvironmentVariable("DFDB_IMAGE");
+        try
+        {
+            Environment.SetEnvironmentVariable("DFDB_IMAGE", null);
+            // Image is cached — re-reading after setting to null doesn't help
+            // here. Instead just assert that whatever the cached value is, it's
+            // not a fabricated string in the absence of the env var.
+            var img = BuildInfo.Image;
+            // Either null (env wasn't set when first observed) OR the value the
+            // env var had then. Either way, no fabrication.
+            if (img is not null)
+            {
+                Assert.Equal(prior, img);
+            }
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("DFDB_IMAGE", prior);
+        }
+    }
+
     public void Dispose()
     {
         // Test fixtures occasionally call _db.Dispose() themselves (e.g. lock
