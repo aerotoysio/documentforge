@@ -527,6 +527,13 @@ public sealed class DocumentForgeCluster : IDisposable
     internal void RollbackOnShardForTx(int shardIndex, string txId) =>
         _shards[shardIndex].RollbackPrepared(txId);
 
+    // Phase C.1 — coordinator-decision-log calls. Always issued against the
+    // shard chosen as coordinator for this tx (lowest participant index).
+    internal void RecordCoordinatorDecisionForTx(int coordinatorShardIndex, string txId, bool commit) =>
+        _shards[coordinatorShardIndex].RecordCoordinatorDecision(txId, commit);
+    internal void RecordCoordinatorDoneForTx(int coordinatorShardIndex, string txId) =>
+        _shards[coordinatorShardIndex].RecordCoordinatorDone(txId);
+
     public void Dispose()
     {
         if (_disposed) return;

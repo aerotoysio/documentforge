@@ -2628,6 +2628,114 @@ public class EngineTests : IDisposable
     }
 
     [Fact]
+    public void ClusterTx_MultiShard_Commit_RecordsCoordinatorDecisionAndDone()
+    {
+        // Phase C.1: COMMIT_DECISION goes to the coordinator shard's coord.log
+        // before the COMMIT broadcast (point of no return); DONE goes after
+        // every participant ACK'd. Recovery (Phase C.2) reads this log.
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
+        try
+        {
+            var (pnrA, pnrB, shardA, shardB) = FindPnrsOnDistinctShards(cluster, dbs);
+            cluster.Execute("DELETE FROM orders");
+
+            string txIdSeen;
+            using (var tx = cluster.BeginTransaction())
+            {
+                txIdSeen = tx.Id.ToString("N");
+                tx.Insert("orders", $$"""{"pnr":"{{pnrA}}"}""");
+                tx.Insert("orders", $$"""{"pnr":"{{pnrB}}"}""");
+                tx.Commit();
+            }
+
+            // Coordinator is the lowest-index participant. Verify on whichever
+            // shard that turned out to be (depends on the consistent hash).
+            int coordIdx = Math.Min(shardA, shardB);
+            var coordStates = dbs[coordIdx].ScanCoordinatorTransactions();
+            Assert.True(coordStates.ContainsKey(txIdSeen),
+                $"Coordinator log on shard {coordIdx} missing tx {txIdSeen}; saw [{string.Join(",", coordStates.Keys)}]");
+            var state = coordStates[txIdSeen];
+            Assert.True(state.Decided);
+            Assert.True(state.Done);
+
+            // The OTHER participant must NOT have a coord-log record for this tx
+            // (it isn't the coordinator; it's only PREPARED-then-COMMITTED).
+            int otherIdx = Math.Max(shardA, shardB);
+            var otherStates = dbs[otherIdx].ScanCoordinatorTransactions();
+            Assert.False(otherStates.ContainsKey(txIdSeen));
+
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_MultiShard_Abort_DoesNotRecordCommitDecision()
+    {
+        // Phase C.1: ABORT is implicit — the coordinator log only contains
+        // COMMIT_DECISION records, never ABORT. A tx that aborts in PREPARE
+        // leaves NO trace in the coordinator log (recovery treats absence
+        // of a decision as "abort").
+        var (dbs, paths, cluster) = BuildClusterForTx(3, "users", "tenant");
+        try
+        {
+            cluster.ShardCollection("orders", "pnr");
+            var (tenantA, tenantB, shardA, shardB) = FindPnrsOnDistinctShards(cluster, dbs);
+            cluster.Execute("DELETE FROM orders");
+
+            // Pre-seed a unique-index conflict on the second shard.
+            dbs[shardB].GetOrCreateCollection("users");
+            dbs[shardB].CreateIndex("users", "email", "idx_email", unique: true);
+            dbs[shardB].Insert("users", $$"""{"tenant":"{{tenantB}}","email":"clash@x.com"}""");
+
+            string txIdSeen;
+            using (var tx = cluster.BeginTransaction())
+            {
+                txIdSeen = tx.Id.ToString("N");
+                tx.Insert("users", $$"""{"tenant":"{{tenantA}}","email":"a@x.com"}""");
+                tx.Insert("users", $$"""{"tenant":"{{tenantB}}","email":"clash@x.com"}""");
+                Assert.Throws<TransactionException>(() => tx.Commit());
+            }
+
+            // Neither shard has a coord-log record for the aborted tx.
+            foreach (var d in dbs)
+                Assert.False(d.ScanCoordinatorTransactions().ContainsKey(txIdSeen));
+
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
+    public void ClusterTx_SingleShard_Commit_DoesNotTouchCoordinatorLog()
+    {
+        // The single-shard fast path bypasses 2PC entirely — it shouldn't
+        // create a coord.log file at all.
+        var (dbs, paths, cluster) = BuildClusterForTx(2, "orders", "pnr");
+        try
+        {
+            using (var tx = cluster.BeginTransaction())
+            {
+                tx.Insert("orders", """{"pnr":"SAME","leg":1}""");
+                tx.Insert("orders", """{"pnr":"SAME","leg":2}""");
+                tx.Commit();
+            }
+
+            // No shard has any coord-log entries.
+            foreach (var d in dbs)
+                Assert.Empty(d.ScanCoordinatorTransactions());
+
+            // And no .coord.log file exists either (lazy init means we
+            // never touched the disk for the coordinator log).
+            foreach (var p in paths)
+                Assert.False(File.Exists(p + ".coord.log"));
+
+            cluster.Dispose();
+        }
+        finally { CleanupClusterPaths(paths); }
+    }
+
+    [Fact]
     public void ClusterTx_UniqueIndexConflict_RollsBackAtomically()
     {
         // Two inserts on the same shard, second violates a unique index.

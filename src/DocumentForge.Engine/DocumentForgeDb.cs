@@ -966,6 +966,14 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     private PreparedTxCoordinator? _preparedTxCoordinator;
     private readonly object _preparedTxInitLock = new();
 
+    // Phase C.1 — coordinator decision log. Only non-null on a shard that's
+    // actually been asked to coordinate a cluster tx; lazy-initialized on
+    // first decision write. The same DB can be both a participant (uses
+    // _preparedTxLog) and a coordinator (uses _coordinatorTxLog) for
+    // different transactions.
+    private CoordinatorTxLog? _coordinatorTxLog;
+    private readonly object _coordinatorTxInitLock = new();
+
     private PreparedTxCoordinator EnsurePreparedTxCoordinator()
     {
         if (_preparedTxCoordinator is not null) return _preparedTxCoordinator;
@@ -1005,6 +1013,52 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     {
         ThrowIfReadOnly();
         EnsurePreparedTxCoordinator().RollbackPrepared(txId);
+    }
+
+    private CoordinatorTxLog EnsureCoordinatorTxLog()
+    {
+        if (_coordinatorTxLog is not null) return _coordinatorTxLog;
+        lock (_coordinatorTxInitLock)
+        {
+            if (_coordinatorTxLog is not null) return _coordinatorTxLog;
+            ThrowIfReadOnly();
+            _coordinatorTxLog = new CoordinatorTxLog(FilePath + ".coord.log");
+            return _coordinatorTxLog;
+        }
+    }
+
+    /// <summary>
+    /// Coordinator-shard call: durably record the COMMIT decision (point of
+    /// no return). Issued by the cluster after every participant voted
+    /// PREPARED; recovery (Phase C.2) reads this on coordinator restart to
+    /// know it must replay the broadcast.
+    /// </summary>
+    public void RecordCoordinatorDecision(string txId, bool commit)
+    {
+        ThrowIfReadOnly();
+        // Phase C.1 only persists COMMIT — ABORT is implicit (no record). If
+        // we wanted to recover and finalize aborts deterministically (e.g.
+        // an operator-driven abort), we'd add an ABORT record. Out of scope.
+        if (commit)
+            EnsureCoordinatorTxLog().AppendCommitDecision(txId);
+    }
+
+    /// <summary>Coordinator-shard call: every participant ACK'd COMMIT — record DONE.</summary>
+    public void RecordCoordinatorDone(string txId)
+    {
+        ThrowIfReadOnly();
+        EnsureCoordinatorTxLog().AppendDone(txId);
+    }
+
+    /// <summary>
+    /// Snapshot of the coordinator decision log. txId → state. Empty if this
+    /// shard never coordinated a cluster tx. Phase C.2 will use this on
+    /// cluster open to find and replay decided-but-not-DONE broadcasts.
+    /// </summary>
+    public IReadOnlyDictionary<string, CoordinatorTxState> ScanCoordinatorTransactions()
+    {
+        if (_coordinatorTxLog is null) return new Dictionary<string, CoordinatorTxState>();
+        return _coordinatorTxLog.Scan();
     }
 
     /// <summary>
@@ -1879,6 +1933,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             // (Phase C will replay it on next Open).
             try { _preparedTxCoordinator?.Dispose(); } catch { }
             try { _preparedTxLog?.Dispose(); } catch { }
+            try { _coordinatorTxLog?.Dispose(); } catch { }
             try { _pageCache.FlushAll(); } // also truncates the recovery log
             catch (Exception ex) { deferredFlushError = ex; }
             try { _walWriter?.Dispose(); } catch { }

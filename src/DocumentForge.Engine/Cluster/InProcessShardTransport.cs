@@ -71,6 +71,12 @@ public sealed class InProcessShardTransport : IShardTransport
 
     public void RollbackPrepared(string txId) => _db.RollbackPreparedTransaction(txId);
 
+    public void RecordCoordinatorDecision(string txId, bool commit) =>
+        _db.RecordCoordinatorDecision(txId, commit);
+
+    public void RecordCoordinatorDone(string txId) =>
+        _db.RecordCoordinatorDone(txId);
+
     public void Dispose()
     {
         if (_ownsDb) _db.Dispose();
