@@ -2355,12 +2355,308 @@ public class EngineTests : IDisposable
         Assert.Equal(2, db2.Execute("SELECT * FROM orders").Documents.Count);
     }
 
-    public void Dispose()
+    // --- Index catalog: multi-page support (issue #22) ---
+
+    [Fact]
+    public void IndexCatalog_HandlesManyIndexesAcrossMultiplePages()
+    {
+        // Pre-fix Save threw "Index catalog overflow - too many indexes for one
+        // page (TODO: multi-page)" once the catalog page filled up — roughly
+        // 170 indexes on a 4 KB page depending on name length. That's a real
+        // ceiling for apps with many small collections.
+        //
+        // Create enough indexes to span at least 3 catalog pages (300 here is
+        // comfortably past the single-page cap). Verify we can save, reload,
+        // and that lookups against each index still plan correctly.
+        const int IndexCount = 300;
+
+        for (int i = 0; i < IndexCount; i++)
+        {
+            var coll = $"col{i:D3}";
+            _db.Insert(coll, $$"""{"k": "v{{i}}"}""");
+            _db.CreateIndex(coll, "k", $"idx_col{i:D3}_k");
+        }
+
+        // Spot-check: every index appears in GetIndexes for its collection.
+        for (int i = 0; i < IndexCount; i++)
+        {
+            var coll = $"col{i:D3}";
+            Assert.Single(_db.GetIndexes(coll));
+        }
+
+        // Round-trip: dispose + reopen reloads the entire chain. If any link
+        // in the chain were broken, indexes after the cap point would be lost.
+        _db.Flush();
+        _db.Dispose();
+        using var reopened = DocumentForgeDb.Open(_dbPath);
+
+        for (int i = 0; i < IndexCount; i++)
+        {
+            var coll = $"col{i:D3}";
+            Assert.Single(reopened.GetIndexes(coll));
+            // Indexed lookup proves the catalog row points at a real, intact index page.
+            var rows = reopened.Execute($"SELECT * FROM {coll} WHERE k = 'v{i}'").Documents;
+            Assert.Single(rows);
+        }
+    }
+
+    [Fact]
+    public void IndexCatalog_ShrinksAndReusesPagesAfterDropIndex()
+    {
+        // Catalog growing then shrinking should free the spare pages, not
+        // leak them. We can't directly inspect the free list, so the test
+        // verifies the engine stays functional through a grow/shrink cycle
+        // and a reopen comes back coherent.
+        for (int i = 0; i < 250; i++)
+        {
+            var coll = $"c{i:D3}";
+            _db.Insert(coll, $$"""{"k":{{i}}}""");
+            _db.CreateIndex(coll, "k", $"idx_c{i:D3}");
+        }
+
+        // Drop most of them — this rewrites the catalog smaller and frees
+        // the now-unneeded chain pages. The SQL DROP INDEX form requires
+        // an ON-clause: `DROP INDEX <name> ON <collection>`.
+        var dropResult = _db.Execute("DROP INDEX idx_c000 ON c000");
+        Assert.True(dropResult.Success, dropResult.Message);
+        for (int i = 50; i < 250; i++)
+        {
+            var r = _db.Execute($"DROP INDEX idx_c{i:D3} ON c{i:D3}");
+            Assert.True(r.Success, r.Message);
+        }
+
+        _db.Flush();
+        _db.Dispose();
+        using var reopened = DocumentForgeDb.Open(_dbPath);
+
+        // Indexes 1..49 survive; 0 was dropped; 50..249 dropped.
+        Assert.Empty(reopened.GetIndexes("c000"));
+        for (int i = 1; i < 50; i++)
+            Assert.Single(reopened.GetIndexes($"c{i:D3}"));
+        for (int i = 50; i < 250; i++)
+            Assert.Empty(reopened.GetIndexes($"c{i:D3}"));
+    }
+
+    // --- Replication topology exposure (issue #12) ---
+
+    [Fact]
+    public async System.Threading.Tasks.Task LogicalReplication_LeaderExposesConnectedFollowerEndpoints()
+    {
+        // The /replication/status endpoint needs to surface enough about
+        // connected followers that an admin UI can wire a topology graph
+        // automatically. Today we expose endpoint, connectedAt, and the
+        // handshake seq (worst-case lag baseline). Ack-driven live lag is
+        // tracked separately under the Phase 2 replication-tx work.
+        int port = 5800 + System.Random.Shared.Next(100);
+        var leaderPath = Path.Combine(Path.GetTempPath(), $"topoleader_{Guid.NewGuid():N}.dfdb");
+        var follower1Path = Path.Combine(Path.GetTempPath(), $"topofol1_{Guid.NewGuid():N}.dfdb");
+        var follower2Path = Path.Combine(Path.GetTempPath(), $"topofol2_{Guid.NewGuid():N}.dfdb");
+
+        try
+        {
+            using var leader = DocumentForgeDb.Create(leaderPath);
+            leader.StartLogicalReplicationServer(port);
+            await System.Threading.Tasks.Task.Delay(150);
+
+            // Pre-seed an op on the leader so the second follower's handshake
+            // seq differs from the first — gives the lag column something to
+            // distinguish.
+            leader.Insert("orders", """{"pnr":"X"}""");
+
+            using var follower1 = DocumentForgeDb.Create(follower1Path);
+            follower1.StartLogicalReplicationFollower("localhost", port);
+            for (int i = 0; i < 30 && leader.GetLogicalFollowerCount() < 1; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+
+            leader.Insert("orders", """{"pnr":"Y"}""");
+            leader.Insert("orders", """{"pnr":"Z"}""");
+
+            using var follower2 = DocumentForgeDb.Create(follower2Path);
+            follower2.StartLogicalReplicationFollower("localhost", port);
+            for (int i = 0; i < 30 && leader.GetLogicalFollowerCount() < 2; i++)
+                await System.Threading.Tasks.Task.Delay(100);
+
+            var followers = leader.GetLogicalFollowers();
+            Assert.Equal(2, followers.Count);
+
+            // Both endpoints are loopback addresses with whatever ephemeral
+            // ports the OS assigned. The status endpoint just needs them
+            // recognisable as host:port — we don't pin the exact port.
+            foreach (var f in followers)
+            {
+                Assert.Contains(":", f.Endpoint);
+                Assert.NotEqual("unknown", f.Endpoint);
+                Assert.True(f.ConnectedAtUtc > DateTime.UtcNow.AddMinutes(-1));
+            }
+
+            // The follower side knows its leader's endpoint — what the
+            // status payload uses to populate `follower.leader.endpoint`.
+            Assert.Equal($"localhost:{port}", follower1.LogicalFollowerLeaderEndpoint);
+            Assert.Equal($"localhost:{port}", follower2.LogicalFollowerLeaderEndpoint);
+
+            // A non-replicating db reports null so the JSON omits the field
+            // gracefully via the null-coalesce in /replication/status.
+            using var standalone = DocumentForgeDb.Create(
+                Path.Combine(Path.GetTempPath(), $"topostandalone_{Guid.NewGuid():N}.dfdb"));
+            Assert.Null(standalone.LogicalFollowerLeaderEndpoint);
+            Assert.Empty(standalone.GetLogicalFollowers());
+        }
+        finally
+        {
+            try { File.Delete(leaderPath); File.Delete(leaderPath + ".wal"); File.Delete(leaderPath + ".recovery"); } catch { }
+            try { File.Delete(follower1Path); File.Delete(follower1Path + ".wal"); File.Delete(follower1Path + ".recovery"); File.Delete(follower1Path + ".followerseq"); } catch { }
+            try { File.Delete(follower2Path); File.Delete(follower2Path + ".wal"); File.Delete(follower2Path + ".recovery"); File.Delete(follower2Path + ".followerseq"); } catch { }
+        }
+    }
+
+    // --- Snapshot / backup API (issue #27) ---
+
+    [Fact]
+    public void Snapshot_ProducesIndependentFileWithSameContent()
+    {
+        _db.Insert("orders", """{"pnr":"ABC","seat":"12A"}""");
+        _db.Insert("orders", """{"pnr":"DEF","seat":"14B"}""");
+        _db.CreateIndex("orders", "pnr", "idx_orders_pnr", unique: true);
+
+        var snapshotPath = Path.Combine(Path.GetTempPath(), $"snapshot_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            _db.Snapshot(snapshotPath);
+            Assert.True(File.Exists(snapshotPath));
+
+            // The snapshot must open as an independent DB with the same docs
+            // AND the same indexes (so queries plan correctly post-restore).
+            using var restored = DocumentForgeDb.Open(snapshotPath);
+            var rows = restored.Execute("SELECT * FROM orders").Documents;
+            Assert.Equal(2, rows.Count);
+            Assert.Single(restored.GetIndexes("orders"));
+
+            // Indexed lookup against the snapshot finds the row — proves the
+            // index entries copied over and the catalog pointer survived.
+            var byPnr = restored.Execute("SELECT * FROM orders WHERE pnr = 'ABC'").Documents;
+            Assert.Single(byPnr);
+            Assert.Equal("12A", byPnr[0]["seat"].AsString);
+        }
+        finally
+        {
+            try { File.Delete(snapshotPath); } catch { }
+            try { File.Delete(snapshotPath + ".wal"); } catch { }
+            try { File.Delete(snapshotPath + ".recovery"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Snapshot_LiveDbContinuesToWorkAfterSnapshot()
+    {
+        _db.Insert("orders", """{"pnr":"BEFORE"}""");
+
+        var snapshotPath = Path.Combine(Path.GetTempPath(), $"snapshot_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            _db.Snapshot(snapshotPath);
+
+            // Live DB must accept new writes after the snapshot returns; the
+            // brief write-lock window during snapshot shouldn't leave the
+            // engine in any kind of degraded state.
+            _db.Insert("orders", """{"pnr":"AFTER"}""");
+            Assert.Equal(2, _db.Execute("SELECT * FROM orders").Documents.Count);
+
+            // The snapshot must not contain the post-snapshot row.
+            using var restored = DocumentForgeDb.Open(snapshotPath);
+            var rows = restored.Execute("SELECT * FROM orders").Documents;
+            Assert.Single(rows);
+            Assert.Equal("BEFORE", rows[0]["pnr"].AsString);
+        }
+        finally
+        {
+            try { File.Delete(snapshotPath); } catch { }
+            try { File.Delete(snapshotPath + ".wal"); } catch { }
+            try { File.Delete(snapshotPath + ".recovery"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Snapshot_SameAsLivePath_ThrowsClearError()
+    {
+        // Copying to the same path would self-truncate the live data file
+        // mid-flush. The engine catches that ahead of File.Copy with an
+        // ArgumentException so the failure mode is "no-op + clear error",
+        // not "corrupt the live database".
+        Assert.Throws<ArgumentException>(() => _db.Snapshot(_dbPath));
+    }
+
+    // --- On-disk lock (issue #26) ---
+
+    [Fact]
+    public void Open_RejectsConcurrentSecondOpener()
+    {
+        // The first DB instance is _db (held open by the test fixture). A
+        // second Open of the same path must surface a clear error rather than
+        // silently allowing both to write.
+        Assert.Throws<DatabaseLockedException>(() => DocumentForgeDb.Open(_dbPath));
+    }
+
+    [Fact]
+    public void Open_AfterClose_AcquiresFreshLock()
+    {
+        // Round-trip: dispose the held lock, reopen — the second open must
+        // succeed once the first has cleanly released.
+        _db.Dispose();
+        using var reopened = DocumentForgeDb.Open(_dbPath);
+        // Smoke-test: a real op proves the engine is functional, not just
+        // that the constructor returned.
+        reopened.Insert("orders", """{"pnr":"AFTER"}""");
+        Assert.Single(reopened.Execute("SELECT * FROM orders").Documents);
+    }
+
+    [Fact]
+    public void Open_StaleLockFromDeadHolder_AutoReclaims()
     {
         _db.Dispose();
+        var lockPath = _dbPath + ".lock";
+
+        // Plant a stale lock pointing at a definitely-dead pid on this host.
+        // 0x7FFFFFFF is impossibly out of range for a real process; the
+        // reclaim path will see it doesn't exist and take the lock.
+        var stale = """{"Pid":2147483646,"Host":""" + System.Text.Json.JsonSerializer.Serialize(Environment.MachineName) + ""","OpenedAtUtc":"2020-01-01T00:00:00Z"}""";
+        File.WriteAllText(lockPath, stale);
+
+        using var reopened = DocumentForgeDb.Open(_dbPath);
+        reopened.Insert("orders", """{"pnr":"X"}""");
+        Assert.Single(reopened.Execute("SELECT * FROM orders").Documents);
+    }
+
+    [Fact]
+    public void Open_StaleLockFromDifferentHost_RefusesWithoutForce()
+    {
+        _db.Dispose();
+        var lockPath = _dbPath + ".lock";
+
+        // Holder claims to be on a different host. We can't probe whether
+        // it's alive remotely, so the safe default is to refuse and surface
+        // the error. The user has to either delete the lock file or pass
+        // ForceUnlock = true.
+        var foreign = """{"Pid":1234,"Host":"some-other-machine","OpenedAtUtc":"2020-01-01T00:00:00Z"}""";
+        File.WriteAllText(lockPath, foreign);
+
+        var ex = Assert.Throws<DatabaseLockedException>(() => DocumentForgeDb.Open(_dbPath));
+        Assert.Equal("some-other-machine", ex.HolderHost);
+        Assert.Equal(1234, ex.HolderPid);
+
+        // ForceUnlock = true bypasses the cross-host check.
+        using var forced = DocumentForgeDb.Open(_dbPath, new DatabaseOptions { ForceUnlock = true });
+        Assert.Equal(0, forced.Execute("SELECT * FROM orders").Documents.Count);
+    }
+
+    public void Dispose()
+    {
+        // Test fixtures occasionally call _db.Dispose() themselves (e.g. lock
+        // round-trip tests). Tolerate the redundant Dispose without throwing.
+        try { _db.Dispose(); } catch { }
         try { File.Delete(_dbPath); } catch { }
         try { File.Delete(_dbPath + ".wal"); } catch { }
         try { File.Delete(_dbPath + ".recovery"); } catch { }
         try { File.Delete(_dbPath + ".followerseq"); } catch { }
+        try { File.Delete(_dbPath + ".lock"); } catch { }
     }
 }

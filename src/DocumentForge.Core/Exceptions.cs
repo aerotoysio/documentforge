@@ -38,3 +38,23 @@ public class TransactionException : DocumentForgeException
 {
     public TransactionException(string message) : base(message) { }
 }
+
+/// <summary>
+/// Thrown when DocumentForgeDb.Open / Create cannot acquire the on-disk
+/// lock for the data file because another process is holding it. The
+/// message names the holder (pid + hostname + open time) so operators can
+/// kill the right process before retrying.
+/// </summary>
+public class DatabaseLockedException : DocumentForgeException
+{
+    public string FilePath { get; }
+    public int HolderPid { get; }
+    public string HolderHost { get; }
+    public DatabaseLockedException(string filePath, int holderPid, string holderHost, string message)
+        : base(message)
+    {
+        FilePath = filePath;
+        HolderPid = holderPid;
+        HolderHost = holderHost;
+    }
+}
