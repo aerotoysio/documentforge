@@ -94,79 +94,18 @@ public sealed class Parser
 
         // JOIN family. Recognised shapes (issue #17 Phase A):
         //   JOIN t ON ...                   — INNER JOIN (default)
-        //   INNER JOIN t ON ...             — explicit INNER
+        //   INNER JOIN t ON ...             — explicit INNER (TODO if needed)
         //   LEFT [OUTER] JOIN t ON ...      — null-pad missing right rows
         //   RIGHT [OUTER] JOIN t ON ...     — null-pad missing left rows
         //   CROSS JOIN t                    — cartesian product, no ON clause
-        // Multi-join chaining (a JOIN b JOIN c) is Phase B; today we still
-        // allow only one JOIN. The parser exits cleanly after the first.
-        var joinType = JoinType.Inner;
-        bool hasJoin = false;
-        if (Current.Type == TokenType.Left)
-        {
-            _pos++;
-            if (Current.Type == TokenType.Outer) _pos++;
-            Expect(TokenType.Join);
-            joinType = JoinType.Left;
-            hasJoin = true;
-        }
-        else if (Current.Type == TokenType.Right)
-        {
-            _pos++;
-            if (Current.Type == TokenType.Outer) _pos++;
-            Expect(TokenType.Join);
-            joinType = JoinType.Right;
-            hasJoin = true;
-        }
-        else if (Current.Type == TokenType.Cross)
-        {
-            _pos++;
-            Expect(TokenType.Join);
-            joinType = JoinType.Cross;
-            hasJoin = true;
-        }
-        else if (Current.Type == TokenType.Join)
-        {
-            _pos++;
-            joinType = JoinType.Inner;
-            hasJoin = true;
-        }
-
-        if (hasJoin)
-        {
-            var joinCollection = ReadIdentifierPath();
-
-            if (joinType == JoinType.Cross)
-            {
-                // CROSS JOIN takes no ON — the join condition is "everything".
-                // Path fields stay empty; the executor recognises the type
-                // and switches to the nested-loop cartesian path.
-                stmt.Join = new JoinClause
-                {
-                    Collection = joinCollection,
-                    Type = joinType,
-                };
-            }
-            else
-            {
-                Expect(TokenType.On);
-                var leftFullPath = ReadIdentifierPath();
-                Expect(TokenType.Equals);
-                var rightFullPath = ReadIdentifierPath();
-                var (leftColl, leftPath) = SplitCollectionPath(leftFullPath, stmt.Collection, joinCollection);
-                var (rightColl, rightPath) = SplitCollectionPath(rightFullPath, stmt.Collection, joinCollection);
-
-                stmt.Join = new JoinClause
-                {
-                    Collection = joinCollection,
-                    LeftCollection = leftColl,
-                    LeftPath = leftPath,
-                    RightCollection = rightColl,
-                    RightPath = rightPath,
-                    Type = joinType,
-                };
-            }
-        }
+        // Phase B (#44): chains. `a JOIN b ON … JOIN c ON …` parses; each
+        // JOIN feeds the next left-deep, the executor evaluates them in
+        // source order.
+        // Phase C (#44): compound ON. `ON a.x = b.x AND a.y = b.y` produces a
+        // JoinClause with multiple Predicates; the hash-join executor keys
+        // on the tuple of right-side values.
+        while (TryParseOneJoin(stmt) is { } parsedJoin)
+            stmt.Joins.Add(parsedJoin);
 
         // WHERE
         if (Current.Type == TokenType.Where)
@@ -643,6 +582,97 @@ public sealed class Parser
         {
             stmt.Fields.Add(ReadIdentifierPath());
         }
+    }
+
+    /// <summary>
+    /// Parse a single JOIN clause if the current token starts one. Returns
+    /// the populated <see cref="JoinClause"/> or null if no join keyword is
+    /// next. Used in a loop by ParseSelect to chain multiple joins.
+    /// </summary>
+    private JoinClause? TryParseOneJoin(SelectStatement stmt)
+    {
+        JoinType type;
+        if (Current.Type == TokenType.Left)
+        {
+            _pos++;
+            if (Current.Type == TokenType.Outer) _pos++;
+            Expect(TokenType.Join);
+            type = JoinType.Left;
+        }
+        else if (Current.Type == TokenType.Right)
+        {
+            _pos++;
+            if (Current.Type == TokenType.Outer) _pos++;
+            Expect(TokenType.Join);
+            type = JoinType.Right;
+        }
+        else if (Current.Type == TokenType.Cross)
+        {
+            _pos++;
+            Expect(TokenType.Join);
+            type = JoinType.Cross;
+        }
+        else if (Current.Type == TokenType.Join)
+        {
+            _pos++;
+            type = JoinType.Inner;
+        }
+        else
+        {
+            return null;
+        }
+
+        var joinCollection = ReadIdentifierPath();
+
+        if (type == JoinType.Cross)
+        {
+            // CROSS JOIN takes no ON — cartesian product.
+            return new JoinClause { Collection = joinCollection, Type = type };
+        }
+
+        Expect(TokenType.On);
+
+        // Phase C: parse one or more `path = path` predicates joined by AND.
+        // Multi-predicate ON keys the hash-join on the tuple of right-side
+        // values; single-predicate is the cheap fast path. The single-pred
+        // legacy fields (LeftPath/RightPath/...) stay populated from
+        // Predicates[0] so the existing executor code keeps working
+        // unchanged for the common case.
+        var predicates = new List<JoinPredicate>();
+        predicates.Add(ReadJoinPredicate(stmt.Collection, joinCollection));
+        while (Current.Type == TokenType.And)
+        {
+            _pos++;
+            predicates.Add(ReadJoinPredicate(stmt.Collection, joinCollection));
+        }
+
+        var first = predicates[0];
+        return new JoinClause
+        {
+            Collection = joinCollection,
+            LeftCollection = first.LeftCollection,
+            LeftPath = first.LeftPath,
+            RightCollection = first.RightCollection,
+            RightPath = first.RightPath,
+            Predicates = predicates,
+            Type = type,
+        };
+    }
+
+    private JoinPredicate ReadJoinPredicate(string outerCollection, string joinCollection)
+    {
+        var leftFullPath = ReadIdentifierPath();
+        Expect(TokenType.Equals);
+        var rightFullPath = ReadIdentifierPath();
+        var (leftColl, leftPath) = SplitCollectionPath(leftFullPath, outerCollection, joinCollection);
+        var (rightColl, rightPath) = SplitCollectionPath(rightFullPath, outerCollection, joinCollection);
+        return new JoinPredicate
+        {
+            LeftCollection = leftColl,
+            LeftPath = leftPath,
+            RightCollection = rightColl,
+            RightPath = rightPath,
+        };
     }
 
     /// <summary>

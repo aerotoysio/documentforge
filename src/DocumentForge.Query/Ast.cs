@@ -10,7 +10,27 @@ public sealed class SelectStatement : Statement
     public List<AggregateField> Aggregates { get; set; } = new();
     public List<string> GroupByPaths { get; set; } = new();
     public string Collection { get; set; } = "";
-    public JoinClause? Join { get; set; }
+
+    /// <summary>
+    /// All JOINs in source order (left-deep). Empty when there's no JOIN.
+    /// Pre-#44 this was a single-valued <c>JoinClause? Join</c>; the property
+    /// below preserves that shape for callers that only ever want the first
+    /// join, but new code should walk <see cref="Joins"/>.
+    /// </summary>
+    public List<JoinClause> Joins { get; set; } = new();
+
+    /// <summary>Back-compat: the first join, or null. Setting this replaces
+    /// the entire <see cref="Joins"/> list.</summary>
+    public JoinClause? Join
+    {
+        get => Joins.Count > 0 ? Joins[0] : null;
+        set
+        {
+            Joins.Clear();
+            if (value is not null) Joins.Add(value);
+        }
+    }
+
     public Expression? Where { get; set; }
     public string? OrderByPath { get; set; }
     public bool OrderDescending { get; set; }
@@ -36,15 +56,34 @@ public sealed class AggregateField
 /// </summary>
 public enum JoinType { Inner, Left, Right, Cross }
 
+/// <summary>One equality predicate of a JOIN's ON clause: the path on the
+/// outer side and the path on the joined side. Multi-predicate ON
+/// (<c>a.x = b.x AND a.y = b.y</c>) carries multiple of these. Issue #44.</summary>
+public sealed class JoinPredicate
+{
+    public string LeftCollection { get; set; } = "";
+    public string LeftPath { get; set; } = "";
+    public string RightCollection { get; set; } = "";
+    public string RightPath { get; set; } = "";
+}
+
 public sealed class JoinClause
 {
     public string Collection { get; set; } = "";
     // Join condition: LeftPath (on outer collection) == RightPath (on joined collection)
     // e.g., "orders.flights[0].flightNumber" == "flights.flightNumber"
+    // Pre-#44 a single equality; now a list. The single-predicate properties
+    // below stay populated from Predicates[0] for the existing executor path.
     public string LeftPath { get; set; } = "";
     public string LeftCollection { get; set; } = "";
     public string RightPath { get; set; } = "";
     public string RightCollection { get; set; } = "";
+
+    /// <summary>All AND-ed equality predicates from the ON clause.
+    /// Single-predicate joins have one entry; CROSS joins have none.
+    /// Issue #44 Phase C: the executor hashes on the tuple of right-side
+    /// values when more than one predicate is present.</summary>
+    public List<JoinPredicate> Predicates { get; set; } = new();
 
     /// <summary>Inner by default — preserves the pre-#17 behaviour for callers
     /// that just write <c>JOIN</c>. CROSS is the only type that doesn't carry
