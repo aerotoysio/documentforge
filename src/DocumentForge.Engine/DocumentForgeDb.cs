@@ -296,37 +296,102 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         if (IsReadOnly) throw new DocumentForgeException("Database is in read-only mode (planned handover in progress).");
     }
 
+    // --- Engine health (issue #25) ---
+    //
+    // Pre-fix an IOException out of WritePage / FlushAll propagated unhandled
+    // through the public Insert/Replace/Delete/Execute surface. The engine
+    // happily kept accepting more writes against a possibly-corrupt page
+    // cache, hoping subsequent writes would succeed — instead they could
+    // silently overwrite earlier-failed pages with new data, masking the
+    // original failure and producing inconsistent state.
+    //
+    // Now: any IOException out of the storage layer flips _health to Failed.
+    // Subsequent writes throw DatabaseHealthException immediately. The only
+    // recovery is Dispose + Open, which runs the recovery-log replay and
+    // restores the on-disk state to a consistent point.
+
+    private DatabaseHealthStatus _health = DatabaseHealthStatus.Healthy;
+
+    /// <summary>Current engine health. <see cref="DatabaseHealthStatus.Failed"/>
+    /// after any IOException out of the storage layer; new writes are rejected
+    /// until Dispose + Open. Surfaces as <c>"degraded"</c> in <c>/health</c>.</summary>
+    public DatabaseHealthStatus HealthStatus => _health;
+
+    /// <summary>The IOException that flipped <see cref="HealthStatus"/> to
+    /// Failed, or null if still healthy. Useful for telemetry / operator
+    /// diagnostics.</summary>
+    public Exception? LastHealthFailure { get; private set; }
+
+    private void EnsureHealthy()
+    {
+        if (_health == DatabaseHealthStatus.Failed)
+            throw new DatabaseHealthException(
+                $"Database '{FilePath}' is in Failed state from an earlier I/O error " +
+                $"({LastHealthFailure?.GetType().Name}: {LastHealthFailure?.Message}). " +
+                "Dispose and Open the database to recover (the recovery log will replay).");
+    }
+
+    /// <summary>Run a write under health tracking: any IOException flips the
+    /// engine to Failed and the original exception re-throws. Read-only ops
+    /// don't go through this — they're allowed to fail without poisoning the
+    /// engine state.</summary>
+    private T TrackHealth<T>(Func<T> op)
+    {
+        try { return op(); }
+        catch (IOException ex)
+        {
+            _health = DatabaseHealthStatus.Failed;
+            LastHealthFailure = ex;
+            throw;
+        }
+    }
+
+    private void TrackHealth(Action op)
+    {
+        try { op(); }
+        catch (IOException ex)
+        {
+            _health = DatabaseHealthStatus.Failed;
+            LastHealthFailure = ex;
+            throw;
+        }
+    }
+
     public DocumentId Insert(string collectionName, BsonDocument doc)
     {
         ThrowIfReadOnly();
+        EnsureHealthy();
         _transactionManager.AcquireWriteLock();
         try
         {
-            var collection = _catalog.GetOrCreateCollection(collectionName);
-            doc.EnsureId(); // ensure _id is set BEFORE we broadcast, so followers get the same id
-            // Stamp the optimistic-concurrency token. Issue #18: every doc the
-            // engine writes carries an `_etag`; clients use it for If-Match
-            // PUTs without inventing their own version field. Caller-supplied
-            // _etag values are intentionally overwritten — clients shouldn't
-            // forge them.
-            doc.StampFreshEtag();
-
-            // Pre-validate uniqueness. If any unique index would reject the doc,
-            // throw BEFORE the page write so the on-disk state is untouched.
-            // Pre-fix this happened in the wrong order: page wrote, index threw,
-            // doc stranded on disk. (issue #9)
-            _indexManager.ValidateUniqueInsert(collectionName, doc);
-
-            var id = collection.Insert(doc);
-            _indexManager.OnDocumentInserted(collectionName, id, doc);
-
-            // Broadcast to read-only followers (with sequence number assignment)
-            if (_logicalServer is not null)
+            return TrackHealth(() =>
             {
-                var bytes = BsonSerializer.Serialize(doc);
-                _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, bytes);
-            }
-            return id;
+                var collection = _catalog.GetOrCreateCollection(collectionName);
+                doc.EnsureId(); // ensure _id is set BEFORE we broadcast, so followers get the same id
+                // Stamp the optimistic-concurrency token. Issue #18: every doc the
+                // engine writes carries an `_etag`; clients use it for If-Match
+                // PUTs without inventing their own version field. Caller-supplied
+                // _etag values are intentionally overwritten — clients shouldn't
+                // forge them.
+                doc.StampFreshEtag();
+
+                // Pre-validate uniqueness. If any unique index would reject the doc,
+                // throw BEFORE the page write so the on-disk state is untouched.
+                // Pre-fix this happened in the wrong order: page wrote, index threw,
+                // doc stranded on disk. (issue #9)
+                _indexManager.ValidateUniqueInsert(collectionName, doc);
+
+                var id = collection.Insert(doc);
+                _indexManager.OnDocumentInserted(collectionName, id, doc);
+
+                // Broadcast to read-only followers (with sequence number assignment)
+                if (_logicalServer is not null)
+                {
+                    var bytes = BsonSerializer.Serialize(doc);
+                    _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, bytes);
+                }
+                return id;
+            });
         }
         finally
         {
@@ -453,43 +518,47 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     public bool Replace(string collectionName, DocumentId id, BsonDocument newDoc)
     {
         ThrowIfReadOnly();
+        EnsureHealthy();
         _transactionManager.AcquireWriteLock();
         try
         {
-            var collection = _catalog.GetOrCreateCollection(collectionName);
-            var oldDoc = collection.FindById(id);
-            if (oldDoc is null) return false;
-
-            // Always preserve the original _id so the replacement is in place.
-            newDoc["_id"] = oldDoc["_id"];
-            // Re-stamp the optimistic-concurrency token. Issue #18: every Replace
-            // mints a fresh _etag so subsequent If-Match clients see the change.
-            newDoc.StampFreshEtag();
-
-            // Validate + apply index changes FIRST. If validation throws (e.g. a
-            // unique-index collision with a different doc), the page is untouched -
-            // no half-commits. Only if the index transition succeeds do we commit
-            // the page.
-            _indexManager.OnDocumentUpdated(collectionName, id, oldDoc, newDoc);
-
-            if (!collection.Update(id, newDoc))
+            return TrackHealth(() =>
             {
-                // Page write failed for an unexpected reason - try to put the index
-                // back where it was. Best-effort: validation already passed for the
-                // forward direction, so the reverse should too.
-                try { _indexManager.OnDocumentUpdated(collectionName, id, newDoc, oldDoc); } catch { }
-                return false;
-            }
+                var collection = _catalog.GetOrCreateCollection(collectionName);
+                var oldDoc = collection.FindById(id);
+                if (oldDoc is null) return false;
 
-            // Replicate as delete + insert (LogicalOpType.Update is on the roadmap).
-            if (_logicalServer is not null)
-            {
-                var oldBytes = BsonSerializer.Serialize(oldDoc);
-                _logicalServer.BroadcastNewOp(LogicalOpType.Delete, collectionName, oldBytes);
-                var newBytes = BsonSerializer.Serialize(newDoc);
-                _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, newBytes);
-            }
-            return true;
+                // Always preserve the original _id so the replacement is in place.
+                newDoc["_id"] = oldDoc["_id"];
+                // Re-stamp the optimistic-concurrency token. Issue #18: every Replace
+                // mints a fresh _etag so subsequent If-Match clients see the change.
+                newDoc.StampFreshEtag();
+
+                // Validate + apply index changes FIRST. If validation throws (e.g. a
+                // unique-index collision with a different doc), the page is untouched -
+                // no half-commits. Only if the index transition succeeds do we commit
+                // the page.
+                _indexManager.OnDocumentUpdated(collectionName, id, oldDoc, newDoc);
+
+                if (!collection.Update(id, newDoc))
+                {
+                    // Page write failed for an unexpected reason - try to put the index
+                    // back where it was. Best-effort: validation already passed for the
+                    // forward direction, so the reverse should too.
+                    try { _indexManager.OnDocumentUpdated(collectionName, id, newDoc, oldDoc); } catch { }
+                    return false;
+                }
+
+                // Replicate as delete + insert (LogicalOpType.Update is on the roadmap).
+                if (_logicalServer is not null)
+                {
+                    var oldBytes = BsonSerializer.Serialize(oldDoc);
+                    _logicalServer.BroadcastNewOp(LogicalOpType.Delete, collectionName, oldBytes);
+                    var newBytes = BsonSerializer.Serialize(newDoc);
+                    _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, newBytes);
+                }
+                return true;
+            });
         }
         finally
         {
@@ -515,6 +584,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     public string? ReplaceIfEtag(string collectionName, DocumentId id, BsonDocument newDoc, string expectedEtag)
     {
         ThrowIfReadOnly();
+        EnsureHealthy();
         _transactionManager.AcquireWriteLock();
         try
         {
@@ -739,8 +809,9 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         if (isWrite)
         {
             ThrowIfReadOnly();
+            EnsureHealthy();
             _transactionManager.AcquireWriteLock();
-            try { return _queryExecutor.Execute(query); }
+            try { return TrackHealth(() => _queryExecutor.Execute(query)); }
             finally { _transactionManager.ReleaseWriteLock(); }
         }
         else
@@ -1361,7 +1432,12 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
 
     public void Flush()
     {
-        _pageCache.FlushAll();
+        // Health check is intentionally NOT here: a Failed engine should still
+        // be Flushable (the recovery log replay on next Open is the path back
+        // to Healthy, but until then a manual Flush attempt is allowed and
+        // simply re-throws if the underlying I/O is still broken). Wrap in
+        // TrackHealth so a fresh failure flips the state.
+        TrackHealth(() => _pageCache.FlushAll());
     }
 
     /// <summary>
