@@ -517,11 +517,18 @@ public sealed class DocumentForgeCluster : IDisposable
     internal void ExecuteOnShardForTx(int shardIndex, IReadOnlyList<ShardTxOp> ops) =>
         _shards[shardIndex].ExecuteTransaction(ops);
 
+    /// <summary>
+    /// Default per-tx PREPARE timeout used by <see cref="ClusterTransaction.Commit"/>.
+    /// Configurable; defaults to 30s. Phase D liveness fix: a participant
+    /// stuck in PREPARED past this deadline self-aborts.
+    /// </summary>
+    public TimeSpan PrepareTimeout { get; set; } = TimeSpan.FromSeconds(30);
+
     // 2PC participant calls (Phase B.2). The cluster relays these straight
     // to the relevant shard's transport.
     internal string GetShardNameForTx(int shardIndex) => _shardNames[shardIndex];
     internal PrepareResult PrepareOnShardForTx(int shardIndex, string txId, string coordinatorShardId, IReadOnlyList<ShardTxOp> ops) =>
-        _shards[shardIndex].Prepare(txId, coordinatorShardId, ops);
+        _shards[shardIndex].Prepare(txId, coordinatorShardId, ops, PrepareTimeout);
     internal void CommitOnShardForTx(int shardIndex, string txId) =>
         _shards[shardIndex].CommitPrepared(txId);
     internal void RollbackOnShardForTx(int shardIndex, string txId) =>
