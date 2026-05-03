@@ -68,6 +68,10 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         public RecoveryLogHook(RecoveryLog log) => _log = log;
         public void OnBeforeFlush(PageId pageId, byte[] pageData) => _log.LogPageWrite(pageId, pageData);
         public void OnAfterFlushComplete() { _log.Flush(); _log.Truncate(); }
+        // Eviction path: fsync the log so recovery replay can resurrect the
+        // evicted page if the data-file write was lost. Don't truncate —
+        // we still need the entries for the next FlushAll's truncate cycle.
+        public void EnsureLogDurable() => _log.Flush();
     }
 
     /// <summary>
@@ -88,6 +92,10 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         {
             foreach (var h in _hooks) h.OnAfterFlushComplete();
         }
+        public void EnsureLogDurable()
+        {
+            foreach (var h in _hooks) h.EnsureLogDurable();
+        }
     }
 
     /// <summary>
@@ -99,6 +107,9 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         public ReplicationHook(ReplicationServer server) => _server = server;
         public void OnBeforeFlush(PageId pageId, byte[] pageData) => _server.BroadcastPageWrite(pageId, pageData);
         public void OnAfterFlushComplete() { }
+        // Replication has no durability concept — broadcast is fire-and-forget;
+        // followers reconnect on disconnect. Nothing to fsync here.
+        public void EnsureLogDurable() { }
     }
 
     public static DocumentForgeDb Create(string filePath, DatabaseOptions? options = null)
