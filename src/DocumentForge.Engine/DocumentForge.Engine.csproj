@@ -12,4 +12,14 @@
     <ProjectReference Include="..\DocumentForge.Query\DocumentForge.Query.csproj" />
     <ProjectReference Include="..\DocumentForge.Transactions\DocumentForge.Transactions.csproj" />
   </ItemGroup>
+
+  <!--
+    Open the engine's `internal` test seams (`OpenWithDataFile`) to the test
+    project so the crash-injection harness (issue #28) can inject a faulty
+    IDataFile around a real DataFile without leaking that surface to public
+    API consumers.
+  -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="DocumentForge.Tests" />
+  </ItemGroup>
 </Project>

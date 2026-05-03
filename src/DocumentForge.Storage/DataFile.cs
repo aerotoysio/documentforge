@@ -9,6 +9,15 @@ public interface IDataFile : IDisposable
     uint PageCount { get; }
     PageId AllocateNewPage();
     void Flush();
+
+    /// <summary>Read the index catalog root page pointer from the file header.
+    /// Returns <see cref="PageId.Invalid"/> if never set.</summary>
+    PageId GetIndexCatalogPage();
+
+    /// <summary>Write the index catalog root page pointer to the file header
+    /// and fsync. Decorators (e.g. the crash-injection harness) can intercept
+    /// this for fault testing.</summary>
+    void SetIndexCatalogPage(PageId pageId);
 }
 
 public sealed class DataFile : IDataFile
