@@ -1587,7 +1587,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     /// Applies incoming ops through the engine's own Insert/Delete/CreateIndex so indexes
     /// and location maps stay coherent. Queries on this instance will see replicated data.
     /// </summary>
-    public void StartLogicalReplicationFollower(string host, int port, string? sharedSecret = null)
+    public void StartLogicalReplicationFollower(string host, int port, string? sharedSecret = null, string? ownHttpEndpoint = null)
     {
         if (_logicalFollower is not null)
             throw new DocumentForgeException("Logical replication follower already running.");
@@ -1597,7 +1597,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         _logicalFollower = new LogicalReplicationFollower(host, port, seqFilePath, op =>
         {
             ApplyFollowerOp(op);
-        }, secret: sharedSecret)
+        }, secret: sharedSecret, ownHttpEndpoint: ownHttpEndpoint)
         {
             // Issue #20: opt in to snapshot transfer. The leader streams a
             // full data file when this follower can't catch up via the OpLog
