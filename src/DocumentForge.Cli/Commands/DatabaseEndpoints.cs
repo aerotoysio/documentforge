@@ -117,8 +117,125 @@ public static class DatabaseEndpoints
             catch (DocumentForgeException ex) { return Results.NotFound(new { error = ex.Message }); }
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
+
+        // ----------------------------------------------------------------
+        // Issue #66 Phase 2.5 — per-DB replication. Each attached DB has
+        // its own _logicalServer / _logicalFollower; until this lands the
+        // flat /replication/* routes only operate on whichever DB was the
+        // initial default at service startup.
+        //
+        // With these routes, "DB A leads, DB B follows A" works inside
+        // one service:
+        //   POST /db/A/replication/start-leader   {"port": 5500}
+        //   POST /db/B/replication/start-follower {"host":"localhost","port":5500}
+        // ----------------------------------------------------------------
+
+        // Per-DB replication status — derived from live engine state, not
+        // startup config. Returns 404 when the named DB isn't attached.
+        app.MapGet("/db/{name}/replication/status", (string name) =>
+        {
+            var db = registry.TryGet(name);
+            if (db is null)
+                return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            var currentSeq = db.LeaderCurrentSeq;
+            var followers = db.GetLogicalFollowers();
+            return Results.Ok(new
+            {
+                database = name,
+                role = db.LogicalReplicationRole,
+                readOnly = db.IsReadOnly,
+                leader = new
+                {
+                    currentSeq,
+                    followerCount = db.GetLogicalFollowerCount(),
+                    followers = followers.Select(f => new
+                    {
+                        endpoint = f.Endpoint,
+                        httpEndpoint = f.HttpEndpoint,
+                        connectedAt = f.ConnectedAtUtc,
+                        handshakeSeq = f.HandshakeSeq,
+                        worstCaseLagSeq = currentSeq > f.HandshakeSeq
+                            ? currentSeq - f.HandshakeSeq : 0UL,
+                    }).ToArray(),
+                },
+                follower = new
+                {
+                    lastAppliedSeq = db.FollowerLastSeq,
+                    opsApplied = db.LogicallyReplicatedOps(),
+                    gapsDetected = db.GapsDetected,
+                    autoFailoverPromoted = db.WasAutoFailoverPromoted,
+                    leader = db.LogicalFollowerLeaderEndpoint is null
+                        ? null
+                        : (object)new { endpoint = db.LogicalFollowerLeaderEndpoint, httpEndpoint = (string?)null },
+                }
+            });
+        });
+
+        // Mount this DB as a replication leader on a dedicated TCP port.
+        // The port has to differ from the service's HTTP port and from
+        // any other DB's replication port in the same service.
+        app.MapPost("/db/{name}/replication/start-leader", (string name, StartLeaderBody body) =>
+        {
+            var db = registry.TryGet(name);
+            if (db is null)
+                return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            try
+            {
+                db.StartLogicalReplicationServer(body.Port, body.SharedSecret);
+                return Results.Ok(new { database = name, role = "leader", port = body.Port });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        // Mount this DB as a follower of another DB (same service or remote).
+        // First action on a fresh follower triggers a snapshot transfer from
+        // the leader — any existing data in this DB is replaced.
+        app.MapPost("/db/{name}/replication/start-follower", (string name, StartFollowerBody body) =>
+        {
+            var db = registry.TryGet(name);
+            if (db is null)
+                return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            try
+            {
+                db.StartLogicalReplicationFollower(body.Host, body.Port, body.SharedSecret,
+                    ownHttpEndpoint: null);
+                return Results.Ok(new
+                {
+                    database = name,
+                    role = "follower",
+                    leader = $"{body.Host}:{body.Port}",
+                });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        // Manual promotion — same semantics as the flat /replication/promote
+        // but scoped to a named DB. Use during planned handover, or after a
+        // leader-side crash, to flip a follower into leader on its own port.
+        app.MapPost("/db/{name}/replication/promote", (string name, PromoteBody body) =>
+        {
+            var db = registry.TryGet(name);
+            if (db is null)
+                return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            try
+            {
+                db.PromoteToLeader(body.Port);
+                return Results.Ok(new { database = name, role = "leader", port = body.Port });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
     }
 }
+
+// ----------------------------------------------------------------
+// Issue #66 Phase 2.5: per-DB replication request bodies. Distinct
+// from the flat StartLeaderRequest/etc. records in ServeCommand so
+// the scoped surface can evolve independently (e.g. add a `force`
+// flag for re-attaching a follower to a different leader).
+// ----------------------------------------------------------------
+public record StartLeaderBody(int Port, string? SharedSecret = null);
+public record StartFollowerBody(string Host, int Port, string? SharedSecret = null);
+public record PromoteBody(int Port);
 
 /// <summary>
 /// Issue #66: payload for POST /databases. Path optional — if absent we

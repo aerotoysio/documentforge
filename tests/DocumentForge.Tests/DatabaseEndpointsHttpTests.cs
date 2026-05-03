@@ -239,6 +239,100 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
     }
 
     [Fact]
+    public async Task ScopedReplication_AlphaLeadsBeta_InsertPropagates()
+    {
+        // The "swarm on one box" demo: two attached DBs in one service,
+        // wire one as leader and the other as its follower over local TCP,
+        // insert into the leader, observe in the follower. Pre-Phase 2.5
+        // this required two `dfdb serve` processes; the scoped routes
+        // make it intra-service.
+        var (registry, baseUrl, _) = BootServer();
+
+        // Phase 1: stand up alpha + beta.
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "alpha" });
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "beta" });
+
+        // Phase 2: alpha leader on a free TCP port.
+        var replPort = FindFreePort();
+        var leaderResp = await _http.PostAsJsonAsync(
+            $"{baseUrl}/db/alpha/replication/start-leader", new { port = replPort });
+        leaderResp.EnsureSuccessStatusCode();
+
+        // Phase 3: beta dials alpha. Same process — loopback only.
+        var followerResp = await _http.PostAsJsonAsync(
+            $"{baseUrl}/db/beta/replication/start-follower",
+            new { host = "localhost", port = replPort });
+        followerResp.EnsureSuccessStatusCode();
+
+        // Phase 4: wait for handshake to complete. The TCP connect + snapshot
+        // transfer is async; poll status until alpha sees its follower OR
+        // we hit a generous deadline. The deadline guards against a
+        // genuinely broken wiring rather than slow CI — handshake is
+        // usually <100ms on loopback.
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (DateTime.UtcNow < deadline)
+        {
+            var status = await _http.GetFromJsonAsync<ReplicationStatusResponse>(
+                $"{baseUrl}/db/alpha/replication/status");
+            if (status?.Leader?.FollowerCount > 0) break;
+            await Task.Delay(100);
+        }
+
+        // Phase 5: drive a write through alpha's engine directly (bypassing
+        // the flat /collections route's set-default plumbing) and verify
+        // beta sees it. We use the engine instances from the registry to
+        // keep the test focused on replication, not on route routing.
+        var alpha = registry.Get("alpha");
+        var beta = registry.Get("beta");
+        alpha.Insert("orders", """{"pnr":"REP-A1"}""");
+
+        // Replication is async — wait for the op to land on beta.
+        var seen = false;
+        deadline = DateTime.UtcNow.AddSeconds(10);
+        while (DateTime.UtcNow < deadline)
+        {
+            var rows = beta.Execute("SELECT * FROM orders").Documents;
+            if (rows.Count == 1 && rows[0]["pnr"].AsString == "REP-A1")
+            {
+                seen = true;
+                break;
+            }
+            await Task.Delay(100);
+        }
+        Assert.True(seen, "Beta never received the replicated insert.");
+
+        // Phase 6: status surface — alpha reports beta as a follower,
+        // beta reports alpha as its leader endpoint.
+        var alphaStatus = await _http.GetFromJsonAsync<ReplicationStatusResponse>(
+            $"{baseUrl}/db/alpha/replication/status");
+        var betaStatus = await _http.GetFromJsonAsync<ReplicationStatusResponse>(
+            $"{baseUrl}/db/beta/replication/status");
+        Assert.Equal("leader", alphaStatus!.Role);
+        Assert.True(alphaStatus.Leader!.FollowerCount >= 1);
+        Assert.Equal("follower", betaStatus!.Role);
+        Assert.NotNull(betaStatus.Follower?.Leader);
+        Assert.Equal($"localhost:{replPort}", betaStatus.Follower!.Leader!.Endpoint);
+    }
+
+    [Fact]
+    public async Task ScopedReplication_UnknownDatabase_Returns404()
+    {
+        var (_, baseUrl, _) = BootServer();
+        // No DB called "ghost" — every scoped verb must 404, not 500.
+        var statusResp = await _http.GetAsync($"{baseUrl}/db/ghost/replication/status");
+        Assert.Equal(HttpStatusCode.NotFound, statusResp.StatusCode);
+
+        var leaderResp = await _http.PostAsJsonAsync(
+            $"{baseUrl}/db/ghost/replication/start-leader", new { port = 5500 });
+        Assert.Equal(HttpStatusCode.NotFound, leaderResp.StatusCode);
+
+        var followerResp = await _http.PostAsJsonAsync(
+            $"{baseUrl}/db/ghost/replication/start-follower",
+            new { host = "localhost", port = 5500 });
+        Assert.Equal(HttpStatusCode.NotFound, followerResp.StatusCode);
+    }
+
+    [Fact]
     public async Task SwarmScenario_AttachThreeDropOne_StateConsistent()
     {
         // The user-facing point of Phase 2: "create a swarm on one box."
@@ -283,5 +377,26 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
         public string Name { get; set; } = "";
         public string Action { get; set; } = "";
         public string? DefaultAfter { get; set; }
+    }
+    private sealed class ReplicationStatusResponse
+    {
+        public string Database { get; set; } = "";
+        public string Role { get; set; } = "";
+        public ReplicationLeaderInfo? Leader { get; set; }
+        public ReplicationFollowerInfo? Follower { get; set; }
+    }
+    private sealed class ReplicationLeaderInfo
+    {
+        public ulong CurrentSeq { get; set; }
+        public int FollowerCount { get; set; }
+    }
+    private sealed class ReplicationFollowerInfo
+    {
+        public ulong LastAppliedSeq { get; set; }
+        public ReplicationLeaderEndpoint? Leader { get; set; }
+    }
+    private sealed class ReplicationLeaderEndpoint
+    {
+        public string Endpoint { get; set; } = "";
     }
 }
