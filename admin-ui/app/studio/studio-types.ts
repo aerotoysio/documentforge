@@ -7,6 +7,9 @@ export interface BaseTab {
   kind: TabKind;
   title: string;
   refreshKey?: number;    // bump to force a child re-fetch
+  connectionId?: string;  // pinned at tab creation; switching the global active
+                          // connection no longer yanks open tabs out from under
+                          // the user. Undefined = follow the global active.
 }
 
 export interface QueryTabState extends BaseTab {
@@ -49,5 +52,6 @@ export interface TabContext {
   openInspector: (collection: string, doc: any) => void;
   closeTab: (tabId: string) => void;
   refreshTab: (tabId: string) => void;
+  setTabConnection: (tabId: string, connectionId: string) => void;
   notifyChanged: (collection: string) => void;
 }

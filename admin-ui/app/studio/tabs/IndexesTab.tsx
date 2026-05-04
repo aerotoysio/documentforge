@@ -2,9 +2,10 @@
 
 import { useEffect, useState } from 'react';
 import { getIndexes, createIndex, rebuildIndex, rebuildIndexes } from '@/lib/api';
+import type { Connection } from '@/lib/connections';
 import type { TabContext } from '../studio-types';
 
-export function IndexesTab({ tab, ctx }: { tab: any; ctx: TabContext }) {
+export function IndexesTab({ tab, ctx, connection }: { tab: any; ctx: TabContext; connection: Connection | null }) {
   const collection: string = tab.collection;
   const [indexes, setIndexes] = useState<any[]>([]);
   const [loading, setLoading] = useState(true);
@@ -18,19 +19,19 @@ export function IndexesTab({ tab, ctx }: { tab: any; ctx: TabContext }) {
   async function refresh() {
     setLoading(true);
     try {
-      const r = await getIndexes(collection);
+      const r = await getIndexes(collection, { connection });
       setIndexes(r.indexes ?? []);
     } catch (e: any) { setMsg({ kind: 'err', text: e.message || String(e) }); }
     finally { setLoading(false); }
   }
 
-  useEffect(() => { refresh(); /* eslint-disable-next-line */ }, [collection, tab.refreshKey]);
+  useEffect(() => { refresh(); /* eslint-disable-next-line */ }, [collection, tab.refreshKey, connection?.id]);
 
   async function add() {
     if (!path) return;
     const idxName = name || `idx_${collection}_${path.replace(/[.\[\]]/g, '_')}`;
     try {
-      await createIndex(collection, path, idxName, unique);
+      await createIndex(collection, path, idxName, unique, { connection });
       setPath(''); setUnique(false); setName('');
       setMsg({ kind: 'ok', text: `Created ${idxName}.` });
       ctx.notifyChanged(collection);
@@ -40,14 +41,14 @@ export function IndexesTab({ tab, ctx }: { tab: any; ctx: TabContext }) {
 
   async function rebuild(idxName: string) {
     try {
-      const r = await rebuildIndex(collection, idxName);
+      const r = await rebuildIndex(collection, idxName, { connection });
       setMsg({ kind: 'ok', text: `Rebuilt ${idxName} in ${r.timeMs?.toFixed?.(1) ?? '?'}ms.` });
     } catch (e: any) { setMsg({ kind: 'err', text: e.message || String(e) }); }
   }
 
   async function rebuildAll() {
     try {
-      const r = await rebuildIndexes(collection);
+      const r = await rebuildIndexes(collection, { connection });
       setMsg({ kind: 'ok', text: `Rebuilt ${r.indexesRebuilt} indexes in ${r.timeMs?.toFixed?.(1) ?? '?'}ms.` });
     } catch (e: any) { setMsg({ kind: 'err', text: e.message || String(e) }); }
   }
