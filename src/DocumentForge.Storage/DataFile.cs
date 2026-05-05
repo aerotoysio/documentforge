@@ -40,8 +40,78 @@ public sealed class DataFile : IDataFile
     public static DataFile Open(string filePath)
     {
         var stream = new FileStream(filePath, FileMode.Open, FileAccess.ReadWrite, FileShare.Read, Constants.PageSize, FileOptions.RandomAccess);
+        try
+        {
+            ValidateHeader(filePath, stream);
+        }
+        catch
+        {
+            stream.Dispose();
+            throw;
+        }
         var pageCount = (uint)(stream.Length / Constants.PageSize);
         return new DataFile(stream, pageCount);
+    }
+
+    /// <summary>
+    /// Issue #57: refuse to Open a data file whose header is missing, truncated,
+    /// has wrong magic bytes, or has an unsupported format version. Throws
+    /// <see cref="DatabaseCorruptedException"/> with a precise message so the
+    /// operator can decide between "restore from backup" and "wrong file."
+    ///
+    /// <para>
+    /// We deliberately do NOT checksum-verify the header page here even though
+    /// every other page is checksum-protected. The header page reuses bytes 24-27
+    /// (the page-checksum slot in normal pages) for the index-catalog root pointer
+    /// (<see cref="GetIndexCatalogPage"/>/<see cref="SetIndexCatalogPage"/>), so a
+    /// CRC verify on those bytes against the rest of the page would be a
+    /// guaranteed false positive on any database with at least one index. The
+    /// magic+version check is the strongest practical integrity gate at this
+    /// layer; deeper corruption (torn page-chain links, etc.) is caught by the
+    /// per-page cycle/range guards in the catalog and collection loaders.
+    /// </para>
+    /// </summary>
+    private static void ValidateHeader(string filePath, FileStream stream)
+    {
+        if (stream.Length < Constants.PageSize)
+            throw new DatabaseCorruptedException(filePath,
+                $"file is {stream.Length} bytes; smaller than a single {Constants.PageSize}-byte page. " +
+                "The header is missing or the file was truncated.");
+
+        var header = new byte[Constants.PageSize];
+        stream.Seek(0, SeekOrigin.Begin);
+        int totalRead = 0;
+        while (totalRead < Constants.PageSize)
+        {
+            int read = stream.Read(header, totalRead, Constants.PageSize - totalRead);
+            if (read == 0) break;
+            totalRead += read;
+        }
+        if (totalRead < Constants.PageSize)
+            throw new DatabaseCorruptedException(filePath,
+                $"could not read the {Constants.PageSize}-byte header page (got {totalRead} bytes).");
+
+        // Magic: bytes 0-3 must be ASCII "DFDB". A wrong magic almost always means
+        // the file isn't ours — stale .dfdb path, copy of an unrelated binary, or
+        // a totally garbled header from a torn write.
+        for (int i = 0; i < Constants.MagicBytes.Length; i++)
+        {
+            if (header[i] != Constants.MagicBytes[i])
+                throw new DatabaseCorruptedException(filePath,
+                    $"header magic bytes are wrong (expected 'DFDB', got " +
+                    $"0x{header[0]:X2}{header[1]:X2}{header[2]:X2}{header[3]:X2}). " +
+                    "This is either not a DocumentForge data file or the header is destroyed.");
+        }
+
+        // Version: bytes 4-7. We only know how to read FileFormatVersion files;
+        // newer formats deliberately fail-fast rather than silently misinterpret.
+        var fileVersion = BitConverter.ToInt32(header, 4);
+        if (fileVersion != Constants.FileFormatVersion)
+            throw new DatabaseCorruptedException(filePath,
+                $"file format version {fileVersion} is not supported by this build " +
+                $"(expected {Constants.FileFormatVersion}).");
+
+        // Header checks pass. Stream position is at PageSize; callers re-seek as needed.
     }
 
     public static DataFile Create(string filePath)

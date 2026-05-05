@@ -4687,6 +4687,177 @@ public class EngineTests : IDisposable
         }
     }
 
+    // ---------------------------------------------------------------------
+    //  Issue #57 regression suite — header validation + page-chain hang fix
+    // ---------------------------------------------------------------------
+    //
+    // Pre-fix: an ungraceful kill (kill -9 / Stop-Process -Force) could leave
+    // the data file in a state where the catalog/collection page-chain walkers
+    // followed a torn NextPageId pointer into a cycle and hung the host process
+    // indefinitely on the next Open. The user's repro was 90s+ no exception, no
+    // log output, no progress.
+    //
+    // The five tests below cover both halves of the fix:
+    //  (a) DataFile.Open header validation: refuse the open with a typed
+    //      DatabaseCorruptedException for truncated / wrong-magic / wrong-version
+    //      files.
+    //  (b) Cycle detection in BuildLocationMap and IndexCatalog.Load: throw
+    //      PageCorruptionException instead of looping. The wall-clock guard
+    //      proves we exit fast — that's the actual regression.
+
+    [Fact]
+    public void Open_OnTruncatedFile_ThrowsDatabaseCorruptedException_Issue57()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"truncated_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using (var s = File.Create(path)) s.Write(new byte[100]); // < one page
+            var ex = Assert.Throws<DatabaseCorruptedException>(() => DocumentForgeDb.Open(path));
+            Assert.Contains("smaller than a single", ex.Message);
+        }
+        finally { try { File.Delete(path); } catch { } try { File.Delete(path + ".lock"); } catch { } }
+    }
+
+    [Fact]
+    public void Open_OnInvalidMagicBytes_ThrowsDatabaseCorruptedException_Issue57()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"badmagic_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using (var db = DocumentForgeDb.Create(path))
+            {
+                db.Insert("foo", """{"x":1}""");
+                db.Flush();
+            }
+            // Stomp the 4-byte magic with garbage.
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Write))
+            {
+                fs.Seek(0, SeekOrigin.Begin);
+                fs.Write(new byte[] { 0xDE, 0xAD, 0xBE, 0xEF }, 0, 4);
+            }
+            var ex = Assert.Throws<DatabaseCorruptedException>(() => DocumentForgeDb.Open(path));
+            Assert.Contains("magic bytes", ex.Message);
+        }
+        finally
+        {
+            foreach (var ext in new[] { "", ".wal", ".recovery", ".followerseq", ".lock" })
+                try { File.Delete(path + ext); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Open_OnUnsupportedVersion_ThrowsDatabaseCorruptedException_Issue57()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"badver_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using (var db = DocumentForgeDb.Create(path))
+            {
+                db.Insert("foo", """{"x":1}""");
+                db.Flush();
+            }
+            // Patch the version field at offset 4 to a value we don't support.
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Write))
+            {
+                fs.Seek(4, SeekOrigin.Begin);
+                fs.Write(BitConverter.GetBytes(int.MaxValue), 0, 4);
+            }
+            var ex = Assert.Throws<DatabaseCorruptedException>(() => DocumentForgeDb.Open(path));
+            Assert.Contains("file format version", ex.Message);
+        }
+        finally
+        {
+            foreach (var ext in new[] { "", ".wal", ".recovery", ".followerseq", ".lock" })
+                try { File.Delete(path + ext); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Open_OnCorruptHeaderReleasesLock_Issue57()
+    {
+        // The corruption check throws *after* DatabaseLock.Acquire. Verify the
+        // failure path still releases the lock so a second Open attempt (e.g.
+        // operator retrying after restoring from backup over the same path) can
+        // proceed instead of getting wedged behind a phantom locker.
+        var path = Path.Combine(Path.GetTempPath(), $"lockrelease_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using (var db = DocumentForgeDb.Create(path)) db.Flush();
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Write))
+            {
+                fs.Seek(0, SeekOrigin.Begin);
+                fs.Write(new byte[4], 0, 4); // wipe magic
+            }
+            Assert.Throws<DatabaseCorruptedException>(() => DocumentForgeDb.Open(path));
+
+            // Restore a clean DB at the same path; if the prior Open didn't
+            // release its lock, this Create would throw DatabaseLockedException.
+            File.Delete(path); // simulate restore-from-backup
+            using var fresh = DocumentForgeDb.Create(path);
+            fresh.Insert("ok", """{"x":1}""");
+        }
+        finally
+        {
+            foreach (var ext in new[] { "", ".wal", ".recovery", ".followerseq", ".lock" })
+                try { File.Delete(path + ext); } catch { }
+        }
+    }
+
+    [Fact]
+    public async System.Threading.Tasks.Task Open_OnCyclicCollectionChain_FailsFast_DoesNotHang_Issue57()
+    {
+        // Reproduces the 90-second-no-progress hang from issue #57. We:
+        //  1. Build a real two-page chain by inserting enough docs to overflow page 1.
+        //  2. Patch the first data page's NextPageId so it points back to itself.
+        //  3. Open the file and BuildLocationMap. Pre-fix: hangs forever.
+        //     Post-fix: throws PageCorruptionException within milliseconds.
+        var path = Path.Combine(Path.GetTempPath(), $"cycle_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            PageId firstDataPage;
+            using (var db = DocumentForgeDb.Create(path))
+            {
+                // Pad each doc large enough to fill the page in O(100) inserts.
+                var pad = new string('x', 200);
+                for (int i = 0; i < 200; i++)
+                    db.Insert("orders", $$"""{"i":{{i}},"pad":"{{pad}}"}""");
+                firstDataPage = db.GetCollection("orders")!.FirstDataPage;
+                db.Flush();
+            }
+            Assert.True(firstDataPage.IsValid);
+
+            // Stamp NextPageId at offset 11 of the first data page → cycle.
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Write))
+            {
+                fs.Seek(firstDataPage.FileOffset + 11, SeekOrigin.Begin);
+                fs.Write(BitConverter.GetBytes(firstDataPage.Value), 0, 4);
+            }
+
+            // Wall-clock guard: the test process must not block. If the chain
+            // walker hangs (pre-fix), the timeout wins and we fail with a clear
+            // message. Post-fix it throws ~instantly.
+            var work = System.Threading.Tasks.Task.Run(() =>
+            {
+                using var db = DocumentForgeDb.Open(path);
+                // BuildLocationMap runs eagerly inside Open; we also query for
+                // belt-and-braces coverage.
+                db.Execute("SELECT * FROM orders");
+            });
+            var timeout = System.Threading.Tasks.Task.Delay(TimeSpan.FromSeconds(5));
+            var winner = await System.Threading.Tasks.Task.WhenAny(work, timeout);
+            Assert.True(winner == work,
+                "Open / query on a cyclic page chain hung past 5s — the cycle guard didn't catch it.");
+
+            var ex = await Assert.ThrowsAsync<PageCorruptionException>(async () => await work);
+            Assert.Contains("cycle", ex.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            foreach (var ext in new[] { "", ".wal", ".recovery", ".followerseq", ".lock" })
+                try { File.Delete(path + ext); } catch { }
+        }
+    }
+
     public void Dispose()
     {
         // Test fixtures occasionally call _db.Dispose() themselves (e.g. lock

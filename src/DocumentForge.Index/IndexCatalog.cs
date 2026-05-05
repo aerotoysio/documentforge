@@ -32,8 +32,17 @@ public sealed class IndexCatalog
         if (!_catalogPage.IsValid) return;
 
         var pageId = _catalogPage;
+        // Issue #57: cycle guard. A torn write that leaves a corrupt NextPageId
+        // pointing back into the chain (or to page 0) would otherwise loop here
+        // forever during Open and hang the host process before any caller-visible
+        // exception is raised.
+        var visited = new HashSet<uint>();
         while (pageId.IsValid)
         {
+            if (!visited.Add(pageId.Value))
+                throw new PageCorruptionException(pageId,
+                    $"cycle detected in index-catalog page chain after {visited.Count} pages.");
+
             var pageData = _cache.GetPage(pageId);
             var page = new DataPage(pageData);
 
@@ -61,11 +70,16 @@ public sealed class IndexCatalog
         // and the previous Save left exactly the chain we need to overwrite.
         // Pages we don't end up needing get freed at the end.
         var existing = new List<PageId>();
+        // Issue #57: cycle guard — same risk profile as Load.
+        var existingVisited = new HashSet<uint>();
         if (_catalogPage.IsValid)
         {
             var p = _catalogPage;
             while (p.IsValid)
             {
+                if (!existingVisited.Add(p.Value))
+                    throw new PageCorruptionException(p,
+                        $"cycle detected in index-catalog page chain during save after {existing.Count} pages.");
                 existing.Add(p);
                 var data = _cache.GetPage(p);
                 p = new DataPage(data).Header.NextPageId;
