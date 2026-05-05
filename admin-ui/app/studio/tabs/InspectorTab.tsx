@@ -2,9 +2,10 @@
 
 import { useEffect, useState } from 'react';
 import { findById, replaceById, deleteById } from '@/lib/api';
+import type { Connection } from '@/lib/connections';
 import type { TabContext } from '../studio-types';
 
-export function InspectorTab({ tab, ctx }: { tab: any; ctx: TabContext }) {
+export function InspectorTab({ tab, ctx, connection }: { tab: any; ctx: TabContext; connection: Connection | null }) {
   const collection: string = tab.collection;
   const docId: string = tab.docId;
 
@@ -17,7 +18,7 @@ export function InspectorTab({ tab, ctx }: { tab: any; ctx: TabContext }) {
     if (tab.initialJson) return;
     let cancelled = false;
     setLoading(true);
-    findById(collection, docId)
+    findById(collection, docId, { connection })
       .then(d => {
         if (cancelled) return;
         const txt = JSON.stringify(d, null, 2);
@@ -27,7 +28,7 @@ export function InspectorTab({ tab, ctx }: { tab: any; ctx: TabContext }) {
       .catch(e => { if (!cancelled) setMsg({ kind: 'err', text: e.message || String(e) }); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [collection, docId, tab.initialJson]);
+  }, [collection, docId, tab.initialJson, connection?.id]);
 
   const dirty = draft !== original;
 
@@ -37,7 +38,7 @@ export function InspectorTab({ tab, ctx }: { tab: any; ctx: TabContext }) {
     try { parsed = JSON.parse(draft); }
     catch (e: any) { setMsg({ kind: 'err', text: 'Invalid JSON: ' + e.message }); return; }
     try {
-      await replaceById(collection, docId, parsed);
+      await replaceById(collection, docId, parsed, { connection });
       setOriginal(draft);
       setMsg({ kind: 'ok', text: 'Saved.' });
       ctx.notifyChanged(collection);
@@ -49,7 +50,7 @@ export function InspectorTab({ tab, ctx }: { tab: any; ctx: TabContext }) {
   async function remove() {
     if (!confirm(`Delete document ${docId} from "${collection}"?\nThis cannot be undone.`)) return;
     try {
-      await deleteById(collection, docId);
+      await deleteById(collection, docId, { connection });
       setMsg({ kind: 'ok', text: 'Deleted.' });
       ctx.notifyChanged(collection);
       ctx.closeTab(tab.id);

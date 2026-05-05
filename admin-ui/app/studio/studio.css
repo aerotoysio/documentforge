@@ -9,18 +9,44 @@
   --studio-row-selected: #fce4e8;
   --studio-row-selected-strong: #f8b3bf;
   --studio-icon-muted: #6c757d;
+  /* Resizable widths/heights — driven by inline style on the splitters,
+     persisted to localStorage so they survive reloads. */
+  --studio-explorer-width: 260px;
 
   display: grid;
   grid-template-rows: 36px 1fr 28px;
-  grid-template-columns: minmax(220px, 280px) 1fr;
+  grid-template-columns: var(--studio-explorer-width) 4px 1fr;
   grid-template-areas:
-    'toolbar toolbar'
-    'explorer workspace'
-    'status status';
+    'toolbar toolbar toolbar'
+    'explorer split-col workspace'
+    'status status status';
   height: calc(100vh - 0px);
   background: var(--studio-bg);
   font-size: 13px;
   color: var(--ink);
+}
+
+/* Vertical splitter between Explorer and Workspace */
+.studio-splitter-col {
+  grid-area: split-col;
+  cursor: col-resize;
+  background: var(--studio-line);
+  position: relative;
+  z-index: 1;
+  user-select: none;
+}
+.studio-splitter-col:hover,
+.studio-splitter-col.dragging {
+  background: var(--red);
+}
+.studio-splitter-col.dragging::after {
+  /* Wide invisible overlay during drag so we don't lose mousemove events
+     when the cursor strays off the 4px-wide handle. */
+  content: '';
+  position: fixed;
+  inset: 0;
+  cursor: col-resize;
+  z-index: 100;
 }
 
 /* ----- Toolbar ----- */
@@ -132,7 +158,8 @@
 .studio-workspace {
   grid-area: workspace;
   display: grid;
-  grid-template-rows: 32px 1fr;
+  /* tab-strip · per-tab connection badge bar · tab-body */
+  grid-template-rows: 32px auto 1fr;
   overflow: hidden;
   background: var(--studio-bg);
 }
@@ -188,7 +215,7 @@
 
 /* Empty state when no tabs */
 .workspace-empty {
-  grid-row: 1 / span 2;
+  grid-row: 1 / -1;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -225,7 +252,29 @@
 .studio-status .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 
 /* ----- Query tab ----- */
-.query-tab { display: grid; grid-template-rows: minmax(120px, 35%) 1fr; height: 100%; }
+.query-tab {
+  display: grid;
+  /* sql-editor · splitter · results — height of the editor is driven by
+     a CSS variable owned by the tab so each tab can have its own. */
+  grid-template-rows: var(--query-sql-height, 35%) 4px 1fr;
+  height: 100%;
+}
+.query-tab .splitter-row {
+  cursor: row-resize;
+  background: var(--studio-line);
+  user-select: none;
+}
+.query-tab .splitter-row:hover,
+.query-tab .splitter-row.dragging {
+  background: var(--red);
+}
+.query-tab .splitter-row.dragging::after {
+  content: '';
+  position: fixed;
+  inset: 0;
+  cursor: row-resize;
+  z-index: 100;
+}
 .sql-editor {
   border: none;
   border-bottom: 1px solid var(--studio-line);
