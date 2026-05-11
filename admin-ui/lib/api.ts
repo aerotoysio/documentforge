@@ -315,6 +315,76 @@ export async function setDefaultDatabase(name: string, opts?: CallOptions) {
   return handle(r);
 }
 
+// ---------- Per-DB replication (Issue #66 Phase 2.5) ----------
+// Phase 2.5 scoped endpoints under /db/{name}/replication/*. Each attached
+// DB has its own role; Studio's topology page uses these to render and
+// configure the intra-service leader/follower graph.
+
+export interface PerDbReplicationStatus {
+  database: string;
+  role: 'leader' | 'follower' | 'none';
+  readOnly: boolean;
+  leader: {
+    currentSeq: number;
+    port: number | null;        // port this DB is leading on; null when not a leader
+    followerCount: number;
+    followers: Array<{
+      endpoint: string;
+      httpEndpoint: string | null;
+      connectedAt: string;
+      handshakeSeq: number;
+      worstCaseLagSeq: number;
+    }>;
+  };
+  follower: {
+    lastAppliedSeq: number;
+    opsApplied: number;
+    gapsDetected: number;
+    autoFailoverPromoted: boolean;
+    leader: { endpoint: string; httpEndpoint: string | null } | null;
+  };
+}
+
+export async function getDbReplicationStatus(
+  name: string,
+  opts?: CallOptions,
+): Promise<PerDbReplicationStatus> {
+  const r = await fetch(
+    urlFor(`/db/${encodeURIComponent(name)}/replication/status`, opts),
+    { headers: authHeaders(opts) },
+  );
+  return handle(r);
+}
+
+export async function startDbAsLeader(name: string, port: number, opts?: CallOptions) {
+  const r = await fetch(
+    urlFor(`/db/${encodeURIComponent(name)}/replication/start-leader`, opts),
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
+      body: JSON.stringify({ port }),
+    },
+  );
+  return handle(r);
+}
+
+export async function startDbAsFollower(
+  name: string,
+  host: string,
+  port: number,
+  opts?: CallOptions,
+) {
+  const r = await fetch(
+    urlFor(`/db/${encodeURIComponent(name)}/replication/start-follower`, opts),
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
+      body: JSON.stringify({ host, port }),
+    },
+  );
+  return handle(r);
+}
+
 // ---------- Replication control ----------
 export async function startLeader(port: number, sharedSecret?: string, opts?: CallOptions) {
   const r = await fetch(urlFor('/replication/start-leader', opts), {

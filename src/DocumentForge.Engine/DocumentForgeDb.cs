@@ -1591,6 +1591,12 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     /// "leader with no followers yet" and "not a leader at all".</summary>
     public bool IsLogicalLeader => _logicalServer is not null;
 
+    /// <summary>TCP port this DB is listening on as a replication leader,
+    /// or null when not a leader. Studio's topology view uses this to
+    /// match a follower's leader-endpoint ("host:port") back to the DB
+    /// that's leading them when both live in the same service.</summary>
+    public int? LogicalLeaderPort => _logicalServer?.Port;
+
     /// <summary>True if this DB is currently acting as a replication follower
     /// (connected to a leader and applying incoming ops).</summary>
     public bool IsLogicalFollower => _logicalFollower is not null;

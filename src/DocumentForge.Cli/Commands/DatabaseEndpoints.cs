@@ -147,6 +147,10 @@ public static class DatabaseEndpoints
                 leader = new
                 {
                     currentSeq,
+                    // Phase 2.5 — the port this DB is leading on. Studio
+                    // matches it against followers' leader-endpoint to
+                    // draw intra-service replication edges.
+                    port = db.LogicalLeaderPort,
                     followerCount = db.GetLogicalFollowerCount(),
                     followers = followers.Select(f => new
                     {
