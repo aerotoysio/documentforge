@@ -108,6 +108,36 @@ function TopologyInner() {
 
   useEffect(() => { refresh(); /* eslint-disable-next-line */ }, [active?.id]);
 
+  // Periodically re-poll status so follower counts, applied-seq, and
+  // newly-attached DBs land without the user hitting refresh. 5s feels
+  // live without hammering the service.
+  useEffect(() => {
+    if (!active) return;
+    const id = window.setInterval(() => {
+      // Silent refresh — only updates state if anything changed
+      // (buildNodes derives positions from current state when available).
+      refreshSilent();
+    }, 5000);
+    return () => window.clearInterval(id);
+    // eslint-disable-next-line
+  }, [active?.id]);
+
+  async function refreshSilent() {
+    if (!active) return;
+    try {
+      const list = await listDatabases({ connection: active });
+      const statuses = await Promise.all(list.databases.map(async db => {
+        try { return await getDbReplicationStatus(db.name, { connection: active }); }
+        catch { return null; }
+      }));
+      const snap: SnapshotEntry[] = list.databases.map((db, i) => ({ db, status: statuses[i] }));
+      setSnapshot(snap);
+      // Diff-update nodes so dragged positions persist between polls.
+      setNodes(prev => mergeNodes(prev, buildNodes(snap)));
+      setEdges(buildEdges(snap));
+    } catch { /* swallow — banner will show on next manual refresh */ }
+  }
+
   // Persist drag positions so a refresh doesn't rearrange the user's layout.
   const onNodesChange = useCallback((changes: NodeChange<Node<DBNodeData>>[]) => {
     setNodes((nds) => {
@@ -174,13 +204,26 @@ function TopologyInner() {
     }
     setActionBusy(true);
     try {
-      // Same-service replication uses loopback. Cross-service follow would
-      // pass a different host; that UI lands when we add the "External
-      // attach" branch in the Add Database modal.
+      // Intra-service follow uses loopback.
       await startDbAsFollower(selectedDb, 'localhost', leaderPort, { connection: active ?? undefined });
       await refresh();
     } catch (e: any) {
       alert(`Could not follow: ${e.message || String(e)}`);
+    } finally {
+      setActionBusy(false);
+    }
+  }
+
+  // Follow a leader running on a different service. Useful when you want
+  // a DB hosted here to be a hot-standby of a leader on a different host.
+  async function handleFollowExternal(host: string, port: number) {
+    if (!selectedDb) return;
+    setActionBusy(true);
+    try {
+      await startDbAsFollower(selectedDb, host, port, { connection: active ?? undefined });
+      await refresh();
+    } catch (e: any) {
+      alert(`Could not follow ${host}:${port}: ${e.message || String(e)}`);
     } finally {
       setActionBusy(false);
     }
@@ -313,6 +356,7 @@ function TopologyInner() {
             onClose={() => setSelectedDb(null)}
             onStartLeader={handleStartLeader}
             onFollow={handleFollowLeader}
+            onFollowExternal={handleFollowExternal}
             onMakeActive={handleMakeActive}
             onDrop={handleDrop}
           />
@@ -331,6 +375,21 @@ function TopologyInner() {
 }
 
 // ---------------------------------------------------------------- nodes/edges
+
+// On auto-poll, preserve any positions the user has already dragged to.
+// New DBs use the auto-position; removed DBs vanish; existing DBs keep
+// their canvas seat.
+function mergeNodes(
+  previous: Node<DBNodeData>[],
+  next: Node<DBNodeData>[],
+): Node<DBNodeData>[] {
+  const prevById = new Map(previous.map(n => [n.id, n]));
+  return next.map(n => {
+    const prev = prevById.get(n.id);
+    if (!prev) return n;
+    return { ...n, position: prev.position };
+  });
+}
 
 function buildNodes(snapshot: SnapshotEntry[]): Node<DBNodeData>[] {
   const positions = loadPositions();
@@ -467,13 +526,17 @@ interface SidePanelProps {
   onClose: () => void;
   onStartLeader: (port: number) => void;
   onFollow: (leaderName: string) => void;
+  onFollowExternal: (host: string, port: number) => void;
   onMakeActive: () => void;
   onDrop: (deleteFiles: boolean) => void;
 }
 
-function SidePanel({ info, availableLeaders, busy, onClose, onStartLeader, onFollow, onMakeActive, onDrop }: SidePanelProps) {
+function SidePanel({ info, availableLeaders, busy, onClose, onStartLeader, onFollow, onFollowExternal, onMakeActive, onDrop }: SidePanelProps) {
   const [draftPort, setDraftPort] = useState(5500);
   const [draftLeader, setDraftLeader] = useState<string>('');
+  const [showExternal, setShowExternal] = useState(false);
+  const [extHost, setExtHost] = useState('');
+  const [extPort, setExtPort] = useState(5500);
   const role = info.status?.role ?? 'unknown';
 
   // Suggest a port that isn't already taken by another leader on this service.
@@ -547,8 +610,8 @@ function SidePanel({ info, availableLeaders, busy, onClose, onStartLeader, onFol
               </div>
             </div>
             {availableLeaders.length > 0 && (
-              <div>
-                <div style={{ fontSize: 11, color: 'var(--gray-500)', marginBottom: 4 }}>Or follow an existing leader:</div>
+              <div style={{ marginBottom: 8 }}>
+                <div style={{ fontSize: 11, color: 'var(--gray-500)', marginBottom: 4 }}>Or follow an existing leader on this service:</div>
                 <div style={{ display: 'flex', gap: 6 }}>
                   <select value={draftLeader} onChange={e => setDraftLeader(e.target.value)} style={{ flex: 1, padding: '6px 8px', fontSize: 12, border: '1px solid var(--gray-200)' }}>
                     <option value="">(pick a leader)</option>
@@ -562,6 +625,37 @@ function SidePanel({ info, availableLeaders, busy, onClose, onStartLeader, onFol
                 </div>
               </div>
             )}
+            {/* External leader — for cross-service replication. Useful when
+                this service hosts a hot-standby of a leader running elsewhere. */}
+            <div>
+              <button
+                onClick={() => setShowExternal(s => !s)}
+                style={{ background: 'none', border: 'none', color: 'var(--gray-500)', fontSize: 11, cursor: 'pointer', padding: 0, textDecoration: 'underline' }}
+              >
+                {showExternal ? '▾ Hide' : '▸ Follow a leader on a different service'}
+              </button>
+              {showExternal && (
+                <div style={{ display: 'flex', gap: 6, marginTop: 4 }}>
+                  <input
+                    type="text"
+                    value={extHost}
+                    onChange={e => setExtHost(e.target.value)}
+                    placeholder="host (e.g. 10.0.1.4)"
+                    style={{ flex: 2, padding: '6px 8px', fontSize: 12, border: '1px solid var(--gray-200)', fontFamily: 'var(--mono)' }}
+                  />
+                  <input
+                    type="number"
+                    value={extPort}
+                    onChange={e => setExtPort(parseInt(e.target.value) || 0)}
+                    placeholder="port"
+                    style={{ width: 72, padding: '6px 8px', fontSize: 12, border: '1px solid var(--gray-200)', fontFamily: 'var(--mono)' }}
+                  />
+                  <button onClick={() => onFollowExternal(extHost.trim(), extPort)} disabled={busy || !extHost.trim() || extPort < 1024} style={primaryBtn()}>
+                    Follow
+                  </button>
+                </div>
+              )}
+            </div>
           </>
         )}
         {role === 'leader' && (
