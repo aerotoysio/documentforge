@@ -15,8 +15,8 @@
     <Product>DocumentForge</Product>
     <Copyright>Copyright © DocumentForge contributors</Copyright>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageProjectUrl>https://github.com/tailwind-retailing/documentforge</PackageProjectUrl>
-    <RepositoryUrl>https://github.com/tailwind-retailing/documentforge</RepositoryUrl>
+    <PackageProjectUrl>https://github.com/aerotoysio/documentforge</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/aerotoysio/documentforge</RepositoryUrl>
     <RepositoryType>git</RepositoryType>
     <PackageTags>database;document-database;json;embedded;nosql;sql;replication;sharding</PackageTags>
     <PackageReadmeFile>README.md</PackageReadmeFile>

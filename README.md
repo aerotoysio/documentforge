@@ -61,7 +61,7 @@ Verified on a 250K and 10M document workload (modern laptop, NVMe SSD):
 | Range query LIMIT 100| 144 QPS   | 47 QPS |
 | File size            | 120 MB    | 4.77 GB |
 
-Full methodology lives in the [documentation site](https://github.com/tailwind-retailing/documentforge-docs) — see `performance.html`.
+Full methodology lives in the [documentation site](https://github.com/aerotoysio/documentforge-docs) — see `performance.html`.
 
 ## Getting started
 
@@ -99,13 +99,13 @@ db.Insert("users", """{"name": "Alice", "email": "alice@example.com"}""");
 var result = db.Execute("SELECT * FROM users WHERE name = 'Alice'");
 ```
 
-Full guide in the [docs site](https://github.com/tailwind-retailing/documentforge-docs) — see `getting-started.html`.
+Full guide in the [docs site](https://github.com/aerotoysio/documentforge-docs) — see `getting-started.html`.
 
 ## Documentation
 
 The docs live in a separate repo so they're easy to host on GitHub Pages:
 
-**[📘 tailwind-retailing/documentforge-docs](https://github.com/tailwind-retailing/documentforge-docs)**
+**[📘 aerotoysio/documentforge-docs](https://github.com/aerotoysio/documentforge-docs)**
 
 10 pages covering: Getting Started · Query Language · Data Modeling · Replication ·
 Sharding · Deployment (incl. Docker + Render) · Security · CLI Reference ·
@@ -139,7 +139,7 @@ scripts/                     start-cluster, publish-dfdb, sample-cluster/
 Dockerfile                   Multi-stage build → self-contained dfdb image
 render.yaml                  Render blueprint: one-click private deploy
 
-(Documentation site lives in the separate tailwind-retailing/documentforge-docs repo.)
+(Documentation site lives in the separate aerotoysio/documentforge-docs repo.)
 ```
 
 ## Status
