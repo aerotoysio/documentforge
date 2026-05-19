@@ -20,6 +20,7 @@ public class Program
             return sub switch
             {
                 "serve"     => ServeCommand.Run(rest),
+                "router"    => RouterCommand.Run(rest),
                 "repl"      => ReplCommand.Run(rest),
                 "inspect"   => InspectCommand.Run(rest),
                 "query"     => QueryCommand.Run(rest),

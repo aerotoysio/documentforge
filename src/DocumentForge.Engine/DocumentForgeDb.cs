@@ -1585,6 +1585,29 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     /// or null if this node isn't a follower.</summary>
     public string? LogicalFollowerLeaderEndpoint => _logicalFollower?.LeaderEndpoint;
 
+    /// <summary>True if this DB is currently acting as a replication leader
+    /// (TCP listener accepting follower connections). Distinct from
+    /// <see cref="GetLogicalFollowerCount"/> which returns 0 both for
+    /// "leader with no followers yet" and "not a leader at all".</summary>
+    public bool IsLogicalLeader => _logicalServer is not null;
+
+    /// <summary>TCP port this DB is listening on as a replication leader,
+    /// or null when not a leader. Studio's topology view uses this to
+    /// match a follower's leader-endpoint ("host:port") back to the DB
+    /// that's leading them when both live in the same service.</summary>
+    public int? LogicalLeaderPort => _logicalServer?.Port;
+
+    /// <summary>True if this DB is currently acting as a replication follower
+    /// (connected to a leader and applying incoming ops).</summary>
+    public bool IsLogicalFollower => _logicalFollower is not null;
+
+    /// <summary>"leader" | "follower" | "none" — derived from live engine state,
+    /// not from startup config. Issue #66 Phase 2.5 needs this for the
+    /// per-DB <c>/db/{name}/replication/status</c> endpoint, where each
+    /// attached DB has its own dynamically-assignable role.</summary>
+    public string LogicalReplicationRole =>
+        IsLogicalLeader ? "leader" : IsLogicalFollower ? "follower" : "none";
+
     /// <summary>
     /// Start this DB as a logical replication follower (read-only replica).
     /// Applies incoming ops through the engine's own Insert/Delete/CreateIndex so indexes

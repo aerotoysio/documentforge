@@ -122,8 +122,15 @@ export async function getReplicationStatus(opts?: CallOptions): Promise<Replicat
 }
 
 // ---------- Query ----------
-export async function query(sql: string, opts?: CallOptions) {
-  const r = await fetch(urlFor('/query', opts), {
+// Issue #66 Phase 3a: pass `database` to target a specific attached DB
+// rather than the service's current default. Omitting it falls back to
+// the flat /query route — the back-compat path for any service that
+// predates multi-DB.
+export async function query(sql: string, opts?: CallOptions & { database?: string }) {
+  const path = opts?.database
+    ? `/db/${encodeURIComponent(opts.database)}/query`
+    : '/query';
+  const r = await fetch(urlFor(path, opts), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
     body: JSON.stringify({ sql }),
@@ -253,6 +260,241 @@ export async function rebuildIndexes(collection: string, opts?: CallOptions) {
 
 export async function rebuildIndex(collection: string, indexName: string, opts?: CallOptions) {
   const r = await fetch(urlFor(`/admin/rebuild-index/${collection}/${indexName}`, opts), { method: 'POST', headers: authHeaders(opts) });
+  return handle(r);
+}
+
+// ---------- Databases (Issue #66 Phase 2) ----------
+// One service can now host N attached databases. These verbs drive Studio's
+// "+ Add Database" UX and the per-connection database picker. Until Phase 4
+// lands per-request auth scoping, set-default is how the UI tells the
+// service "all subsequent flat-route calls should target DB X."
+
+export interface DatabaseEntry {
+  name: string;
+  filePath: string;
+  isDefault: boolean;
+}
+
+export interface DatabasesListResponse {
+  default: string | null;
+  count: number;
+  databases: DatabaseEntry[];
+}
+
+export async function listDatabases(opts?: CallOptions): Promise<DatabasesListResponse> {
+  const r = await fetch(urlFor('/databases', opts), { headers: authHeaders(opts) });
+  return handle(r);
+}
+
+export async function createDatabase(
+  name: string,
+  options?: { path?: string; createIfMissing?: boolean } & CallOptions,
+): Promise<DatabaseEntry> {
+  const r = await fetch(urlFor('/databases', options), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(options) },
+    body: JSON.stringify({
+      name,
+      path: options?.path,
+      createIfMissing: options?.createIfMissing ?? true,
+    }),
+  });
+  return handle(r);
+}
+
+export async function deleteDatabase(
+  name: string,
+  options?: { deleteFiles?: boolean } & CallOptions,
+) {
+  const qs = options?.deleteFiles ? '?deleteFiles=true' : '';
+  const r = await fetch(urlFor(`/databases/${encodeURIComponent(name)}${qs}`, options), {
+    method: 'DELETE',
+    headers: authHeaders(options),
+  });
+  return handle(r);
+}
+
+export async function setDefaultDatabase(name: string, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/databases/${encodeURIComponent(name)}/set-default`, opts), {
+    method: 'POST',
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+
+// ---------- Per-DB replication (Issue #66 Phase 2.5) ----------
+// Phase 2.5 scoped endpoints under /db/{name}/replication/*. Each attached
+// DB has its own role; Studio's topology page uses these to render and
+// configure the intra-service leader/follower graph.
+
+export interface PerDbReplicationStatus {
+  database: string;
+  role: 'leader' | 'follower' | 'none';
+  readOnly: boolean;
+  leader: {
+    currentSeq: number;
+    port: number | null;        // port this DB is leading on; null when not a leader
+    followerCount: number;
+    followers: Array<{
+      endpoint: string;
+      httpEndpoint: string | null;
+      connectedAt: string;
+      handshakeSeq: number;
+      worstCaseLagSeq: number;
+    }>;
+  };
+  follower: {
+    lastAppliedSeq: number;
+    opsApplied: number;
+    gapsDetected: number;
+    autoFailoverPromoted: boolean;
+    leader: { endpoint: string; httpEndpoint: string | null } | null;
+  };
+}
+
+export async function getDbReplicationStatus(
+  name: string,
+  opts?: CallOptions,
+): Promise<PerDbReplicationStatus> {
+  const r = await fetch(
+    urlFor(`/db/${encodeURIComponent(name)}/replication/status`, opts),
+    { headers: authHeaders(opts) },
+  );
+  return handle(r);
+}
+
+// Issue #66 Phase 6b — collection list per attached DB. Used by the
+// Collections tab to auto-discover what's where across the cluster.
+export async function listDbCollections(
+  name: string,
+  opts?: CallOptions,
+): Promise<{ database: string; collections: string[] }> {
+  const r = await fetch(
+    urlFor(`/db/${encodeURIComponent(name)}/collections`, opts),
+    { headers: authHeaders(opts) },
+  );
+  return handle(r);
+}
+
+export async function startDbAsLeader(name: string, port: number, opts?: CallOptions) {
+  const r = await fetch(
+    urlFor(`/db/${encodeURIComponent(name)}/replication/start-leader`, opts),
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
+      body: JSON.stringify({ port }),
+    },
+  );
+  return handle(r);
+}
+
+export async function startDbAsFollower(
+  name: string,
+  host: string,
+  port: number,
+  opts?: CallOptions,
+) {
+  const r = await fetch(
+    urlFor(`/db/${encodeURIComponent(name)}/replication/start-follower`, opts),
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
+      body: JSON.stringify({ host, port }),
+    },
+  );
+  return handle(r);
+}
+
+// ---------- Service orchestration (Issue #66 Phase 5) ----------
+// Spawn / stop sibling `dfdb serve` processes from an existing service.
+// The "+ Spawn local service" button in the Connections page calls these;
+// the new HTTP base URL comes back and Studio auto-registers it as a
+// Connection so the cluster grows in one click.
+
+export interface ManagedServiceInfo {
+  port: number;
+  baseUrl: string;
+  dataDir: string;
+  nodeName: string | null;
+  startedAt: string;
+  running: boolean;
+  exitCode: number | null;
+  logPath: string;
+}
+
+export interface SpawnServiceResponse {
+  port: number;
+  baseUrl: string;
+  dataDir: string;
+  nodeName: string | null;
+  startedAt: string;
+  ready: boolean;
+  logPath: string;
+}
+
+export async function listServices(opts?: CallOptions): Promise<{ count: number; services: ManagedServiceInfo[] }> {
+  const r = await fetch(urlFor('/services', opts), { headers: authHeaders(opts) });
+  return handle(r);
+}
+
+export async function spawnService(
+  options?: { dataDir?: string; port?: number; nodeName?: string } & CallOptions,
+): Promise<SpawnServiceResponse> {
+  const r = await fetch(urlFor('/services', options), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(options) },
+    body: JSON.stringify({
+      dataDir: options?.dataDir,
+      port: options?.port,
+      nodeName: options?.nodeName,
+    }),
+  });
+  return handle(r);
+}
+
+export async function stopService(port: number, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/services/${port}`, opts), {
+    method: 'DELETE',
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+
+export async function getServiceLog(port: number, opts?: CallOptions): Promise<string> {
+  const r = await fetch(urlFor(`/services/${port}/logs`, opts), { headers: authHeaders(opts) });
+  if (!r.ok) throw new Error(`Failed to fetch log: ${r.status} ${r.statusText}`);
+  return r.text();
+}
+
+// ---------- Spawn cluster router (Issue #66 Phase 6b) ----------
+// One-click cluster router from Studio. The host service writes the
+// cluster.json to disk and starts a `dfdb router` child against it.
+// Studio auto-registers the new router as a Connection.
+
+export interface SpawnRouterResponse {
+  kind: 'router';
+  port: number;
+  baseUrl: string;
+  configPath: string;
+  name: string | null;
+  startedAt: string;
+  ready: boolean;
+  logPath: string;
+}
+
+export async function spawnRouter(
+  clusterConfigJson: string,
+  options?: { port?: number; name?: string } & CallOptions,
+): Promise<SpawnRouterResponse> {
+  const r = await fetch(urlFor('/routers', options), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(options) },
+    body: JSON.stringify({
+      clusterConfigJson,
+      port: options?.port,
+      name: options?.name,
+    }),
+  });
   return handle(r);
 }
 

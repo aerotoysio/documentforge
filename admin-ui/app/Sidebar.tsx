@@ -1,12 +1,28 @@
 'use client';
 
 import Link from 'next/link';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useConnections } from '@/lib/connections-context';
+import { listDatabases } from '@/lib/api';
 
 export function Sidebar() {
   const { connections, active, setActive } = useConnections();
   const [pickerOpen, setPickerOpen] = useState(false);
+
+  // Issue #66 Phase 2: peek at the active connection's database registry
+  // so the sidebar can show "you're working on DB X" alongside the
+  // connection. Best-effort — old single-DB services pre-#66 will 404 on
+  // /databases and we just hide the indicator.
+  const [defaultDb, setDefaultDb] = useState<string | null>(null);
+  const [dbCount, setDbCount] = useState<number | null>(null);
+  useEffect(() => {
+    if (!active) { setDefaultDb(null); setDbCount(null); return; }
+    let cancelled = false;
+    listDatabases({ connection: active })
+      .then(r => { if (!cancelled) { setDefaultDb(r.default); setDbCount(r.count); } })
+      .catch(() => { if (!cancelled) { setDefaultDb(null); setDbCount(null); } });
+    return () => { cancelled = true; };
+  }, [active?.id, active?.baseUrl]);
 
   return (
     <aside className="sidebar">
@@ -55,15 +71,34 @@ export function Sidebar() {
         )}
       </div>
 
+      {/* Issue #66 Phase 2 — active database indicator. Quietly absent
+          when the connected service predates multi-DB or returns 0 DBs. */}
+      {active && defaultDb && (
+        <Link href="/databases" className="db-indicator" title="Manage attached databases on this service">
+          <div className="db-indicator-label">DATABASE</div>
+          <div className="db-indicator-row">
+            <span className="db-indicator-dot" />
+            <span className="db-indicator-name">{defaultDb}</span>
+            {dbCount !== null && dbCount > 1 && (
+              <span className="db-indicator-count">+{dbCount - 1}</span>
+            )}
+          </div>
+        </Link>
+      )}
+
+      {/* Consolidation pass (#66 follow-up):
+          - /swarm and /databases live on as pages but their entry point is
+            now the unified Topology page (List + Across-services tabs lift
+            their content). Old bookmarks still work.
+          - /cluster (static config wizard) and /rebalance (pure docs) are
+            destination pages, not operational views — they move to the
+            developer portal (#68) and out of the sidebar. */}
       <nav>
         <Link href="/">Dashboard</Link>
         <Link href="/studio" className="nav-headline">✦ Studio</Link>
-        <Link href="/swarm">🐝 Swarm</Link>
+        <Link href="/topology">⌬ Topology</Link>
         <Link href="/admin">⚙ Admin</Link>
         <Link href="/connections">⇋ Connections</Link>
-        <div className="nav-divider" />
-        <Link href="/cluster">Cluster topology</Link>
-        <Link href="/rebalance">Rebalance guide</Link>
       </nav>
 
       <div style={{
