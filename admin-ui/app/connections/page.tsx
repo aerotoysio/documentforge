@@ -1,8 +1,8 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useConnections } from '@/lib/connections-context';
-import { getHealth } from '@/lib/api';
+import { getHealth, listServices, spawnService, stopService, spawnRouter, listDatabases, type ManagedServiceInfo } from '@/lib/api';
 import { discoverNetwork, normalizeUrl, type DiscoveredNode, type DiscoveryResult } from '@/lib/discovery';
 import type { Connection } from '@/lib/connections';
 
@@ -13,6 +13,178 @@ export default function ConnectionsPage() {
   const [draft, setDraft] = useState<Partial<Connection>>({ name: '', baseUrl: '', apiKey: '', color: PALETTE[0] });
   const [editingId, setEditingId] = useState<string | null>(null);
   const [testing, setTesting] = useState<Record<string, { ok?: boolean; msg?: string; pinging?: boolean }>>({});
+
+  // Issue #66 Phase 5 — spawn-local-service state.
+  const [spawnName, setSpawnName] = useState('');
+  const [spawnPort, setSpawnPort] = useState('');
+  const [spawnDataDir, setSpawnDataDir] = useState('');
+  // Shard membership for the new Connection. Backend ignores it — it's
+  // purely a Studio-side grouping label that the Across-services view
+  // uses to draw shard frames.
+  const [spawnShard, setSpawnShard] = useState('');
+  const [spawning, setSpawning] = useState(false);
+  const [spawnError, setSpawnError] = useState<string | null>(null);
+  const [managedServices, setManagedServices] = useState<ManagedServiceInfo[]>([]);
+
+  // Poll the active host's managed children so the user can see what was
+  // spawned through this Studio session. Silent on services that predate
+  // Phase 5 — feature is purely additive.
+  useEffect(() => {
+    if (!active) { setManagedServices([]); return; }
+    let cancelled = false;
+    async function refresh() {
+      try {
+        const r = await listServices({ connection: active ?? undefined });
+        if (!cancelled) setManagedServices(r.services);
+      } catch {
+        if (!cancelled) setManagedServices([]);  // pre-#66 service or transient
+      }
+    }
+    refresh();
+    const id = window.setInterval(refresh, 4000);
+    return () => { cancelled = true; window.clearInterval(id); };
+  }, [active?.id, active?.baseUrl]);
+
+  async function handleSpawn(e?: React.FormEvent) {
+    e?.preventDefault();
+    if (!active) {
+      setSpawnError('Pick an active connection first — that service hosts the spawned children.');
+      return;
+    }
+    setSpawnError(null);
+    setSpawning(true);
+    try {
+      const port = spawnPort.trim() ? parseInt(spawnPort.trim(), 10) : undefined;
+      const result = await spawnService({
+        connection: active,
+        nodeName: spawnName.trim() || undefined,
+        port,
+        dataDir: spawnDataDir.trim() || undefined,
+      });
+      // Auto-register the new service as a Connection so it's immediately
+      // usable. Inherit the host's API key — children spawned by the host
+      // run unauthenticated by default (dev mode). The optional shard tag
+      // lands the new connection in the right shard frame on the
+      // Across-services topology view.
+      add({
+        name: result.nodeName || `spawned-:${result.port}`,
+        baseUrl: result.baseUrl,
+        apiKey: undefined,
+        color: PALETTE[(connections.length + 1) % PALETTE.length],
+        tags: ['spawned', `parent:${active.baseUrl}`],
+        shard: spawnShard.trim() || undefined,
+      });
+      setSpawnName(''); setSpawnPort(''); setSpawnDataDir(''); setSpawnShard('');
+      // Refresh the managed-services list.
+      try {
+        const r = await listServices({ connection: active });
+        setManagedServices(r.services);
+      } catch { /* ignore */ }
+    } catch (e: any) {
+      setSpawnError(e.message || String(e));
+    } finally {
+      setSpawning(false);
+    }
+  }
+
+  // ---- Phase 6b — spawn-router state + handlers ----
+  const [routerJson, setRouterJson] = useState('');
+  const [routerName, setRouterName] = useState('');
+  const [routerPort, setRouterPort] = useState('');
+  const [routerSpawning, setRouterSpawning] = useState(false);
+  const [routerError, setRouterError] = useState<string | null>(null);
+
+  // Pre-populate the cluster config textarea by probing the active
+  // connection's databases. Each attached DB becomes a candidate
+  // ring leader; the operator can prune + add collections to taste
+  // before clicking Spawn. The result is a starter cluster.json
+  // that's immediately routable.
+  async function buildStarterClusterConfig() {
+    if (!active) return;
+    try {
+      const r = await listDatabases({ connection: active });
+      const shards = r.databases.map((d) => ({
+        name: `ring-${d.name}`,
+        leader: { baseUrl: active.baseUrl, database: d.name },
+      }));
+      const config = {
+        router: { name: 'studio-cluster', port: 5500 },
+        shards,
+        collections: [
+          { name: 'orders', strategy: 'hash', shardKeyPath: 'pnr' },
+          { name: 'lookup', strategy: 'replicated' },
+        ],
+      };
+      setRouterJson(JSON.stringify(config, null, 2));
+    } catch (e: any) {
+      setRouterError(`Could not probe ${active.name}: ${e.message || String(e)}`);
+    }
+  }
+
+  async function handleSpawnRouter(e?: React.FormEvent) {
+    e?.preventDefault();
+    if (!active) {
+      setRouterError('Pick an active connection — its host is what spawns the router process.');
+      return;
+    }
+    if (!routerJson.trim()) {
+      setRouterError('Paste or build a cluster.json first.');
+      return;
+    }
+    // Quick syntax check so we fail fast in the UI rather than at the
+    // backend. Backend's ClusterConfig.Validate() catches semantic issues.
+    try { JSON.parse(routerJson); }
+    catch (e: any) { setRouterError(`Invalid JSON: ${e.message}`); return; }
+
+    setRouterError(null);
+    setRouterSpawning(true);
+    try {
+      const port = routerPort.trim() ? parseInt(routerPort.trim(), 10) : undefined;
+      const result = await spawnRouter(routerJson, {
+        connection: active,
+        name: routerName.trim() || undefined,
+        port,
+      });
+      // Auto-register the router URL as a Connection so the operator
+      // can immediately point Studio at it. The router speaks the
+      // same /collections + /query surface as a service, so it Just
+      // Works as a connection target.
+      add({
+        name: result.name ?? `router-:${result.port}`,
+        baseUrl: result.baseUrl,
+        apiKey: undefined,
+        color: PALETTE[(connections.length + 1) % PALETTE.length],
+        tags: ['router', `parent:${active.baseUrl}`],
+      });
+      // Refresh managed services list.
+      try {
+        const list = await listServices({ connection: active });
+        setManagedServices(list.services);
+      } catch { /* ignore */ }
+      setRouterJson('');
+      setRouterName('');
+      setRouterPort('');
+    } catch (e: any) {
+      setRouterError(e.message || String(e));
+    } finally {
+      setRouterSpawning(false);
+    }
+  }
+
+  async function handleStopSpawned(port: number) {
+    if (!active) return;
+    if (!confirm(`Stop the spawned service on port ${port}? The data files stay on disk.`)) return;
+    try {
+      await stopService(port, { connection: active });
+      const r = await listServices({ connection: active });
+      setManagedServices(r.services);
+      // Remove its Connection too (best-effort match by baseUrl).
+      const dead = connections.find(c => c.baseUrl.endsWith(`:${port}`));
+      if (dead) remove(dead.id);
+    } catch (e: any) {
+      alert(`Could not stop :${port}: ${e.message || String(e)}`);
+    }
+  }
 
   // Discover-network panel state
   const [discoverSeedUrl, setDiscoverSeedUrl] = useState('');
@@ -134,6 +306,193 @@ export default function ConnectionsPage() {
         on Render, individual cluster shards, replication followers. Switch between them from the
         sidebar dropdown. Run swarm-wide commands from <a href="/swarm">Swarm</a>.
       </p>
+
+      {/* Issue #66 Phase 5 — spawn a child dfdb serve process on the
+          machine that's hosting the active connection. Studio auto-
+          registers the new service as a Connection. The fastest way
+          to build a local cluster for testing. */}
+      <div className="card" style={{ borderTop: '3px solid var(--red)', marginBottom: 24 }}>
+        <h3 style={{ marginTop: 0 }}>Spawn local service</h3>
+        <p style={{ fontSize: 13, color: 'var(--gray-500)', marginTop: -8 }}>
+          Start a sibling <code>dfdb serve</code> on the host that's running your active connection.
+          Studio auto-registers it here so you can immediately work against it — pair this with
+          per-DB replication on the <a href="/topology">Topology</a> page to build a local cluster.
+        </p>
+        {!active && (
+          <div style={{ padding: '10px 12px', background: 'rgba(217,4,41,0.06)', color: 'var(--red)', fontSize: 12, borderLeft: '3px solid var(--red)' }}>
+            Pick an active connection in the sidebar — its service is what spawns the children.
+          </div>
+        )}
+        {active && (
+          <>
+            <form onSubmit={handleSpawn} style={{ display: 'grid', gridTemplateColumns: '2fr 1fr 1.5fr 2fr auto', gap: 10, alignItems: 'end' }}>
+              <div>
+                <div className="key">Node name <span style={{ color: 'var(--gray-500)', fontWeight: 400 }}>(optional)</span></div>
+                <input
+                  type="text"
+                  value={spawnName}
+                  onChange={e => setSpawnName(e.target.value)}
+                  placeholder="shard-a"
+                  disabled={spawning}
+                />
+              </div>
+              <div>
+                <div className="key">Port <span style={{ color: 'var(--gray-500)', fontWeight: 400 }}>(blank = free)</span></div>
+                <input
+                  type="text"
+                  value={spawnPort}
+                  onChange={e => setSpawnPort(e.target.value)}
+                  placeholder="auto"
+                  disabled={spawning}
+                />
+              </div>
+              <div>
+                <div className="key">Shard <span style={{ color: 'var(--gray-500)', fontWeight: 400 }}>(Studio grouping)</span></div>
+                <input
+                  type="text"
+                  value={spawnShard}
+                  onChange={e => setSpawnShard(e.target.value)}
+                  placeholder="orders"
+                  disabled={spawning}
+                />
+              </div>
+              <div>
+                <div className="key">Data dir <span style={{ color: 'var(--gray-500)', fontWeight: 400 }}>(blank = under host)</span></div>
+                <input
+                  type="text"
+                  value={spawnDataDir}
+                  onChange={e => setSpawnDataDir(e.target.value)}
+                  placeholder="C:\\path\\to\\dir"
+                  disabled={spawning}
+                />
+              </div>
+              <button
+                type="submit"
+                disabled={spawning}
+                style={{ background: 'var(--red)', color: 'white', border: 'none', padding: '8px 18px', fontWeight: 700, cursor: spawning ? 'wait' : 'pointer', minHeight: 38 }}
+              >
+                {spawning ? 'Spawning…' : '⚡ Spawn'}
+              </button>
+            </form>
+            {spawnError && (
+              <div style={{ marginTop: 12, padding: '10px 12px', background: 'rgba(217,4,41,0.08)', color: 'var(--red)', fontFamily: 'var(--mono)', fontSize: 12, borderLeft: '3px solid var(--red)' }}>
+                ✗ {spawnError}
+              </div>
+            )}
+            {managedServices.length > 0 && (
+              <div style={{ marginTop: 16, paddingTop: 12, borderTop: '1px solid var(--gray-100)' }}>
+                <div style={{ fontFamily: 'var(--mono)', fontSize: 10, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--gray-500)', fontWeight: 700, marginBottom: 8 }}>
+                  Managed by {active.name} — {managedServices.length} child{managedServices.length === 1 ? '' : 'ren'}
+                </div>
+                <div style={{ display: 'grid', gap: 6 }}>
+                  {managedServices.map(s => (
+                    <div key={s.port} style={{ display: 'grid', gridTemplateColumns: '1fr auto', alignItems: 'center', gap: 12, padding: '6px 0' }}>
+                      <div>
+                        <div style={{ fontSize: 13, fontWeight: 600 }}>
+                          {s.nodeName ?? `port-${s.port}`}
+                          <span style={{ marginLeft: 8, fontFamily: 'var(--mono)', fontSize: 11, color: s.running ? 'var(--green)' : 'var(--red)' }}>
+                            {s.running ? '● running' : `✗ exited${s.exitCode != null ? ` (${s.exitCode})` : ''}`}
+                          </span>
+                        </div>
+                        <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--gray-500)' }}>
+                          {s.baseUrl} · {s.dataDir}
+                        </div>
+                      </div>
+                      <button
+                        onClick={() => handleStopSpawned(s.port)}
+                        style={{ background: 'transparent', color: 'var(--red)', border: '1px solid var(--red)', padding: '4px 10px', fontSize: 11, cursor: 'pointer' }}
+                      >
+                        Stop
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      {/* Phase 6b — spawn a cluster router process. Same hosting model
+          as "Spawn local service" (the active connection's machine runs
+          the child), but the child is a `dfdb router` rather than a
+          `dfdb serve`. Studio auto-adds the router as a Connection so
+          it appears in the sidebar picker immediately. */}
+      <div className="card" style={{ borderTop: '3px solid var(--red)', marginBottom: 24 }}>
+        <h3 style={{ marginTop: 0 }}>Spawn cluster router</h3>
+        <p style={{ fontSize: 13, color: 'var(--gray-500)', marginTop: -8 }}>
+          Front an entire cluster behind one URL. Paste a <code>cluster.json</code> or hit{' '}
+          <em>Build starter config</em> to scaffold one from the databases on your active
+          connection. Studio auto-registers the new router as a Connection so you can switch
+          to it in the sidebar instantly.
+        </p>
+        {!active && (
+          <div style={{ padding: '10px 12px', background: 'rgba(217,4,41,0.06)', color: 'var(--red)', fontSize: 12, borderLeft: '3px solid var(--red)' }}>
+            Pick an active connection in the sidebar — its host is what runs the router process.
+          </div>
+        )}
+        {active && (
+          <>
+            <form onSubmit={handleSpawnRouter} style={{ display: 'grid', gap: 10 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr auto auto', gap: 10, alignItems: 'end' }}>
+                <div>
+                  <div className="key">Router name <span style={{ color: 'var(--gray-500)', fontWeight: 400 }}>(optional)</span></div>
+                  <input
+                    type="text"
+                    value={routerName}
+                    onChange={e => setRouterName(e.target.value)}
+                    placeholder="studio-cluster"
+                    disabled={routerSpawning}
+                  />
+                </div>
+                <div>
+                  <div className="key">Port <span style={{ color: 'var(--gray-500)', fontWeight: 400 }}>(blank = free)</span></div>
+                  <input
+                    type="text"
+                    value={routerPort}
+                    onChange={e => setRouterPort(e.target.value)}
+                    placeholder="auto"
+                    disabled={routerSpawning}
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={buildStarterClusterConfig}
+                  disabled={routerSpawning}
+                  style={{ background: 'transparent', color: 'var(--ink)', border: '1px solid var(--gray-200)', padding: '8px 14px', fontSize: 12, cursor: 'pointer', minHeight: 38 }}
+                  title="Generate a cluster.json from the databases on the active connection"
+                >
+                  ↺ Build starter config
+                </button>
+                <button
+                  type="submit"
+                  disabled={routerSpawning || !routerJson.trim()}
+                  style={{ background: 'var(--red)', color: 'white', border: 'none', padding: '8px 18px', fontWeight: 700, cursor: routerSpawning ? 'wait' : 'pointer', minHeight: 38 }}
+                >
+                  {routerSpawning ? 'Spawning…' : '⚡ Spawn router'}
+                </button>
+              </div>
+              <div>
+                <div className="key">cluster.json</div>
+                <textarea
+                  value={routerJson}
+                  onChange={e => setRouterJson(e.target.value)}
+                  disabled={routerSpawning}
+                  rows={14}
+                  spellCheck={false}
+                  placeholder={`{\n  "shards": [\n    { "name": "ring-a", "leader": { "baseUrl": "http://localhost:5099", "database": "ring_a" } },\n    { "name": "ring-b", "leader": { "baseUrl": "http://localhost:5099", "database": "ring_b" } }\n  ],\n  "collections": [\n    { "name": "orders", "strategy": "hash", "shardKeyPath": "pnr" },\n    { "name": "lookup", "strategy": "replicated" }\n  ]\n}`}
+                  style={{ width: '100%', minHeight: 240, fontFamily: 'var(--mono)', fontSize: 12, padding: 10, border: '1px solid var(--gray-200)', background: '#fafafa', resize: 'vertical' }}
+                />
+              </div>
+            </form>
+            {routerError && (
+              <div style={{ marginTop: 12, padding: '10px 12px', background: 'rgba(217,4,41,0.08)', color: 'var(--red)', fontFamily: 'var(--mono)', fontSize: 12, borderLeft: '3px solid var(--red)' }}>
+                ✗ {routerError}
+              </div>
+            )}
+          </>
+        )}
+      </div>
 
       {/* Discover network */}
       <div className="card" style={{ borderTop: '3px solid var(--red)', marginBottom: 24 }}>

@@ -181,6 +181,33 @@ textarea:focus, input:focus { outline: none; border-color: var(--red); }
   flex-shrink: 0;
   gap: 16px;
 }
+/* Tab strip for switching between Graph / List / Across-services views.
+   Matches the Studio aesthetic — flat, mono labels, red accent on active. */
+.topology-tabs {
+  display: flex;
+  align-items: center;
+  border-bottom: 1px solid var(--gray-200);
+  margin-bottom: 16px;
+  gap: 0;
+}
+.topology-tab {
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 10px 16px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--gray-500);
+  cursor: pointer;
+  font-family: var(--sans);
+  transition: color 120ms ease, border-color 120ms ease;
+}
+.topology-tab:hover { color: var(--ink); }
+.topology-tab.active {
+  color: var(--red);
+  border-bottom-color: var(--red);
+}
+.topology-tab-spacer { flex: 1; }
 /* Stage takes the remaining viewport below main's top padding + header.
    Reactflow needs an explicit pixel height — flex won't propagate down
    through its inner divs. */

@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { query as runQuery } from '@/lib/api';
+import { query as runQuery, listDatabases } from '@/lib/api';
 import type { Connection } from '@/lib/connections';
 import type { TabContext } from '../studio-types';
 
@@ -12,6 +12,36 @@ export function QueryTab({ tab, ctx, connection }: { tab: any; ctx: TabContext; 
   const [result, setResult] = useState<any | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
+
+  // Issue #66 Phase 3a — per-tab DB picker. Empty string = "use the
+  // service's default DB" (the back-compat flat /query route). Anything
+  // else routes through /db/{name}/query so each Studio tab can target
+  // a different attached database without flipping the service default.
+  const [availableDbs, setAvailableDbs] = useState<string[]>([]);
+  const [defaultDb, setDefaultDb] = useState<string | null>(null);
+  const [selectedDb, setSelectedDb] = useState<string>('');
+  const [dbsAvailable, setDbsAvailable] = useState(false);
+
+  useEffect(() => {
+    if (!connection) { setAvailableDbs([]); setDefaultDb(null); setDbsAvailable(false); return; }
+    let cancelled = false;
+    listDatabases({ connection })
+      .then(r => {
+        if (cancelled) return;
+        setAvailableDbs(r.databases.map(d => d.name));
+        setDefaultDb(r.default);
+        setDbsAvailable(true);
+      })
+      .catch(() => {
+        // Service predates multi-DB or is unreachable. Hide the picker;
+        // the tab silently uses the flat /query route as before.
+        if (cancelled) return;
+        setAvailableDbs([]);
+        setDefaultDb(null);
+        setDbsAvailable(false);
+      });
+    return () => { cancelled = true; };
+  }, [connection?.id, connection?.baseUrl]);
 
   // Resizable SQL/results split — value stored in pixels, persisted globally
   // (all QueryTabs share the same default split so muscle memory holds across tabs).
@@ -54,7 +84,7 @@ export function QueryTab({ tab, ctx, connection }: { tab: any; ctx: TabContext; 
     setRunning(true);
     setError(null);
     try {
-      const r = await runQuery(sql, { connection });
+      const r = await runQuery(sql, { connection, database: selectedDb || undefined });
       setResult(r);
       ctx.setStatus({
         plan: r.plan,
@@ -109,9 +139,34 @@ export function QueryTab({ tab, ctx, connection }: { tab: any; ctx: TabContext; 
           <button className="run-btn" onClick={execute} disabled={running}>
             {running ? 'Running…' : '▶  Run  (Ctrl+Enter)'}
           </button>
+          {dbsAvailable && availableDbs.length > 0 && (
+            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginLeft: 10 }}>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 10, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--gray-500)', fontWeight: 700 }}>
+                DB
+              </span>
+              <select
+                value={selectedDb}
+                onChange={e => setSelectedDb(e.target.value)}
+                title="Target database for this query. Empty = use the service's default DB."
+                style={{ padding: '3px 6px', fontSize: 12, border: '1px solid var(--gray-200)', background: 'white', fontFamily: 'var(--mono)' }}
+              >
+                <option value="">
+                  (default{defaultDb ? `: ${defaultDb}` : ''})
+                </option>
+                {availableDbs.map(name => (
+                  <option key={name} value={name}>{name}</option>
+                ))}
+              </select>
+            </span>
+          )}
           {result?.plan && (
             <span className="plan">
               {result.plan} · {result.executionTimeMs?.toFixed(2)}ms · {result.count ?? 0} row{result.count === 1 ? '' : 's'}
+              {result.database && (
+                <span style={{ marginLeft: 6, fontFamily: 'var(--mono)', color: 'var(--red)', fontWeight: 600 }}>
+                  · {result.database}
+                </span>
+              )}
             </span>
           )}
         </div>

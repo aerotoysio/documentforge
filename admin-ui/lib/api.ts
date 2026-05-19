@@ -122,8 +122,15 @@ export async function getReplicationStatus(opts?: CallOptions): Promise<Replicat
 }
 
 // ---------- Query ----------
-export async function query(sql: string, opts?: CallOptions) {
-  const r = await fetch(urlFor('/query', opts), {
+// Issue #66 Phase 3a: pass `database` to target a specific attached DB
+// rather than the service's current default. Omitting it falls back to
+// the flat /query route — the back-compat path for any service that
+// predates multi-DB.
+export async function query(sql: string, opts?: CallOptions & { database?: string }) {
+  const path = opts?.database
+    ? `/db/${encodeURIComponent(opts.database)}/query`
+    : '/query';
+  const r = await fetch(urlFor(path, opts), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
     body: JSON.stringify({ sql }),
@@ -356,6 +363,19 @@ export async function getDbReplicationStatus(
   return handle(r);
 }
 
+// Issue #66 Phase 6b — collection list per attached DB. Used by the
+// Collections tab to auto-discover what's where across the cluster.
+export async function listDbCollections(
+  name: string,
+  opts?: CallOptions,
+): Promise<{ database: string; collections: string[] }> {
+  const r = await fetch(
+    urlFor(`/db/${encodeURIComponent(name)}/collections`, opts),
+    { headers: authHeaders(opts) },
+  );
+  return handle(r);
+}
+
 export async function startDbAsLeader(name: string, port: number, opts?: CallOptions) {
   const r = await fetch(
     urlFor(`/db/${encodeURIComponent(name)}/replication/start-leader`, opts),
@@ -382,6 +402,99 @@ export async function startDbAsFollower(
       body: JSON.stringify({ host, port }),
     },
   );
+  return handle(r);
+}
+
+// ---------- Service orchestration (Issue #66 Phase 5) ----------
+// Spawn / stop sibling `dfdb serve` processes from an existing service.
+// The "+ Spawn local service" button in the Connections page calls these;
+// the new HTTP base URL comes back and Studio auto-registers it as a
+// Connection so the cluster grows in one click.
+
+export interface ManagedServiceInfo {
+  port: number;
+  baseUrl: string;
+  dataDir: string;
+  nodeName: string | null;
+  startedAt: string;
+  running: boolean;
+  exitCode: number | null;
+  logPath: string;
+}
+
+export interface SpawnServiceResponse {
+  port: number;
+  baseUrl: string;
+  dataDir: string;
+  nodeName: string | null;
+  startedAt: string;
+  ready: boolean;
+  logPath: string;
+}
+
+export async function listServices(opts?: CallOptions): Promise<{ count: number; services: ManagedServiceInfo[] }> {
+  const r = await fetch(urlFor('/services', opts), { headers: authHeaders(opts) });
+  return handle(r);
+}
+
+export async function spawnService(
+  options?: { dataDir?: string; port?: number; nodeName?: string } & CallOptions,
+): Promise<SpawnServiceResponse> {
+  const r = await fetch(urlFor('/services', options), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(options) },
+    body: JSON.stringify({
+      dataDir: options?.dataDir,
+      port: options?.port,
+      nodeName: options?.nodeName,
+    }),
+  });
+  return handle(r);
+}
+
+export async function stopService(port: number, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/services/${port}`, opts), {
+    method: 'DELETE',
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+
+export async function getServiceLog(port: number, opts?: CallOptions): Promise<string> {
+  const r = await fetch(urlFor(`/services/${port}/logs`, opts), { headers: authHeaders(opts) });
+  if (!r.ok) throw new Error(`Failed to fetch log: ${r.status} ${r.statusText}`);
+  return r.text();
+}
+
+// ---------- Spawn cluster router (Issue #66 Phase 6b) ----------
+// One-click cluster router from Studio. The host service writes the
+// cluster.json to disk and starts a `dfdb router` child against it.
+// Studio auto-registers the new router as a Connection.
+
+export interface SpawnRouterResponse {
+  kind: 'router';
+  port: number;
+  baseUrl: string;
+  configPath: string;
+  name: string | null;
+  startedAt: string;
+  ready: boolean;
+  logPath: string;
+}
+
+export async function spawnRouter(
+  clusterConfigJson: string,
+  options?: { port?: number; name?: string } & CallOptions,
+): Promise<SpawnRouterResponse> {
+  const r = await fetch(urlFor('/routers', options), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(options) },
+    body: JSON.stringify({
+      clusterConfigJson,
+      port: options?.port,
+      name: options?.name,
+    }),
+  });
   return handle(r);
 }
 

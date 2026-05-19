@@ -86,17 +86,19 @@ export function Sidebar() {
         </Link>
       )}
 
+      {/* Consolidation pass (#66 follow-up):
+          - /swarm and /databases live on as pages but their entry point is
+            now the unified Topology page (List + Across-services tabs lift
+            their content). Old bookmarks still work.
+          - /cluster (static config wizard) and /rebalance (pure docs) are
+            destination pages, not operational views — they move to the
+            developer portal (#68) and out of the sidebar. */}
       <nav>
         <Link href="/">Dashboard</Link>
         <Link href="/studio" className="nav-headline">✦ Studio</Link>
-        <Link href="/swarm">🐝 Swarm</Link>
-        <Link href="/databases">🗃 Databases</Link>
         <Link href="/topology">⌬ Topology</Link>
         <Link href="/admin">⚙ Admin</Link>
         <Link href="/connections">⇋ Connections</Link>
-        <div className="nav-divider" />
-        <Link href="/cluster">Cluster topology</Link>
-        <Link href="/rebalance">Rebalance guide</Link>
       </nav>
 
       <div style={{

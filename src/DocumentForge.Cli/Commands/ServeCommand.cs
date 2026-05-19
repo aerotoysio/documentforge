@@ -107,9 +107,22 @@ public static class ServeCommand
         // single-DB clients see no change.
         DatabaseEndpoints.Map(app, registry, config.DataDir);
 
+        // Issue #66 Phase 5: service orchestration. Lets Studio (or a CLI)
+        // spawn sibling dfdb serve processes from one running service —
+        // the foundation for the "create a local cluster in one click"
+        // UX. Children are tracked, reaped on parent shutdown.
+        var serviceManager = new ServiceManager();
+        ServiceEndpoints.Map(app, serviceManager, config.DataDir);
+
         // Dispose the registry on shutdown — it cascades to every attached
-        // database, including the Phase 1 single "default" one.
-        app.Lifetime.ApplicationStopping.Register(() => registry.Dispose());
+        // database, including the Phase 1 single "default" one. The service
+        // manager is disposed first so child processes are reaped before
+        // we close their parent's data files.
+        app.Lifetime.ApplicationStopping.Register(() =>
+        {
+            try { serviceManager.Dispose(); } catch { }
+            try { registry.Dispose(); } catch { }
+        });
         app.Run();
         return 0;
     }
@@ -135,6 +148,7 @@ public static class ServeCommand
         Console.WriteLine("             POST /seed | GET /health | GET /version");
         Console.WriteLine("  databases: GET  /databases | POST /databases | DELETE /databases/{name}");
         Console.WriteLine("             POST /databases/{name}/set-default");
+        Console.WriteLine("  services:  GET  /services | POST /services | DELETE /services/{port}");
         Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint | POST /admin/snapshot");
         Console.WriteLine("             POST /admin/compact/{collection}");
         Console.WriteLine("             POST /admin/rebuild-indexes/{collection}");

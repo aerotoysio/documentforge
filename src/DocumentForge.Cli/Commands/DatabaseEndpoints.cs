@@ -1,3 +1,4 @@
+using System.Text.Json;
 using DocumentForge.Core;
 using DocumentForge.Engine;
 using Microsoft.AspNetCore.Routing;
@@ -228,8 +229,79 @@ public static class DatabaseEndpoints
             }
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
+
+        // ----------------------------------------------------------------
+        // Issue #66 Phase 3a — scoped data plane. Studio (and any client)
+        // can now run SQL against any attached DB without flipping the
+        // service's default. The flat /query route still targets the
+        // default DB; this route targets the named one. Same response
+        // shape so the client-side handler stays simple.
+        // ----------------------------------------------------------------
+        app.MapPost("/db/{name}/query", (string name, QueryBody body) =>
+        {
+            var db = registry.TryGet(name);
+            if (db is null)
+                return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            if (string.IsNullOrWhiteSpace(body.Sql))
+                return Results.BadRequest(new { error = "Missing 'sql' field." });
+
+            var result = db.Execute(body.Sql);
+            if (!result.Success)
+                return Results.BadRequest(new { error = result.Message });
+
+            var docs = result.Documents
+                .Select(d => JsonDocument.Parse(d.ToJson()).RootElement)
+                .ToList();
+            return Results.Ok(new
+            {
+                database = name,
+                success = true,
+                count = result.Documents.Count,
+                affected = result.AffectedCount,
+                plan = result.QueryPlan,
+                executionTimeMs = result.ExecutionTime.TotalMilliseconds,
+                message = result.Message,
+                documents = docs,
+            });
+        });
+
+        // Scoped collections list — Studio's Explorer pane uses this when
+        // a tab is pinned to a non-default DB. The flat /collections
+        // continues to return the default DB's collections for back-compat.
+        app.MapGet("/db/{name}/collections", (string name) =>
+        {
+            var db = registry.TryGet(name);
+            if (db is null)
+                return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            return Results.Ok(new { database = name, collections = db.GetCollectionNames() });
+        });
+
+        // Scoped insert. Required for the Phase 6 router to forward
+        // /collections/{c} POSTs against a multi-DB-backed ring leader.
+        // Body shape mirrors the flat POST /collections/{name}: raw JSON
+        // document. Returns the new doc id on success.
+        app.MapPost("/db/{name}/collections/{collection}", async (string name, string collection, HttpRequest request) =>
+        {
+            var db = registry.TryGet(name);
+            if (db is null)
+                return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            try
+            {
+                using var reader = new StreamReader(request.Body);
+                var body = await reader.ReadToEndAsync();
+                if (string.IsNullOrWhiteSpace(body))
+                    return Results.BadRequest(new { error = "Empty body — JSON document required." });
+                var id = db.Insert(collection, body);
+                return Results.Ok(new { database = name, success = true, id = id.ToString(), collection });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
     }
 }
+
+// Phase 3a — scoped query body. Same field as the flat QueryRequest in
+// ServeCommand, kept distinct so the per-DB API can evolve independently.
+public record QueryBody(string Sql);
 
 // ----------------------------------------------------------------
 // Issue #66 Phase 2.5: per-DB replication request bodies. Distinct
