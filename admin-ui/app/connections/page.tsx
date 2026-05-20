@@ -655,7 +655,7 @@ export default function ConnectionsPage() {
                   <div style={{ flex: 1 }}>
                     <div style={{ fontSize: 16, fontWeight: 700 }}>
                       {c.name}
-                      {isActive && <span className="pill green" style={{ marginLeft: 10 }}>active</span>}
+                      {isActive && <span className="pill green" style={{ marginLeft: 10 }}>default</span>}
                       {c.apiKey && <span className="pill gray" style={{ marginLeft: 6 }}>auth</span>}
                       {c.shard && <span className="pill gray" style={{ marginLeft: 6 }}>shard: {c.shard}</span>}
                     </div>
@@ -665,7 +665,7 @@ export default function ConnectionsPage() {
                     {!isActive && (
                       <button onClick={() => setActive(c.id)}
                         style={{ background: 'var(--ink)', color: 'white', border: 'none', padding: '6px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
-                        Make active
+                        Set default
                       </button>
                     )}
                     <button onClick={() => ping(c)} disabled={t?.pinging}

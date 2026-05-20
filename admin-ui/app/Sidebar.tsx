@@ -33,7 +33,7 @@ export function Sidebar() {
 
       {/* Connection picker */}
       <div className="conn-picker">
-        <div className="conn-picker-label">CONNECTION</div>
+        <div className="conn-picker-label" title="Default connection — new Studio tabs, spawns and Admin target this unless you pick another on the page">DEFAULT CONNECTION</div>
         {connections.length === 0 ? (
           <Link href="/connections" className="conn-picker-empty">
             + Add a connection

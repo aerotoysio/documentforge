@@ -25,7 +25,7 @@ interface ConnSummary {
 }
 
 export default function Dashboard() {
-  const { connections, active, setActive } = useConnections();
+  const { connections, active } = useConnections();
   const [summaries, setSummaries] = useState<ConnSummary[]>([]);
   const [loading, setLoading] = useState(true);
 
@@ -125,7 +125,7 @@ export default function Dashboard() {
                   <div style={{ flex: 1, minWidth: 200 }}>
                     <div style={{ fontSize: 16, fontWeight: 700 }}>
                       {conn.name}
-                      {isActive && <span className="pill green" style={{ marginLeft: 8 }}>active</span>}
+                      {isActive && <span className="pill green" style={{ marginLeft: 8 }}>default</span>}
                       {role && role !== 'none' && <span className={`pill ${role === 'leader' ? 'red' : 'gray'}`} style={{ marginLeft: 6 }}>{role}</span>}
                       {readOnly && <span className="pill red" style={{ marginLeft: 6 }}>RO</span>}
                     </div>
@@ -141,14 +141,7 @@ export default function Dashboard() {
                   ) : (
                     <span style={{ color: 'var(--red)', fontSize: 12, fontFamily: 'var(--mono)' }}>offline</span>
                   )}
-                  <div style={{ display: 'flex', gap: 6 }}>
-                    {!isActive && (
-                      <button onClick={() => setActive(conn.id)} style={{ background: 'var(--ink)', color: 'white', border: 'none', padding: '6px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
-                        Make active
-                      </button>
-                    )}
-                    <Link href="/studio" style={{ background: 'transparent', color: 'var(--ink)', border: '1px solid var(--gray-200)', padding: '6px 12px', fontSize: 12, cursor: 'pointer', textDecoration: 'none' }}>Studio</Link>
-                  </div>
+                  <Link href="/studio" style={{ background: 'transparent', color: 'var(--ink)', border: '1px solid var(--gray-200)', padding: '6px 12px', fontSize: 12, cursor: 'pointer', textDecoration: 'none' }}>Open in Studio</Link>
                 </div>
               </div>
             );

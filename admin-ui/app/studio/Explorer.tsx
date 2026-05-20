@@ -103,7 +103,7 @@ export function Explorer({ refreshKey, onRefresh, onOpenBrowse, onOpenIndexes, o
               <span className="twisty">{cOpen ? '▼' : '▶'}</span>
               <span style={{ display: 'inline-block', width: 7, height: 7, borderRadius: '50%', marginRight: 6, background: tree.error ? 'var(--red)' : 'var(--green)' }} />
               <span className="label">{tree.conn.name}</span>
-              {tree.conn.id === active?.id && <span className="badge">active</span>}
+              {tree.conn.id === active?.id && <span className="badge">default</span>}
               {!tree.error && <span className="badge">{dbCount} db</span>}
             </div>
 
