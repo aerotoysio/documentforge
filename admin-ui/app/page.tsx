@@ -1,51 +1,87 @@
 'use client';
 
+// Cross-connection overview. Each registered connection contributes its
+// default-DB stats (/stats), its attached-DB count (/databases) and its
+// replication role (/replication/status). Per-connection failures are
+// tolerated — an unreachable host shows as offline rather than sinking the
+// whole page.
+
 import { useEffect, useState } from 'react';
-import { getStats, API_URL } from '@/lib/api';
+import Link from 'next/link';
+import { useConnections } from '@/lib/connections-context';
+import { getStats, listDatabases, getReplicationStatus } from '@/lib/api';
+import type { Connection } from '@/lib/connections';
+
+interface ConnSummary {
+  conn: Connection;
+  reachable: boolean;
+  role?: string;
+  readOnly?: boolean;
+  fileSizeMb?: number;
+  collections?: number;
+  documents?: number;
+  indexes?: number;
+  dbCount?: number;
+}
 
 export default function Dashboard() {
-  const [stats, setStats] = useState<any>(null);
-  const [error, setError] = useState<string | null>(null);
+  const { connections, active, setActive } = useConnections();
+  const [summaries, setSummaries] = useState<ConnSummary[]>([]);
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    const load = async () => {
-      try {
-        setStats(await getStats());
-        setError(null);
-      } catch (e: any) {
-        setError(e.message);
-      }
-    };
+    let cancelled = false;
+    async function load() {
+      const out = await Promise.all(connections.map(async (conn): Promise<ConnSummary> => {
+        try {
+          const [stats, dbs, repl] = await Promise.all([
+            getStats({ connection: conn }),
+            listDatabases({ connection: conn }).catch(() => null),
+            getReplicationStatus({ connection: conn }).catch(() => null),
+          ]);
+          const collections = stats.collections ?? [];
+          return {
+            conn, reachable: true,
+            role: repl?.role, readOnly: repl?.readOnly,
+            fileSizeMb: stats.fileSizeMb,
+            collections: collections.length,
+            documents: collections.reduce((s: number, c: any) => s + (c.documentCount || 0), 0),
+            indexes: collections.reduce((s: number, c: any) => s + (c.indexes?.length || 0), 0),
+            dbCount: dbs?.count ?? dbs?.databases?.length ?? 1,
+          };
+        } catch {
+          return { conn, reachable: false };
+        }
+      }));
+      if (!cancelled) { setSummaries(out); setLoading(false); }
+    }
     load();
-    const t = setInterval(load, 3000);
-    return () => clearInterval(t);
-  }, []);
+    const t = window.setInterval(load, 5000);
+    return () => { cancelled = true; window.clearInterval(t); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [connections.map((c) => c.id + c.baseUrl).join('|')]);
 
-  if (error) return (
-    <>
-      <div className="eyebrow">Dashboard</div>
-      <h1 className="page-title">Overview</h1>
-      <div className="card" style={{ borderLeft: '3px solid var(--red)' }}>
-        <h3>Can&apos;t reach the database API</h3>
-        <p>Tried <code style={{ background: 'var(--gray-100)', padding: '2px 6px' }}>{API_URL}</code> — {error}</p>
-        <h3 style={{ marginTop: 20 }}>Start the API:</h3>
-        <pre className="code-block">{`# From the repo root — dev mode
-dotnet run --project src/DocumentForge.Cli -- serve --port 5000 --data-dir ./data
+  if (connections.length === 0) {
+    return (
+      <>
+        <div className="eyebrow">Dashboard</div>
+        <h1 className="page-title">Overview</h1>
+        <div className="card">
+          <h3>No connections yet</h3>
+          <p style={{ color: 'var(--gray-500)' }}>
+            Add a DocumentForge endpoint on the <Link href="/connections" style={{ color: 'var(--red)' }}>Connections</Link> page,
+            or spawn a local service there. Each one will show up here with its live stats.
+          </p>
+        </div>
+      </>
+    );
+  }
 
-# Or with the published binary
-./dist/win-x64/dfdb.exe serve --port 5000 --data-dir ./data
-# → listens on http://localhost:5000`}</pre>
-        <h3 style={{ marginTop: 20 }}>Or point this UI at a different host:</h3>
-        <pre className="code-block">{`# In admin-ui/.env.local
-NEXT_PUBLIC_DFDB_URL=https://dfdb.internal:5500`}</pre>
-      </div>
-    </>
-  );
-
-  if (!stats) return <p>Loading...</p>;
-
-  const totalDocs = stats.collections?.reduce((sum: number, c: any) => sum + (c.documentCount || 0), 0) ?? 0;
-  const totalIndexes = stats.collections?.reduce((sum: number, c: any) => sum + (c.indexes?.length || 0), 0) ?? 0;
+  const reachable = summaries.filter((s) => s.reachable);
+  const totalDbs = reachable.reduce((s, x) => s + (x.dbCount || 0), 0);
+  const totalDocs = reachable.reduce((s, x) => s + (x.documents || 0), 0);
+  const totalColls = reachable.reduce((s, x) => s + (x.collections || 0), 0);
+  const totalSize = reachable.reduce((s, x) => s + (x.fileSizeMb || 0), 0);
 
   return (
     <>
@@ -54,58 +90,86 @@ NEXT_PUBLIC_DFDB_URL=https://dfdb.internal:5500`}</pre>
 
       <div className="grid grid-4">
         <div className="stat">
-          <div className="label">File size</div>
-          <div className="num">{stats.fileSizeMb?.toFixed?.(1) ?? 0} <span style={{ fontSize: 18, color: 'var(--gray-500)' }}>MB</span></div>
-          <div className="sub">{stats.filePath}</div>
+          <div className="label">Connections</div>
+          <div className="num">{reachable.length}<span style={{ fontSize: 18, color: 'var(--gray-500)' }}> / {connections.length}</span></div>
+          <div className="sub">{connections.length - reachable.length > 0 ? `${connections.length - reachable.length} unreachable` : 'all reachable'}</div>
         </div>
         <div className="stat">
-          <div className="label">Pages</div>
-          <div className="num">{stats.pageCount?.toLocaleString() ?? 0}</div>
-          <div className="sub">{stats.cachedPages?.toLocaleString() ?? 0} cached ({stats.dirtyPages ?? 0} dirty)</div>
+          <div className="label">Databases</div>
+          <div className="num">{totalDbs.toLocaleString()}</div>
+          <div className="sub">attached across all services</div>
         </div>
         <div className="stat">
           <div className="label">Documents</div>
           <div className="num">{totalDocs.toLocaleString()}</div>
-          <div className="sub">across {stats.collections?.length ?? 0} collection(s)</div>
+          <div className="sub">in default DBs · {totalColls} collection{totalColls === 1 ? '' : 's'}</div>
         </div>
         <div className="stat">
-          <div className="label">Indexes</div>
-          <div className="num">{totalIndexes}</div>
-          <div className="sub">total across all collections</div>
+          <div className="label">Total size</div>
+          <div className="num">{totalSize.toFixed(1)} <span style={{ fontSize: 18, color: 'var(--gray-500)' }}>MB</span></div>
+          <div className="sub">default DB files</div>
         </div>
       </div>
 
-      <h2>Collections</h2>
-      {stats.collections?.length === 0 ? (
-        <p style={{ color: 'var(--gray-500)' }}>No collections yet. Run an INSERT from the query console to create one.</p>
+      <h2>Connections</h2>
+      {loading && summaries.length === 0 ? (
+        <p style={{ color: 'var(--gray-500)' }}>Probing every connection…</p>
       ) : (
-        <table className="table">
-          <thead>
-            <tr><th>Name</th><th>Documents</th><th>Indexes</th></tr>
-          </thead>
-          <tbody>
-            {stats.collections?.map((c: any) => (
-              <tr key={c.name}>
-                <td><a href={`/collections?name=${c.name}`}>{c.name}</a></td>
-                <td>{c.documentCount?.toLocaleString()}</td>
-                <td>
-                  {c.indexes?.length === 0 ? <span className="pill gray">none</span> : (
-                    c.indexes?.map((i: any) => (
-                      <span key={i.name} className="pill" style={{ marginRight: 6 }}>
-                        {i.name} {i.unique && <span style={{ color: 'var(--red)' }}>·unique</span>}
-                      </span>
-                    ))
+        <div className="grid" style={{ gap: 12 }}>
+          {summaries.map(({ conn, reachable, role, readOnly, fileSizeMb, collections, documents, dbCount }) => {
+            const isActive = conn.id === active?.id;
+            return (
+              <div key={conn.id} className="card" style={{ borderLeft: `4px solid ${reachable ? (conn.color || 'var(--red)') : 'var(--gray-200)'}`, opacity: reachable ? 1 : 0.7 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                  <span style={{ display: 'inline-block', width: 9, height: 9, borderRadius: '50%', background: reachable ? 'var(--green)' : 'var(--red)' }} title={reachable ? 'reachable' : 'unreachable'} />
+                  <div style={{ flex: 1, minWidth: 200 }}>
+                    <div style={{ fontSize: 16, fontWeight: 700 }}>
+                      {conn.name}
+                      {isActive && <span className="pill green" style={{ marginLeft: 8 }}>active</span>}
+                      {role && role !== 'none' && <span className={`pill ${role === 'leader' ? 'red' : 'gray'}`} style={{ marginLeft: 6 }}>{role}</span>}
+                      {readOnly && <span className="pill red" style={{ marginLeft: 6 }}>RO</span>}
+                    </div>
+                    <div style={{ fontFamily: 'var(--mono)', fontSize: 12, color: 'var(--gray-500)' }}>{conn.baseUrl.replace(/^https?:\/\//, '')}</div>
+                  </div>
+                  {reachable ? (
+                    <div style={{ display: 'flex', gap: 20, fontSize: 13, flexWrap: 'wrap' }}>
+                      <Metric label="databases" value={(dbCount ?? 1).toLocaleString()} />
+                      <Metric label="collections" value={(collections ?? 0).toLocaleString()} />
+                      <Metric label="docs (default)" value={(documents ?? 0).toLocaleString()} />
+                      <Metric label="size" value={`${(fileSizeMb ?? 0).toFixed(1)} MB`} />
+                    </div>
+                  ) : (
+                    <span style={{ color: 'var(--red)', fontSize: 12, fontFamily: 'var(--mono)' }}>offline</span>
                   )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+                  <div style={{ display: 'flex', gap: 6 }}>
+                    {!isActive && (
+                      <button onClick={() => setActive(conn.id)} style={{ background: 'var(--ink)', color: 'white', border: 'none', padding: '6px 12px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>
+                        Make active
+                      </button>
+                    )}
+                    <Link href="/studio" style={{ background: 'transparent', color: 'var(--ink)', border: '1px solid var(--gray-200)', padding: '6px 12px', fontSize: 12, cursor: 'pointer', textDecoration: 'none' }}>Studio</Link>
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
       )}
 
-      <h2>Live at</h2>
-      <div className="setting-row"><span className="key">API endpoint</span><span className="val">{API_URL}</span></div>
-      <div className="setting-row"><span className="key">Auto-refresh</span><span className="val">every 3 seconds</span></div>
+      <div style={{ marginTop: 16, fontSize: 12, color: 'var(--gray-500)' }}>
+        Per-connection document / collection counts reflect each service&apos;s <strong>default database</strong>.
+        See the full per-DB tree in <Link href="/studio" style={{ color: 'var(--red)' }}>Studio</Link> and the
+        cluster shape in <Link href="/topology" style={{ color: 'var(--red)' }}>Topology</Link>. Auto-refreshes every 5s.
+      </div>
     </>
+  );
+}
+
+function Metric({ label, value }: { label: string; value: string }) {
+  return (
+    <div style={{ textAlign: 'right' }}>
+      <div style={{ fontWeight: 700 }}>{value}</div>
+      <div style={{ fontSize: 10, color: 'var(--gray-500)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>{label}</div>
+    </div>
   );
 }

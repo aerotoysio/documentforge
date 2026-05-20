@@ -1,9 +1,9 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { useActiveConnection } from '@/lib/connections-context';
+import { useConnections } from '@/lib/connections-context';
 import {
-  getStats, getReplicationStatus,
+  getStats, getReplicationStatus, listDatabases,
   flushDb, checkpointDb, compactCollection, rebuildIndexes, rebuildIndex,
   dropCollection,
   setReadOnly, promoteToLeader, enableAutoFailover, disableAutoFailover,
@@ -11,9 +11,11 @@ import {
 } from '@/lib/api';
 
 export default function AdminPage() {
-  const conn = useActiveConnection();
+  const { connections, active, setActive } = useConnections();
+  const conn = active;
   const [stats, setStats] = useState<any>(null);
   const [repl, setRepl] = useState<any>(null);
+  const [dbs, setDbs] = useState<any[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [log, setLog] = useState<{ ts: string; ok: boolean; line: string }[]>([]);
@@ -21,12 +23,14 @@ export default function AdminPage() {
   const refresh = async () => {
     setError(null);
     try {
-      const [s, r] = await Promise.all([
+      const [s, r, d] = await Promise.all([
         getStats().catch(() => null),
         getReplicationStatus().catch(() => null),
+        listDatabases().catch(() => null),
       ]);
       setStats(s);
       setRepl(r);
+      setDbs(d?.databases ?? []);
     } catch (e: any) { setError(e.message || String(e)); }
   };
 
@@ -63,8 +67,18 @@ export default function AdminPage() {
     <>
       <div className="eyebrow">Management</div>
       <h1 className="page-title">Admin · {conn.name}</h1>
-      <div style={{ fontFamily: 'var(--mono)', color: 'var(--gray-500)', fontSize: 13, marginBottom: 24 }}>
-        {conn.baseUrl}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 24 }}>
+        {connections.length > 1 && (
+          <select
+            value={conn.id}
+            onChange={(e) => setActive(e.target.value)}
+            title="Administer a different connection"
+            style={{ fontFamily: 'var(--mono)', fontSize: 12, padding: '4px 8px', border: '1px solid var(--gray-200)', background: 'white' }}
+          >
+            {connections.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
+          </select>
+        )}
+        <span style={{ fontFamily: 'var(--mono)', color: 'var(--gray-500)', fontSize: 13 }}>{conn.baseUrl}</span>
       </div>
 
       {error && (
@@ -148,9 +162,33 @@ export default function AdminPage() {
           <ReplicationControls repl={repl} run={run} busy={busy} />
         </div>
 
+        {/* Databases on this connection */}
+        <div className="card" style={{ gridColumn: '1 / -1' }}>
+          <h3>Databases <span style={{ fontWeight: 400, fontSize: 13, color: 'var(--gray-500)' }}>({dbs.length} attached)</span></h3>
+          <p style={{ color: 'var(--gray-500)', fontSize: 13, marginTop: 0 }}>
+            This service hosts {dbs.length} attached database{dbs.length === 1 ? '' : 's'}. The admin operations below act on the
+            <strong> default</strong> database; create / drop / replication for the others lives on the{' '}
+            <a href="/topology" style={{ color: 'var(--red)' }}>Topology</a> canvas.
+          </p>
+          {dbs.length > 0 && (
+            <table className="table">
+              <thead><tr><th>Name</th><th>Default</th><th>File</th></tr></thead>
+              <tbody>
+                {dbs.map((d: any) => (
+                  <tr key={d.name}>
+                    <td><strong>{d.name}</strong></td>
+                    <td>{d.isDefault ? <span className="pill red">default</span> : '—'}</td>
+                    <td style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--gray-500)', wordBreak: 'break-all' }}>{d.filePath}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+
         {/* Collection ops */}
         <div className="card" style={{ gridColumn: '1 / -1' }}>
-          <h3>Collections</h3>
+          <h3>Collections <span style={{ fontWeight: 400, fontSize: 13, color: 'var(--gray-500)' }}>· default DB</span></h3>
           <p style={{ color: 'var(--gray-500)', fontSize: 13, marginTop: 0 }}>
             Per-collection maintenance. Compact reclaims space from deletes; rebuild fixes index drift; drop is destructive.
           </p>
