@@ -26,22 +26,36 @@ public sealed class IndexCatalog
         _catalogPage = catalogPage;
     }
 
-    public void Load()
+    /// <summary>
+    /// Attempt to load the catalog from disk. Returns true on success;
+    /// returns false (with <paramref name="corruptionReason"/> populated)
+    /// when the page chain is structurally corrupt (Issue #64 — cycle on
+    /// disk that survives a crash). On failure <see cref="Definitions"/>
+    /// is left empty so the engine can decide whether to surface the
+    /// error or fall back to a self-heal path.
+    /// </summary>
+    public bool TryLoad(out string? corruptionReason)
     {
+        corruptionReason = null;
         _definitions.Clear();
-        if (!_catalogPage.IsValid) return;
+        if (!_catalogPage.IsValid) return true;
 
-        var pageId = _catalogPage;
-        // Issue #57: cycle guard. A torn write that leaves a corrupt NextPageId
-        // pointing back into the chain (or to page 0) would otherwise loop here
-        // forever during Open and hang the host process before any caller-visible
-        // exception is raised.
+        // Walk into a staging list. Only commit to _definitions after a
+        // clean traversal — a half-loaded catalog with the rest discarded
+        // would be worse than no catalog at all.
+        var staged = new List<IndexDefinition>();
         var visited = new HashSet<uint>();
+        var pageId = _catalogPage;
+
         while (pageId.IsValid)
         {
             if (!visited.Add(pageId.Value))
-                throw new PageCorruptionException(pageId,
-                    $"cycle detected in index-catalog page chain after {visited.Count} pages.");
+            {
+                corruptionReason =
+                    $"cycle detected in index-catalog page chain at page {pageId.Value} " +
+                    $"after {visited.Count} pages.";
+                return false;
+            }
 
             var pageData = _cache.GetPage(pageId);
             var page = new DataPage(pageData);
@@ -53,11 +67,41 @@ public sealed class IndexCatalog
                 if (slotData.IsEmpty) continue;
 
                 var def = DeserializeDefinition(slotData);
-                if (def is not null) _definitions.Add(def);
+                if (def is not null) staged.Add(def);
             }
 
             pageId = page.Header.NextPageId;
         }
+
+        _definitions.AddRange(staged);
+        return true;
+    }
+
+    /// <summary>
+    /// Convenience overload that throws <see cref="PageCorruptionException"/>
+    /// when the chain is corrupt. Kept for callers that have no recovery
+    /// path (and to make the behaviour change surgical for callers that do).
+    /// </summary>
+    public void Load()
+    {
+        if (TryLoad(out var reason))
+            return;
+        throw new PageCorruptionException(_catalogPage, reason ?? "index catalog corrupt.");
+    }
+
+    /// <summary>
+    /// Issue #64: wipe the catalog head pointer and the in-memory definition
+    /// list. Used by the self-heal path on Open when <see cref="TryLoad"/>
+    /// reports corruption. The previous catalog pages become orphaned (we
+    /// can't safely walk them — that's how we got here) but the rest of the
+    /// data file is untouched and a subsequent <see cref="Save"/> will
+    /// allocate a fresh head page. Operators recreate indexes via
+    /// <c>CreateIndex</c>; document data is preserved.
+    /// </summary>
+    public void Reset()
+    {
+        _definitions.Clear();
+        _catalogPage = PageId.Invalid;
     }
 
     public void Save(IEnumerable<IndexDefinition> definitions)
@@ -119,13 +163,24 @@ public sealed class IndexCatalog
                 existing.Add(nextPageId);
             }
 
-            // Stamp the link on the just-finished page and persist it before
-            // moving on; the chain has to be valid as soon as we walk away.
+            // Issue #64: persist the new tail page in a known-good (empty)
+            // state BEFORE stamping the link onto the previous page. If a
+            // crash lands between the two writes, the old tail still says
+            // NextPageId=Invalid and the freshly-cleared B is durable;
+            // either way Load sees a coherent chain. The reverse order
+            // (link A first, persist B's reset later) is what produced the
+            // disk-cycle reports in #64: a freed page returning from the
+            // allocator with stale content could carry a leftover
+            // NextPageId looping back into the chain.
+            var nextPage = ResetCatalogPage(nextPageId);
+            _cache.PutPage(nextPageId, nextPage.RawData, isDirty: true);
+
+            // Now safe to link forwards.
             currentPage.SetNextPage(nextPageId);
             _cache.PutPage(currentPageId, currentPage.RawData, isDirty: true);
 
             currentPageId = nextPageId;
-            currentPage = ResetCatalogPage(currentPageId);
+            currentPage = nextPage;
 
             int retry = currentPage.Insert(bytes);
             if (retry < 0)

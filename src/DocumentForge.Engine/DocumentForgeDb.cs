@@ -164,7 +164,19 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             var db = new DocumentForgeDb(filePath, dataFile, lockHandle, options);
             db._catalog.Load();
             // Load persistent indexes (no rebuild from scratch!)
-            db._indexManager.LoadFromCatalog();
+            // Issue #64: a structurally corrupt index catalog (cycle on disk
+            // surviving recovery) must not block the database from opening.
+            // The document data is in a separate page chain and is intact;
+            // we surface a warning and open with no indexes. Operators can
+            // re-create indexes via CreateIndex.
+            if (!db._indexManager.TryLoadFromCatalog(out var indexCorruption))
+            {
+                Console.Error.WriteLine(
+                    $"[DocumentForge] WARNING: index catalog corrupted ({indexCorruption}); " +
+                    $"opening database with no indexes. Document data is intact. " +
+                    $"Re-create indexes via CreateIndex. (Issue #64)");
+                db._indexManager.ResetCatalog();
+            }
             // Eagerly build location maps for all collections - avoids 1s lag on first query
             foreach (var collName in db._catalog.GetCollectionNames())
             {
@@ -210,7 +222,16 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         {
             var db = new DocumentForgeDb(filePath, dataFile, lockHandle, options);
             db._catalog.Load();
-            db._indexManager.LoadFromCatalog();
+            // Mirror Open's #64 self-heal behaviour so crash-injection tests
+            // exercise the same code path as production.
+            if (!db._indexManager.TryLoadFromCatalog(out var indexCorruption))
+            {
+                Console.Error.WriteLine(
+                    $"[DocumentForge] WARNING: index catalog corrupted ({indexCorruption}); " +
+                    $"opening database with no indexes. Document data is intact. " +
+                    $"Re-create indexes via CreateIndex. (Issue #64)");
+                db._indexManager.ResetCatalog();
+            }
             foreach (var collName in db._catalog.GetCollectionNames())
                 db._catalog.GetCollection(collName)?.BuildLocationMap();
             return db;

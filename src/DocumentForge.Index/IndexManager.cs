@@ -74,9 +74,26 @@ public sealed class IndexManager
     /// </summary>
     public void LoadFromCatalog()
     {
-        if (_catalog is null || _cache is null || _allocator is null) return;
+        if (!TryLoadFromCatalog(out var reason))
+            throw new DocumentForgeException(
+                $"Index catalog could not be loaded: {reason}");
+    }
 
-        _catalog.Load();
+    /// <summary>
+    /// Issue #64: non-throwing variant of <see cref="LoadFromCatalog"/>. On a
+    /// structurally corrupt catalog (cycle on disk surviving crash recovery)
+    /// returns false with a description; the in-memory index registry is left
+    /// empty so the caller can decide to self-heal (reset the catalog) or
+    /// surface the corruption.
+    /// </summary>
+    public bool TryLoadFromCatalog(out string? corruptionReason)
+    {
+        corruptionReason = null;
+        if (_catalog is null || _cache is null || _allocator is null) return true;
+
+        if (!_catalog.TryLoad(out corruptionReason))
+            return false;
+
         foreach (var def in _catalog.Definitions)
         {
             var index = new BTreeIndex(def);
@@ -99,6 +116,21 @@ public sealed class IndexManager
             list.Add(index);
             _indexesByName[def.Name] = index;
         }
+        return true;
+    }
+
+    /// <summary>
+    /// Issue #64: wipe the in-memory index registry and reset the catalog
+    /// head pointer. Called by the open path after <see cref="TryLoadFromCatalog"/>
+    /// reports corruption. The next <see cref="CreateIndex"/> allocates a
+    /// fresh catalog chain; previously-orphaned index pages remain on disk
+    /// but no longer participate in catalog walks.
+    /// </summary>
+    public void ResetCatalog()
+    {
+        _indexesByCollection.Clear();
+        _indexesByName.Clear();
+        _catalog?.Reset();
     }
 
     public void DropIndex(string indexName)
