@@ -10,6 +10,8 @@ export interface BaseTab {
   connectionId?: string;  // pinned at tab creation; switching the global active
                           // connection no longer yanks open tabs out from under
                           // the user. Undefined = follow the global active.
+  database?: string;      // attached DB to target (multi-DB hosts). Undefined =
+                          // the service's default DB (flat routes).
 }
 
 export interface QueryTabState extends BaseTab {

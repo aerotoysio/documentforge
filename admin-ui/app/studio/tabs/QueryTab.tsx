@@ -19,7 +19,7 @@ export function QueryTab({ tab, ctx, connection }: { tab: any; ctx: TabContext; 
   // a different attached database without flipping the service default.
   const [availableDbs, setAvailableDbs] = useState<string[]>([]);
   const [defaultDb, setDefaultDb] = useState<string | null>(null);
-  const [selectedDb, setSelectedDb] = useState<string>('');
+  const [selectedDb, setSelectedDb] = useState<string>(tab.database ?? '');
   const [dbsAvailable, setDbsAvailable] = useState(false);
 
   useEffect(() => {

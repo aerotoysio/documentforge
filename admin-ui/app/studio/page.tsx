@@ -100,19 +100,24 @@ export default function StudioPage() {
   // QueryTab pre-filled with `SELECT * FROM <coll> LIMIT 100` rather than a
   // BrowseTab. This keeps the SQL editor visible so the user can tweak the
   // query (add WHERE / ORDER BY / etc.) without losing the results pane.
-  const openBrowse = useCallback((collection: string) => {
-    const id = `query:${collection}`;
+  const openBrowse = useCallback((collection: string, opts?: { connectionId?: string; database?: string }) => {
+    const cid = opts?.connectionId;
+    const db = opts?.database;
+    const id = `query:${cid ?? 'active'}:${db ?? ''}:${collection}`;
     openTab({
       id,
       kind: 'query',
-      title: collection,
+      title: db ? `${collection} @${db}` : collection,
       initialSql: `SELECT * FROM ${collection} LIMIT 100`,
+      connectionId: cid,
+      database: db,
     } as Tab);
   }, [openTab]);
 
-  const openIndexes = useCallback((collection: string) => {
-    const id = `indexes:${collection}`;
-    openTab({ id, kind: 'indexes', title: `🔑 ${collection}`, collection } as Tab);
+  const openIndexes = useCallback((collection: string, opts?: { connectionId?: string }) => {
+    const cid = opts?.connectionId;
+    const id = `indexes:${cid ?? 'active'}:${collection}`;
+    openTab({ id, kind: 'indexes', title: `🔑 ${collection}`, collection, connectionId: cid } as Tab);
   }, [openTab]);
 
   const openInspector = useCallback((collection: string, doc: any) => {
