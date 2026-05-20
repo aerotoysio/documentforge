@@ -8,6 +8,21 @@ using DocumentForge.Document;
 namespace DocumentForge.Engine.Linq;
 
 /// <summary>
+/// Shared JSON options for the typed LINQ surface. Typed Insert and typed
+/// Where/Read MUST agree on casing — both emit and read camelCase. Issue #62:
+/// Insert used default PascalCase while Where/Read used camelCase, so typed
+/// inserts produced documents that typed queries could never find.
+/// </summary>
+internal static class LinqJson
+{
+    public static readonly JsonSerializerOptions Options = new()
+    {
+        PropertyNameCaseInsensitive = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    };
+}
+
+/// <summary>
 /// Strongly-typed access to a DocumentForge collection. Translates a focused subset of
 /// LINQ expressions into SQL strings that our query engine understands.
 ///
@@ -53,7 +68,7 @@ public sealed class LinqCollection<T> where T : class
     /// <summary>Insert a typed object. The object is serialized to JSON then stored.</summary>
     public DocumentId Insert(T item)
     {
-        var json = JsonSerializer.Serialize(item);
+        var json = JsonSerializer.Serialize(item, LinqJson.Options);
         return _db.Insert(_collectionName, BsonDocument.FromJson(json));
     }
 }
@@ -101,16 +116,10 @@ public sealed class LinqQuery<T> where T : class
     public LinqQuery<T> Take(int n) { _limit = n; return this; }
     public LinqQuery<T> Skip(int n) { _skip = n; return this; }
 
-    private static readonly JsonSerializerOptions _jsonOptions = new()
-    {
-        PropertyNameCaseInsensitive = true,
-        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
-    };
-
     public List<T> ToList()
     {
         var result = _db.Execute(BuildSql());
-        return result.Documents.Select(d => JsonSerializer.Deserialize<T>(d.ToJson(), _jsonOptions)!).ToList();
+        return result.Documents.Select(d => JsonSerializer.Deserialize<T>(d.ToJson(), LinqJson.Options)!).ToList();
     }
 
     public T? FirstOrDefault()
@@ -228,6 +237,11 @@ internal static class ExpressionTranslator
         return lambda.Compile().DynamicInvoke();
     }
 
+    // Issue #63: Guid (and any non-numeric type) used to fall through to an
+    // unquoted ToString(), so `WHERE id = abc123-...` parsed as an identifier
+    // and matched nothing. Quote the string-ish types, format numerics with the
+    // invariant culture, and throw on genuinely unknown types so the next gap
+    // surfaces as a clear error instead of silently returning zero rows.
     private static string FormatLiteral(object? value) => value switch
     {
         null => "NULL",
@@ -235,6 +249,11 @@ internal static class ExpressionTranslator
         bool b => b ? "true" : "false",
         DateTime dt => $"'{dt:yyyy-MM-ddTHH:mm:ss}'",
         DateTimeOffset dto => $"'{dto:yyyy-MM-ddTHH:mm:ss}'",
-        _ => value.ToString() ?? "NULL"
+        Guid g => $"'{g}'",
+        Enum e => Convert.ToInt64(e).ToString(System.Globalization.CultureInfo.InvariantCulture),
+        IFormattable f when value is sbyte or byte or short or ushort or int or uint or long or ulong or float or double or decimal
+            => f.ToString(null, System.Globalization.CultureInfo.InvariantCulture),
+        _ => throw new NotSupportedException(
+            $"Cannot translate value of type {value.GetType().Name} to a SQL literal — add an explicit case in FormatLiteral."),
     };
 }
