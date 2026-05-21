@@ -58,7 +58,28 @@ export function Explorer({ refreshKey, onRefresh, onOpenBrowse, onOpenIndexes, o
           }));
           return { conn, dbs, error: null };
         } catch (e: any) {
-          return { conn, dbs: [], error: e?.message || String(e) };
+          // Older (pre-#66) single-DB builds have no /databases route. If
+          // /stats still answers the service is reachable — surface it as one
+          // "default" DB so the Explorer stays consistent with the Dashboard's
+          // reachability check (which also probes /stats). Only mark it
+          // unreachable when /stats fails too.
+          try {
+            const stats = await getStats({ connection: conn });
+            return {
+              conn,
+              dbs: [{
+                name: 'default', isDefault: true,
+                collections: (stats.collections ?? []).map((c: any) => ({
+                  name: c.name,
+                  documentCount: c.documentCount,
+                  indexes: (c.indexes ?? []).map((i: any) => ({ name: i.name, path: i.path, unique: i.unique, entries: i.entries })),
+                })),
+              }],
+              error: null,
+            };
+          } catch {
+            return { conn, dbs: [], error: e?.message || String(e) };
+          }
         }
       }));
       if (cancelled) return;
