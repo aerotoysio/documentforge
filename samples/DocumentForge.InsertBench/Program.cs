@@ -43,12 +43,15 @@ var options = new DatabaseOptions { CacheSizeInPages = 200_000, EnableWal = fals
 double insRate;
 using (var db = DocumentForgeDb.Create(dbPath, options))
 {
+    int g0 = GC.CollectionCount(0), g1 = GC.CollectionCount(1), g2 = GC.CollectionCount(2);
+    long alloc = GC.GetTotalAllocatedBytes();
     var insSw = Stopwatch.StartNew();
     for (int off = 0; off < N; off += BATCH)
         db.BulkInsert("orders", docs.GetRange(off, Math.Min(BATCH, N - off)));
     insSw.Stop();
     insRate = N / insSw.Elapsed.TotalSeconds;
     Console.WriteLine($"  BulkInsert only : {insSw.Elapsed.TotalSeconds,6:F2}s  =>  {insRate,10:N0} docs/sec   <-- engine ceiling");
+    Console.WriteLine($"  GC during insert: gen0 {GC.CollectionCount(0) - g0}, gen1 {GC.CollectionCount(1) - g1}, gen2 {GC.CollectionCount(2) - g2}; allocated {(GC.GetTotalAllocatedBytes() - alloc) / 1048576.0:F0} MB");
     db.Flush();
 }
 Cleanup(dbPath);
