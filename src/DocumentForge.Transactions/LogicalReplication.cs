@@ -468,6 +468,10 @@ public sealed class LogicalReplicationServer : IDisposable
                 }
             }
 
+            // catchupOps is non-null on every reachable path above, but the
+            // nullable flow analysis can't see that through the `needSnapshot`
+            // bool. Normalise to empty so the dereference is provably safe (CS8602).
+            catchupOps ??= new List<LogicalOp>();
             Console.WriteLine($"[LogicalRep] Follower connected (seq {streamFromSeq} → {OpLog.NewestSeq}), " +
                               $"replaying {catchupOps.Count} ops");
 
