@@ -111,30 +111,24 @@ public sealed class Collection
         doc.EnsureId();
         var id = doc.GetId();
 
-        // Use pooled buffer to avoid GC pressure in the hot insert path
+        // Use pooled buffer to avoid GC pressure in the hot insert path.
         var (pooledBuffer, length) = BsonSerializer.SerializeToPooled(doc);
         try
         {
-            byte[] slotData;
             if (length > MaxSingleDocSize)
             {
-                // Large doc: copy to a temp array only for overflow chain write
+                // Large doc: copy to a temp array only for the overflow-chain write.
                 var bytes = new byte[length];
                 pooledBuffer.AsSpan(0, length).CopyTo(bytes);
                 var firstOverflow = WriteOverflowChain(bytes);
-                slotData = BuildOverflowStub(length, firstOverflow);
+                return InsertSlotData(id, BuildOverflowStub(length, firstOverflow));
             }
-            else
-            {
-                // Small doc: the slot data is just the first `length` bytes of pooledBuffer.
-                // We need a byte[] because DataPage.Insert takes ReadOnlySpan but we reuse below.
-                // Copy only the used portion (most docs are << page size).
-                slotData = new byte[length];
-                pooledBuffer.AsSpan(0, length).CopyTo(slotData);
-            }
-        // Hoisting the rest of the insert outside the try - but we still need pooledBuffer in scope
-        // for the return at the end. Restructure:
-        return InsertSlotData(id, slotData);
+
+            // Small doc (the common case): write straight from the pooled buffer.
+            // Pre-fix this copied into a fresh `new byte[length]` on every insert —
+            // a needless hot-path allocation. DataPage.Insert copies the span into
+            // the page, so the pooled buffer is safe to return the moment we return.
+            return InsertSlotData(id, pooledBuffer.AsSpan(0, length));
         }
         finally
         {
@@ -142,9 +136,8 @@ public sealed class Collection
         }
     }
 
-    private DocumentId InsertSlotData(DocumentId id, byte[] slotData)
+    private DocumentId InsertSlotData(DocumentId id, ReadOnlySpan<byte> slotData)
     {
-
         if (!_firstDataPage.IsValid)
         {
             _firstDataPage = _allocator.AllocatePage(PageType.Data);
@@ -156,21 +149,16 @@ public sealed class Collection
         var currentPageId = _lastInsertPage.IsValid ? _lastInsertPage : _firstDataPage;
 
         // Safety: after allocating a fresh empty page, the doc MUST fit (we checked size above).
-        // Track if we already tried a freshly allocated page.
         bool triedFreshPage = false;
 
-        // Issue #57: bound the walk against a corrupt NextPageId loop. Without
-        // this, a torn page header that cycles back into the chain prevents
-        // triedFreshPage from ever flipping (we never reach an Invalid tail),
-        // and Insert hangs forever instead of failing fast.
-        var visited = new HashSet<uint>();
+        // Issue #57 cycle guard: a torn NextPageId that loops back into the chain
+        // must not spin forever. The only way to loop is by following an *existing*
+        // link, so we guard there and allocate the visited set lazily — the common
+        // case (first page has room) never walks a chain and never allocates.
+        HashSet<uint>? visited = null;
 
         while (true)
         {
-            if (!visited.Add(currentPageId.Value))
-                throw new PageCorruptionException(currentPageId,
-                    $"cycle detected in collection '{_name.Value}' page chain during insert.");
-
             var pageData = _cache.GetPage(currentPageId);
             var page = new DataPage(pageData);
 
@@ -191,9 +179,10 @@ public sealed class Collection
                     $"Insert failed on freshly allocated page - slot size: {slotData.Length} bytes, page free: {page.Header.FreeSpace}");
             }
 
-            // Current page is full - allocate a new one and link it
             if (!page.Header.NextPageId.IsValid)
             {
+                // Current page is full - allocate a fresh one and link it. A
+                // brand-new page id can't be part of a cycle, so no guard needed.
                 var newPageId = _allocator.AllocatePage(PageType.Data);
                 page.SetNextPage(newPageId);
                 _cache.PutPage(currentPageId, page.RawData, isDirty: true);
@@ -208,6 +197,12 @@ public sealed class Collection
             }
             else
             {
+                // Following an existing link is the only way a corrupt chain can
+                // loop. Record the page we're leaving; revisiting it = a cycle.
+                visited ??= new HashSet<uint>();
+                if (!visited.Add(currentPageId.Value))
+                    throw new PageCorruptionException(currentPageId,
+                        $"cycle detected in collection '{_name.Value}' page chain during insert.");
                 currentPageId = page.Header.NextPageId;
             }
         }
