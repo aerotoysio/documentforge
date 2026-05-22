@@ -272,7 +272,6 @@ public sealed class DatabaseRegistryTests
     [InlineData("")]
     [InlineData("  ")]
     [InlineData("1starts_with_digit")]
-    [InlineData("_starts_with_underscore")]
     [InlineData("has space")]
     [InlineData("has.dot")]
     [InlineData("has/slash")]
@@ -284,6 +283,23 @@ public sealed class DatabaseRegistryTests
             using var registry = new DatabaseRegistry();
             Assert.Throws<ArgumentException>(() =>
                 registry.Create(badName, Path.Combine(dir, "x.dfdb")));
+        }
+        finally { CleanupDir(dir); }
+    }
+
+    [Fact]
+    public void Create_UnderscorePrefixedName_IsAllowed()
+    {
+        // Issue #73 relaxed the name rule: engine-internal databases
+        // (the auto-attached _system) need an underscore prefix; the
+        // routing layer (DatabaseEndpoints) hides them from /databases.
+        var dir = FreshDir("underscore");
+        try
+        {
+            using var registry = new DatabaseRegistry();
+            var db = registry.Create("_system", Path.Combine(dir, "system.dfdb"));
+            Assert.NotNull(db);
+            Assert.NotNull(registry.TryGet("_system"));
         }
         finally { CleanupDir(dir); }
     }

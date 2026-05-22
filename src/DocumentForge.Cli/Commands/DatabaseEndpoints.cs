@@ -36,10 +36,14 @@ public static class DatabaseEndpoints
         // List every attached database. Stable shape across phases.
         // Admin-scoped: enumerating tenants would leak names to a
         // restricted key, which is what scoped keys exist to prevent.
+        // The _system DB (Issue #73) is hidden from this view — it's
+        // an implementation detail surfaced through /admin/* instead.
         app.MapGet("/databases", (HttpContext ctx) =>
         {
             if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
-            var entries = registry.List();
+            var entries = registry.List()
+                .Where(e => !IsInternalDatabase(e.Name))
+                .ToList();
             return Results.Ok(new
             {
                 @default = registry.DefaultDatabaseName,
@@ -96,6 +100,8 @@ public static class DatabaseEndpoints
         app.MapDelete("/databases/{name}", (HttpContext ctx, string name, bool? deleteFiles) =>
         {
             if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (IsInternalDatabase(name))
+                return Results.BadRequest(new { error = $"Database '{name}' is a system DB and cannot be detached or dropped." });
             try
             {
                 var drop = deleteFiles == true;
@@ -319,6 +325,12 @@ public static class DatabaseEndpoints
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
     }
+
+    // Issue #73 — names beginning with an underscore are reserved for
+    // internal use (currently just "_system"). The check is in one place
+    // so adding "_audit" / "_metrics" / etc. later only touches here.
+    private static bool IsInternalDatabase(string name) =>
+        !string.IsNullOrEmpty(name) && name.StartsWith("_", StringComparison.Ordinal);
 }
 
 // Phase 3a — scoped query body. Same field as the flat QueryRequest in
