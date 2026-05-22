@@ -466,6 +466,54 @@ export async function getServiceLog(port: number, opts?: CallOptions): Promise<s
   return r.text();
 }
 
+// ---------- Managed API keys (Issue #73) ----------
+// Stored in the service's _system database via the KeyStore. The
+// admin token (legacy apiKey) is what unlocks these endpoints; from
+// there operators mint per-database scoped keys for tenant apps.
+
+export interface AdminKeyInfo {
+  id: string;
+  scopes: string[];
+  description: string | null;
+  createdAt: string;
+}
+
+export interface MintedKey {
+  id: string;
+  /** Plaintext secret — returned ONCE on mint. Show, store, then it's gone. */
+  secret: string;
+  scopes: string[];
+  description: string | null;
+  createdAt: string;
+  warning: string;
+}
+
+export async function listAdminKeys(opts?: CallOptions): Promise<{ count: number; keys: AdminKeyInfo[] }> {
+  const r = await fetch(urlFor('/admin/keys', opts), { headers: authHeaders(opts) });
+  return handle(r);
+}
+
+export async function createAdminKey(
+  scopes: string[],
+  description: string | null | undefined,
+  opts?: CallOptions,
+): Promise<MintedKey> {
+  const r = await fetch(urlFor('/admin/keys', opts), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
+    body: JSON.stringify({ scopes, description: description || null }),
+  });
+  return handle(r);
+}
+
+export async function deleteAdminKey(id: string, opts?: CallOptions) {
+  const r = await fetch(urlFor(`/admin/keys/${encodeURIComponent(id)}`, opts), {
+    method: 'DELETE',
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+
 // ---------- Spawn cluster router (Issue #66 Phase 6b) ----------
 // One-click cluster router from Studio. The host service writes the
 // cluster.json to disk and starts a `dfdb router` child against it.
