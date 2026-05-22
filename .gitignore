@@ -43,3 +43,7 @@ Thumbs.db
 cluster.json
 *.test.json
 tsconfig.tsbuildinfo
+
+# Local DocumentForge runtime data (not source)
+data/
+data.bak/
