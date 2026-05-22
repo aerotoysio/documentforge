@@ -1,4 +1,5 @@
 using System.Text.Json;
+using DocumentForge.Cli.Auth;
 using DocumentForge.Core;
 using DocumentForge.Engine;
 using Microsoft.AspNetCore.Routing;
@@ -33,8 +34,11 @@ public static class DatabaseEndpoints
     public static void Map(IEndpointRouteBuilder app, DatabaseRegistry registry, string defaultDataDir)
     {
         // List every attached database. Stable shape across phases.
-        app.MapGet("/databases", () =>
+        // Admin-scoped: enumerating tenants would leak names to a
+        // restricted key, which is what scoped keys exist to prevent.
+        app.MapGet("/databases", (HttpContext ctx) =>
         {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
             var entries = registry.List();
             return Results.Ok(new
             {
@@ -53,8 +57,9 @@ public static class DatabaseEndpoints
         //   { "name": "acme" }                            -> {dataDir}/acme.dfdb, create-or-attach
         //   { "name": "acme", "path": "/abs/p.dfdb" }     -> use the supplied path, create-or-attach
         //   { "name": "acme", "createIfMissing": false }  -> Attach (existing file only)
-        app.MapPost("/databases", (CreateDatabaseRequest req) =>
+        app.MapPost("/databases", (HttpContext ctx, CreateDatabaseRequest req) =>
         {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
             try
             {
                 if (string.IsNullOrWhiteSpace(req.Name))
@@ -88,8 +93,9 @@ public static class DatabaseEndpoints
 
         // Detach (default) or Drop (delete-files=true). 404 when not
         // registered so Studio's idempotent retries get a clear signal.
-        app.MapDelete("/databases/{name}", (string name, bool? deleteFiles) =>
+        app.MapDelete("/databases/{name}", (HttpContext ctx, string name, bool? deleteFiles) =>
         {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
             try
             {
                 var drop = deleteFiles == true;
@@ -108,8 +114,9 @@ public static class DatabaseEndpoints
 
         // Phase 2 stopgap for "I'm working on DB X now" — Phase 4 will
         // replace this with auth-scoped Bearer tokens.
-        app.MapPost("/databases/{name}/set-default", (string name) =>
+        app.MapPost("/databases/{name}/set-default", (HttpContext ctx, string name) =>
         {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
             try
             {
                 registry.SetDefault(name);
@@ -133,8 +140,13 @@ public static class DatabaseEndpoints
 
         // Per-DB replication status — derived from live engine state, not
         // startup config. Returns 404 when the named DB isn't attached.
-        app.MapGet("/db/{name}/replication/status", (string name) =>
+        // Replication status reveals followers, current seq, etc. —
+        // admin-only since these wire topology details would help an
+        // attacker reconstruct the cluster shape from a leaked
+        // tenant-scoped key.
+        app.MapGet("/db/{name}/replication/status", (HttpContext ctx, string name) =>
         {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
             var db = registry.TryGet(name);
             if (db is null)
                 return Results.NotFound(new { error = $"Database '{name}' is not attached." });
@@ -179,8 +191,9 @@ public static class DatabaseEndpoints
         // Mount this DB as a replication leader on a dedicated TCP port.
         // The port has to differ from the service's HTTP port and from
         // any other DB's replication port in the same service.
-        app.MapPost("/db/{name}/replication/start-leader", (string name, StartLeaderBody body) =>
+        app.MapPost("/db/{name}/replication/start-leader", (HttpContext ctx, string name, StartLeaderBody body) =>
         {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
             var db = registry.TryGet(name);
             if (db is null)
                 return Results.NotFound(new { error = $"Database '{name}' is not attached." });
@@ -195,8 +208,9 @@ public static class DatabaseEndpoints
         // Mount this DB as a follower of another DB (same service or remote).
         // First action on a fresh follower triggers a snapshot transfer from
         // the leader — any existing data in this DB is replaced.
-        app.MapPost("/db/{name}/replication/start-follower", (string name, StartFollowerBody body) =>
+        app.MapPost("/db/{name}/replication/start-follower", (HttpContext ctx, string name, StartFollowerBody body) =>
         {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
             var db = registry.TryGet(name);
             if (db is null)
                 return Results.NotFound(new { error = $"Database '{name}' is not attached." });
@@ -217,8 +231,9 @@ public static class DatabaseEndpoints
         // Manual promotion — same semantics as the flat /replication/promote
         // but scoped to a named DB. Use during planned handover, or after a
         // leader-side crash, to flip a follower into leader on its own port.
-        app.MapPost("/db/{name}/replication/promote", (string name, PromoteBody body) =>
+        app.MapPost("/db/{name}/replication/promote", (HttpContext ctx, string name, PromoteBody body) =>
         {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
             var db = registry.TryGet(name);
             if (db is null)
                 return Results.NotFound(new { error = $"Database '{name}' is not attached." });
@@ -237,8 +252,13 @@ public static class DatabaseEndpoints
         // default DB; this route targets the named one. Same response
         // shape so the client-side handler stays simple.
         // ----------------------------------------------------------------
-        app.MapPost("/db/{name}/query", (string name, QueryBody body) =>
+        app.MapPost("/db/{name}/query", (HttpContext ctx, string name, QueryBody body) =>
         {
+            // Treat as read — SELECT is the dominant workload. INSERT
+            // statements run through /collections POSTs which use write
+            // scope; running them via /query bypasses that gate is a
+            // known limitation called out in #72.
+            if (ScopeCheck.RequireDbRead(ctx, name) is { } deny) return deny;
             var db = registry.TryGet(name);
             if (db is null)
                 return Results.NotFound(new { error = $"Database '{name}' is not attached." });
@@ -268,8 +288,9 @@ public static class DatabaseEndpoints
         // Scoped collections list — Studio's Explorer pane uses this when
         // a tab is pinned to a non-default DB. The flat /collections
         // continues to return the default DB's collections for back-compat.
-        app.MapGet("/db/{name}/collections", (string name) =>
+        app.MapGet("/db/{name}/collections", (HttpContext ctx, string name) =>
         {
+            if (ScopeCheck.RequireDbRead(ctx, name) is { } deny) return deny;
             var db = registry.TryGet(name);
             if (db is null)
                 return Results.NotFound(new { error = $"Database '{name}' is not attached." });
@@ -280,8 +301,9 @@ public static class DatabaseEndpoints
         // /collections/{c} POSTs against a multi-DB-backed ring leader.
         // Body shape mirrors the flat POST /collections/{name}: raw JSON
         // document. Returns the new doc id on success.
-        app.MapPost("/db/{name}/collections/{collection}", async (string name, string collection, HttpRequest request) =>
+        app.MapPost("/db/{name}/collections/{collection}", async (HttpContext ctx, string name, string collection, HttpRequest request) =>
         {
+            if (ScopeCheck.RequireDbWrite(ctx, name) is { } deny) return deny;
             var db = registry.TryGet(name);
             if (db is null)
                 return Results.NotFound(new { error = $"Database '{name}' is not attached." });

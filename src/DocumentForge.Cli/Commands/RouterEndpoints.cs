@@ -89,7 +89,7 @@ public static class RouterEndpoints
             status = "ok",
             node = "router",
             role = "router",
-            version = "0.1.0",
+            version = "1.0.0",
             configPath = Path.GetFullPath(configPath),
             shards = router.Config.Shards.Count,
             collections = router.Config.Collections.Count,

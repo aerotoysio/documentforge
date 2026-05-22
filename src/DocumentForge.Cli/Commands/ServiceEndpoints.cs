@@ -1,4 +1,5 @@
 using DocumentForge.Cli;
+using DocumentForge.Cli.Auth;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
@@ -33,14 +34,18 @@ public static class ServiceEndpoints
 {
     public static void Map(IEndpointRouteBuilder app, ServiceManager manager, string defaultDataDirRoot)
     {
-        app.MapGet("/services", () =>
+        // All /services + /routers verbs are admin-only — spawning a
+        // child process is way more privileged than data-plane access.
+        app.MapGet("/services", (HttpContext ctx) =>
         {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
             var entries = manager.List();
             return Results.Ok(new { count = entries.Count, services = entries });
         });
 
-        app.MapPost("/services", (SpawnServiceRequest req) =>
+        app.MapPost("/services", (HttpContext ctx, SpawnServiceRequest req) =>
         {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
             try
             {
                 // Default data dir: a sibling of the parent's, named by port
@@ -82,16 +87,18 @@ public static class ServiceEndpoints
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
 
-        app.MapDelete("/services/{port:int}", (int port) =>
+        app.MapDelete("/services/{port:int}", (HttpContext ctx, int port) =>
         {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
             var stopped = manager.Stop(port);
             if (!stopped)
                 return Results.NotFound(new { error = $"No managed service on port {port}." });
             return Results.Ok(new { port, stopped = true });
         });
 
-        app.MapGet("/services/{port:int}/logs", (int port, int? maxBytes) =>
+        app.MapGet("/services/{port:int}/logs", (HttpContext ctx, int port, int? maxBytes) =>
         {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
             var log = manager.ReadLog(port, maxBytes ?? 16384);
             return Results.Text(log, "text/plain");
         });
@@ -102,8 +109,9 @@ public static class ServiceEndpoints
         // ServiceManager that handles serve children. Studio's "Spawn
         // router" button hits this; the new HTTP base URL comes back
         // and Studio auto-registers it as a Connection.
-        app.MapPost("/routers", (SpawnRouterRequest req) =>
+        app.MapPost("/routers", (HttpContext ctx, SpawnRouterRequest req) =>
         {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
             try
             {
                 if (string.IsNullOrWhiteSpace(req.ClusterConfigJson))

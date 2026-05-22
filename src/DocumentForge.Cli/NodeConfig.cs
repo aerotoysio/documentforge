@@ -185,9 +185,41 @@ public sealed class NetworkConfig
 
 public sealed class SecurityConfig
 {
+    /// <summary>Admin (god) key — full access to every database + admin
+    /// operations (attach/detach DBs, spawn services, etc.). Kept as the
+    /// dev-mode default; production deployments should prefer scoped
+    /// keys (see <see cref="ScopedKeys"/>) and reserve this for an
+    /// emergency-access path.</summary>
     public string? ApiKey { get; set; }
     public string? ReplicationSecret { get; set; }
     public TlsConfig? Tls { get; set; }
+
+    /// <summary>Issue #72 — scoped API keys. Each entry's key grants
+    /// access only to the databases its scopes name. Coexists with
+    /// <see cref="ApiKey"/>: the admin key always works; scoped keys
+    /// fill in the multi-tenant gap.</summary>
+    public List<ScopedApiKey>? ScopedKeys { get; set; }
+}
+
+/// <summary>
+/// A bearer token that's restricted to one or more databases + an
+/// access level. Scope grammar (each entry in <see cref="Scopes"/>):
+///   <list type="bullet">
+///     <item><c>*</c>  — admin (everything, equivalent to ApiKey)</item>
+///     <item><c>db:*</c> — full data-plane access to every DB (no admin)</item>
+///     <item><c>db:foo</c> — read+write on database "foo"</item>
+///     <item><c>db:foo:read</c> — read-only on "foo"</item>
+///     <item><c>db:foo:write</c> — same as db:foo (explicit form)</item>
+///   </list>
+/// </summary>
+public sealed class ScopedApiKey
+{
+    public string Key { get; set; } = "";
+    /// <summary>Scopes this key carries. AT LEAST ONE required.</summary>
+    public List<string> Scopes { get; set; } = new();
+    /// <summary>Free-form note for operators ("staging tenant-a",
+    /// "metrics reader") — never used by enforcement.</summary>
+    public string? Description { get; set; }
 }
 
 public sealed class TlsConfig
