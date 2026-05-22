@@ -1,0 +1,83 @@
+# One-shot manifest retag — copies an existing image to additional tags
+# without rebuilding. Useful when a release was cut before the main
+# release workflow could produce its semver tags (release.yml needs the
+# `tags:` trigger to fire, which doesn't help for an already-published
+# tag whose commit predates the semver-aware workflow).
+#
+# Usage (from GitHub UI → Actions → "Retag images"):
+#   source_tag = master-679ef9f    (engine image already on GHCR)
+#   version    = 1.1.0
+#
+# Produces:
+#   ghcr.io/aerotoysio/documentforge:1.1.0
+#   ghcr.io/aerotoysio/documentforge:1.1
+#   ghcr.io/aerotoysio/documentforge:1
+#   ghcr.io/aerotoysio/documentforge-admin:1.1.0
+#   ghcr.io/aerotoysio/documentforge-admin:1.1
+#   ghcr.io/aerotoysio/documentforge-admin:1
+#
+# Buildx imagetools copies the manifest pointers — no rebuild, no
+# layer transfer. Pull-by-digest pins still work; only the tag map
+# changes.
+
+name: Retag images
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_tag:
+        description: 'Existing tag on GHCR to copy FROM (e.g. master-679ef9f)'
+        required: true
+      version:
+        description: 'Target semver to publish (e.g. 1.1.0). Major and minor are derived.'
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  retag:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - documentforge
+          - documentforge-admin
+    name: Retag ${{ matrix.image }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute version segments
+        id: ver
+        run: |
+          v="${{ inputs.version }}"
+          # Strip an optional leading "v".
+          v="${v#v}"
+          # Split into major / minor / patch with a glob fallback so
+          # a non-3-segment input still produces useful prefix tags.
+          IFS='.' read -r major minor patch <<< "$v"
+          {
+            echo "full=$v"
+            echo "minor=$major.$minor"
+            echo "major=$major"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Copy manifest with new tags
+        run: |
+          SRC="ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ inputs.source_tag }}"
+          docker buildx imagetools create \
+            -t "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ steps.ver.outputs.full }}" \
+            -t "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ steps.ver.outputs.minor }}" \
+            -t "ghcr.io/${{ github.repository_owner }}/${{ matrix.image }}:${{ steps.ver.outputs.major }}" \
+            "$SRC"
+          echo "Retagged $SRC to ${{ steps.ver.outputs.full }} + ${{ steps.ver.outputs.minor }} + ${{ steps.ver.outputs.major }}"
