@@ -65,6 +65,15 @@ public static class ServeCommand
         var registry = new DatabaseRegistry();
         var db = registry.AttachOrCreate("default", dbPath);
 
+        // Issue #73: auto-attach the _system DB alongside default. Holds
+        // managed keys, audit log (future), runtime config overrides
+        // (future). Treated as undeletable; hidden from /databases
+        // listings so it doesn't clutter the Studio sidebar.
+        var systemDbPath = Path.Combine(config.DataDir, "_system.dfdb");
+        registry.AttachOrCreate("_system", systemDbPath);
+        var keyStore = new Auth.KeyStore(registry);
+        keyStore.Reload();
+
         // Optional replication wiring - leader / follower / none
         var replicationSummary = StartReplication(db, config);
 
@@ -86,7 +95,13 @@ public static class ServeCommand
         // per-DB / admin / read-vs-write decisions.
         var adminKey = config.Security?.ApiKey;
         var scopedKeys = config.Security?.ScopedKeys ?? new List<ScopedApiKey>();
-        var devMode = string.IsNullOrEmpty(adminKey) && scopedKeys.Count == 0;
+        // Dev mode = nothing in node.json AND nothing in the _system
+        // DB. Computed lazily per request so that adding the first key
+        // via POST /admin/keys *immediately* closes the dev-mode door
+        // without restart. (Equivalent to SQL Server's "mixed auth"
+        // tipping into real auth the moment a sa login exists.)
+        Func<bool> isDevMode = () =>
+            string.IsNullOrEmpty(adminKey) && scopedKeys.Count == 0 && keyStore.Count == 0;
         app.Use(async (ctx, next) =>
         {
             if (ctx.Request.Method == "OPTIONS") { await next(); return; }
@@ -99,7 +114,7 @@ public static class ServeCommand
                 return;
             }
 
-            if (devMode)
+            if (isDevMode())
             {
                 ctx.Items[Auth.AuthContext.ContextKey] = Auth.AuthContext.DevMode();
                 await next();
@@ -123,9 +138,19 @@ public static class ServeCommand
                 return;
             }
 
-            // Scoped-key match. Iterate to keep constant-time per-key
-            // comparison; an attacker can't time-fingerprint which
-            // configured key they're closest to.
+            // Issue #73: persistent scoped keys. O(1) hash lookup against
+            // the KeyStore's in-memory cache; no DB round-trip per request.
+            var fromStore = keyStore.TryAuthenticate(token);
+            if (fromStore is not null)
+            {
+                ctx.Items[Auth.AuthContext.ContextKey] = fromStore;
+                await next();
+                return;
+            }
+
+            // Config-file scoped keys (back-compat for node.json users).
+            // Iterates because the list is tiny + constant-time per-key
+            // comparison removes timing side-channels.
             foreach (var sk in scopedKeys)
             {
                 if (string.IsNullOrEmpty(sk.Key)) continue;
@@ -226,6 +251,11 @@ public static class ServeCommand
         var serviceManager = new ServiceManager();
         ServiceEndpoints.Map(app, serviceManager, config.DataDir);
 
+        // Issue #73: managed (persisted) API keys. CRUD endpoints under
+        // /admin/keys — all admin-scoped, backed by _system._keys via
+        // the KeyStore set up above.
+        KeysEndpoints.Map(app, keyStore);
+
         // Dispose the registry on shutdown — it cascades to every attached
         // database, including the Phase 1 single "default" one. The service
         // manager is disposed first so child processes are reaped before
@@ -261,6 +291,7 @@ public static class ServeCommand
         Console.WriteLine("  databases: GET  /databases | POST /databases | DELETE /databases/{name}");
         Console.WriteLine("             POST /databases/{name}/set-default");
         Console.WriteLine("  services:  GET  /services | POST /services | DELETE /services/{port}");
+        Console.WriteLine("  keys:      GET  /admin/keys | POST /admin/keys | DELETE /admin/keys/{id}");
         Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint | POST /admin/snapshot");
         Console.WriteLine("             POST /admin/compact/{collection}");
         Console.WriteLine("             POST /admin/rebuild-indexes/{collection}");

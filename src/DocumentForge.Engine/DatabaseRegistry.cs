@@ -318,10 +318,13 @@ public sealed class DatabaseRegistry : IDisposable
     }
 
     /// <summary>
-    /// Names must start with a letter and contain only letters, digits,
-    /// underscores, and dashes. Max 64 chars. Constrained on purpose —
-    /// names appear in URLs and SQL, so spaces / quotes / dots would be
-    /// nightmares. Operators wanting "My Database" should pick "my_database".
+    /// Names must start with a letter or underscore and contain only
+    /// letters, digits, underscores, and dashes. Max 64 chars. Constrained
+    /// on purpose — names appear in URLs and SQL, so spaces / quotes /
+    /// dots would be nightmares. Underscore-prefix is reserved by
+    /// convention for engine-internal databases (Issue #73 — _system);
+    /// the registry permits the syntax but the routing layer hides
+    /// underscore-prefixed names from the public /databases listing.
     /// </summary>
     private static void ValidateName(string name)
     {
@@ -330,9 +333,9 @@ public sealed class DatabaseRegistry : IDisposable
         if (name.Length > 64)
             throw new ArgumentException(
                 $"Database name '{name}' exceeds 64 characters.", nameof(name));
-        if (!char.IsLetter(name[0]))
+        if (!char.IsLetter(name[0]) && name[0] != '_')
             throw new ArgumentException(
-                $"Database name '{name}' must start with a letter.", nameof(name));
+                $"Database name '{name}' must start with a letter or underscore.", nameof(name));
         foreach (var c in name)
         {
             if (!(char.IsLetterOrDigit(c) || c == '_' || c == '-'))
