@@ -21,6 +21,9 @@ name: Build & publish dfdb images
 on:
   push:
     branches: [master]
+    # Versioned releases — push a v1.2.3 tag and the workflow tags the
+    # images with 1.2.3, 1.2, and 1 alongside the master `latest`.
+    tags: ['v*.*.*']
   workflow_dispatch:
 
 concurrency:
@@ -76,6 +79,10 @@ jobs:
           tags: |
             type=raw,value=latest,enable={{is_default_branch}}
             type=sha,prefix=master-,format=short
+            # Push-on-tag (e.g. v1.1.0) → 1.1.0 + 1.1 + 1.
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
 
       - name: Build and push
         uses: docker/build-push-action@v6
