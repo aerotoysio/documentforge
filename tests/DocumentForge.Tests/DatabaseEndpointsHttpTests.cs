@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Net.Sockets;
+using DocumentForge.Cli.Auth;
 using DocumentForge.Cli.Commands;
 using DocumentForge.Engine;
 using Microsoft.AspNetCore.Builder;
@@ -36,6 +37,16 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
         builder.Logging.ClearProviders();
         builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
         var app = builder.Build();
+        // Issue #72: scope-enforcement requires an AuthContext on
+        // HttpContext.Items. ServeCommand installs this; for the
+        // bare-DatabaseEndpoints harness we drop in dev-mode auth so
+        // the tests exercise endpoint behaviour, not authentication.
+        // The actual auth flow is unit-tested in AuthContextTests.
+        app.Use(async (ctx, next) =>
+        {
+            ctx.Items[AuthContext.ContextKey] = AuthContext.DevMode();
+            await next();
+        });
         DatabaseEndpoints.Map(app, registry, dataDir);
 
         app.StartAsync().GetAwaiter().GetResult();

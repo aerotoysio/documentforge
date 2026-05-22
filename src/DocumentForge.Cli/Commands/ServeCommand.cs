@@ -1,4 +1,5 @@
 using System.Text.Json;
+using DocumentForge.Cli.Auth;
 using DocumentForge.Core;
 using DocumentForge.Document;
 using DocumentForge.Engine;
@@ -67,38 +68,149 @@ public static class ServeCommand
         // Optional replication wiring - leader / follower / none
         var replicationSummary = StartReplication(db, config);
 
-        // Optional bearer-token middleware.
-        // /health is always public (load balancers, Render, Docker HEALTHCHECK all probe it
-        // without any auth context - if we gate it, the platform thinks we're unhealthy).
-        // CORS preflights (OPTIONS) are also exempt so browser callers work.
-        if (!string.IsNullOrEmpty(config.Security?.ApiKey))
+        // Bearer-token auth middleware (Issue #72 — scoped keys).
+        // Always installed; what it ENFORCES is a function of what's
+        // configured:
+        //   - No ApiKey, no ScopedKeys → dev mode. Every request gets
+        //     an admin AuthContext. Effectively unauthenticated.
+        //   - ApiKey only → existing single-key behaviour. Token must
+        //     match. On match → admin AuthContext.
+        //   - ScopedKeys only → token must match one of them. Each
+        //     key's scopes define its access.
+        //   - Both → admin key always works; scoped keys also work.
+        //
+        // /health stays public for load balancers.
+        // OPTIONS (CORS preflight) stays public for browsers.
+        //
+        // Endpoints downstream consult HttpContext.GetAuth() to make
+        // per-DB / admin / read-vs-write decisions.
+        var adminKey = config.Security?.ApiKey;
+        var scopedKeys = config.Security?.ScopedKeys ?? new List<ScopedApiKey>();
+        var devMode = string.IsNullOrEmpty(adminKey) && scopedKeys.Count == 0;
+        app.Use(async (ctx, next) =>
         {
-            var expected = config.Security.ApiKey;
-            app.Use(async (ctx, next) =>
-            {
-                if (ctx.Request.Method == "OPTIONS") { await next(); return; }
+            if (ctx.Request.Method == "OPTIONS") { await next(); return; }
 
-                var path = ctx.Request.Path.Value ?? "";
-                if (string.Equals(path, "/health", StringComparison.OrdinalIgnoreCase))
+            var path = ctx.Request.Path.Value ?? "";
+            if (string.Equals(path, "/health", StringComparison.OrdinalIgnoreCase))
+            {
+                ctx.Items[Auth.AuthContext.ContextKey] = Auth.AuthContext.DevMode();
+                await next();
+                return;
+            }
+
+            if (devMode)
+            {
+                ctx.Items[Auth.AuthContext.ContextKey] = Auth.AuthContext.DevMode();
+                await next();
+                return;
+            }
+
+            var header = ctx.Request.Headers["Authorization"].ToString();
+            if (!header.StartsWith("Bearer ", StringComparison.Ordinal))
+            {
+                await Reject401(ctx);
+                return;
+            }
+            var token = header.Substring(7);
+
+            // Admin key match (back-compat). Wins regardless of scopes.
+            if (!string.IsNullOrEmpty(adminKey) &&
+                Auth.AuthContextExtensions.ConstantTimeEquals(token, adminKey))
+            {
+                ctx.Items[Auth.AuthContext.ContextKey] = Auth.AuthContext.FromScopes(new[] { "*" }, "admin");
+                await next();
+                return;
+            }
+
+            // Scoped-key match. Iterate to keep constant-time per-key
+            // comparison; an attacker can't time-fingerprint which
+            // configured key they're closest to.
+            foreach (var sk in scopedKeys)
+            {
+                if (string.IsNullOrEmpty(sk.Key)) continue;
+                if (Auth.AuthContextExtensions.ConstantTimeEquals(token, sk.Key))
                 {
+                    var label = !string.IsNullOrEmpty(sk.Description) ? sk.Description : "scoped-key";
+                    ctx.Items[Auth.AuthContext.ContextKey] = Auth.AuthContext.FromScopes(sk.Scopes, label);
                     await next();
                     return;
                 }
+            }
 
-                var header = ctx.Request.Headers["Authorization"].ToString();
-                if (!header.StartsWith("Bearer ", StringComparison.Ordinal) ||
-                    !ConstantTimeEquals(header.Substring(7), expected))
+            await Reject401(ctx);
+        });
+
+        // Issue #72 — second-line enforcement for flat data-plane routes
+        // that don't (yet) carry inline scope checks. A scoped key that
+        // doesn't cover the *default* DB must not be able to touch
+        // /collections/*, /query, /index, /seed, /tx/* — those all act
+        // on the default DB. Admin tokens pass through untouched.
+        //
+        // This is path-prefix gating, intentionally coarse. Individual
+        // endpoints that have already called ScopeCheck.RequireDbX still
+        // get checked there too (defence in depth). Endpoint-level
+        // checks will eventually replace this middleware once every
+        // flat route has been audited.
+        app.Use(async (ctx, next) =>
+        {
+            var auth = ctx.Items.TryGetValue(Auth.AuthContext.ContextKey, out var raw)
+                && raw is Auth.AuthContext a ? a : Auth.AuthContext.Anonymous();
+            if (auth.CanAdmin) { await next(); return; }
+
+            var path = ctx.Request.Path.Value ?? "";
+            // Flat data-plane prefixes targeting the default DB.
+            // Anything under /db/{name}/* runs its own scope check;
+            // anything under /databases / /services / /routers / /admin
+            // already has admin gates at endpoint level.
+            var needsDefaultDbScope =
+                path.StartsWith("/collections", StringComparison.OrdinalIgnoreCase) ||
+                path.Equals("/query", StringComparison.OrdinalIgnoreCase) ||
+                path.Equals("/index", StringComparison.OrdinalIgnoreCase) ||
+                path.Equals("/seed", StringComparison.OrdinalIgnoreCase) ||
+                path.StartsWith("/tx/", StringComparison.OrdinalIgnoreCase) ||
+                path.StartsWith("/indexes/", StringComparison.OrdinalIgnoreCase);
+            if (!needsDefaultDbScope) { await next(); return; }
+
+            // Which DB? Path-route /db/{n}/... never gets here (covered
+            // above). For flat routes resolve via header/query or fall
+            // back to the registry's current default.
+            var queryDb = ctx.Request.Query["database"].ToString();
+            var headerDb = ctx.Request.Headers["X-Database"].ToString();
+            var targetDb = !string.IsNullOrEmpty(queryDb) ? queryDb
+                : !string.IsNullOrEmpty(headerDb) ? headerDb
+                : registry.DefaultDatabaseName;
+            if (string.IsNullOrEmpty(targetDb)) { await next(); return; }
+
+            // Reads vs writes: we'd need to inspect the route to know.
+            // Coarse rule: GET/HEAD are reads, everything else is a write.
+            // True per-endpoint check still lives in the handler.
+            var isWrite = ctx.Request.Method != "GET" && ctx.Request.Method != "HEAD";
+            var ok = isWrite ? auth.CanWriteDb(targetDb) : auth.CanReadDb(targetDb);
+            if (!ok)
+            {
+                ctx.Response.StatusCode = 403;
+                await ctx.Response.WriteAsJsonAsync(new
                 {
-                    ctx.Response.StatusCode = 401;
-                    await ctx.Response.WriteAsJsonAsync(new { error = "Unauthorized. Provide Authorization: Bearer <apiKey>." });
-                    return;
-                }
-                await next();
+                    error = $"Forbidden — Bearer token lacks {(isWrite ? "write" : "read")} scope on db:{targetDb}.",
+                    matchedKey = auth.MatchedKeyLabel,
+                });
+                return;
+            }
+            await next();
+        });
+
+        static async Task Reject401(HttpContext ctx)
+        {
+            ctx.Response.StatusCode = 401;
+            await ctx.Response.WriteAsJsonAsync(new
+            {
+                error = "Unauthorized. Provide Authorization: Bearer <apiKey>.",
             });
         }
 
         PrintBanner(config, bindUrl, replicationSummary);
-        MapEndpoints(app, db);
+        MapEndpoints(app, db, registry);
         MapAdminEndpoints(app, db, config);
         MapReplicationEndpoints(app, db, config);
         // Issue #66 Phase 2: multi-database admin verbs (list/attach/create/
@@ -217,7 +329,7 @@ public static class ServeCommand
             $"Unknown replication role '{rep.Role}'. Expected 'leader' or 'follower'.");
     }
 
-    private static void MapEndpoints(WebApplication app, DocumentForgeDb db)
+    private static void MapEndpoints(WebApplication app, DocumentForgeDb db, DatabaseRegistry registry)
     {
         // POST /query - materialised JSON response (default, back-compat).
         // Pass ?stream=true OR Accept: application/x-ndjson for an NDJSON stream:
@@ -272,7 +384,25 @@ public static class ServeCommand
             return Results.Empty;
         });
 
-        app.MapGet("/collections", () => Results.Ok(new { collections = db.GetCollectionNames() }));
+        // Issue #72 — consistent DB selection on flat /collections.
+        // Honour ?database=<name> or X-Database header so callers can
+        // target any attached DB without switching to the scoped
+        // /db/{name}/collections path. Falls back to the default DB
+        // when neither is supplied.
+        app.MapGet("/collections", (HttpContext httpCtx, string? database) =>
+        {
+            var requestedDb = ResolveTargetDatabase(httpCtx, database);
+            var targetDb = requestedDb is null ? db : registry.TryGet(requestedDb);
+            if (targetDb is null)
+                return Results.NotFound(new { error = $"Database '{requestedDb}' is not attached." });
+            var resolvedName = requestedDb ?? registry.DefaultDatabaseName ?? "default";
+            if (ScopeCheck.RequireDbRead(httpCtx, resolvedName) is { } deny) return deny;
+            return Results.Ok(new
+            {
+                database = resolvedName,
+                collections = targetDb.GetCollectionNames(),
+            });
+        });
 
         app.MapPost("/collections/{name}", async (string name, HttpRequest request) =>
         {
@@ -767,7 +897,7 @@ public static class ServeCommand
             {
                 status = healthy ? "ok" : "degraded",
                 node = config.NodeName,
-                version = "0.1.0",
+                version = "1.0.0",
                 readOnly = db.IsReadOnly,
                 uptimeSeconds = Math.Round((DateTime.UtcNow - _startedAt).TotalSeconds, 1),
                 health = healthy ? null : new
@@ -794,8 +924,9 @@ public static class ServeCommand
         }));
 
         // Force a cache flush (all dirty pages to disk, truncate recovery log)
-        app.MapPost("/admin/flush", () =>
+        app.MapPost("/admin/flush", (HttpContext httpCtx) =>
         {
+            if (ScopeCheck.RequireAdmin(httpCtx) is { } deny) return deny;
             var sw = System.Diagnostics.Stopwatch.StartNew();
             db.Flush();
             sw.Stop();
@@ -803,8 +934,9 @@ public static class ServeCommand
         });
 
         // Synonym for flush - common DB ops term
-        app.MapPost("/admin/checkpoint", () =>
+        app.MapPost("/admin/checkpoint", (HttpContext httpCtx) =>
         {
+            if (ScopeCheck.RequireAdmin(httpCtx) is { } deny) return deny;
             var sw = System.Diagnostics.Stopwatch.StartNew();
             db.Checkpoint();
             sw.Stop();
@@ -819,8 +951,9 @@ public static class ServeCommand
         // For multi-GB datasets the copy dominates wall time; consider
         // running this against a follower instead so the leader's writes
         // aren't paused.
-        app.MapPost("/admin/snapshot", (SnapshotRequest req) =>
+        app.MapPost("/admin/snapshot", (HttpContext httpCtx, SnapshotRequest req) =>
         {
+            if (ScopeCheck.RequireAdmin(httpCtx) is { } deny) return deny;
             if (string.IsNullOrWhiteSpace(req.TargetPath))
                 return Results.BadRequest(new { error = "targetPath is required." });
             try
@@ -844,8 +977,9 @@ public static class ServeCommand
         // Rebuild every index on a collection from scratch.
         // Needed after a bulk insert that used ?skipIndexes=true, or any time
         // an operator suspects index corruption.
-        app.MapPost("/admin/rebuild-indexes/{collection}", (string collection) =>
+        app.MapPost("/admin/rebuild-indexes/{collection}", (HttpContext httpCtx, string collection) =>
         {
+            if (ScopeCheck.RequireAdmin(httpCtx) is { } deny) return deny;
             try
             {
                 var indexes = db.GetIndexes(collection);
@@ -865,8 +999,9 @@ public static class ServeCommand
 
         // Rebuild ONE named index. Surgical recovery for single-index drift
         // (e.g. issue #1 - a unique index out of sync with the collection).
-        app.MapPost("/admin/rebuild-index/{collection}/{indexName}", (string collection, string indexName) =>
+        app.MapPost("/admin/rebuild-index/{collection}/{indexName}", (HttpContext httpCtx, string collection, string indexName) =>
         {
+            if (ScopeCheck.RequireAdmin(httpCtx) is { } deny) return deny;
             try
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -886,8 +1021,9 @@ public static class ServeCommand
         });
 
         // Compact (reclaim space from deletes) on a single collection
-        app.MapPost("/admin/compact/{collection}", (string collection) =>
+        app.MapPost("/admin/compact/{collection}", (HttpContext httpCtx, string collection) =>
         {
+            if (ScopeCheck.RequireAdmin(httpCtx) is { } deny) return deny;
             try
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -1062,6 +1198,24 @@ public static class ServeCommand
 
     private static bool IsValidFieldPath(string field) =>
         !string.IsNullOrEmpty(field) && _fieldPathRegex.IsMatch(field);
+
+    /// <summary>
+    /// Issue #72 — resolve the database the caller wants this request
+    /// to target. Priority (highest first):
+    ///   <list type="number">
+    ///     <item>Explicit <c>?database=name</c> query parameter</item>
+    ///     <item><c>X-Database: name</c> request header</item>
+    ///     <item>Returns <c>null</c> → caller falls back to the default DB</item>
+    ///   </list>
+    /// Path-scoped routes (<c>/db/{name}/...</c>) bypass this entirely —
+    /// the name lives in the route value and is read directly.
+    /// </summary>
+    private static string? ResolveTargetDatabase(HttpContext ctx, string? queryDatabase)
+    {
+        if (!string.IsNullOrEmpty(queryDatabase)) return queryDatabase;
+        var headerValue = ctx.Request.Headers["X-Database"].ToString();
+        return string.IsNullOrEmpty(headerValue) ? null : headerValue;
+    }
 
     /// <summary>
     /// Normalise an HTTP If-Match header value. RFC 9110 says ETags are quoted
