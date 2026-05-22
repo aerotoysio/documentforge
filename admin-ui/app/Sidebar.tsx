@@ -98,6 +98,7 @@ export function Sidebar() {
         <Link href="/studio" className="nav-headline">✦ Studio</Link>
         <Link href="/topology">⌬ Topology</Link>
         <Link href="/admin">⚙ Admin</Link>
+        <Link href="/admin/keys">🔑 API Keys</Link>
         <Link href="/connections">⇋ Connections</Link>
       </nav>
 
