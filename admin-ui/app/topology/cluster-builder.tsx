@@ -43,10 +43,12 @@ import {
   spawnRouter,
   spawnService,
   createDatabase,
+  createAdminKey,
   startDbAsLeader,
   startDbAsFollower,
   type DatabaseEntry,
   type PerDbReplicationStatus,
+  type MintedKey,
 } from '@/lib/api';
 import { ClusterNode, ServiceFrameNode, BuilderDBNode, type ClusterNodeData, type ServiceFrameData, type BuilderDBNodeData } from './cluster-nodes';
 
@@ -296,6 +298,14 @@ function UnifiedCanvas({ connections }: { connections: Connection[] }) {
   } | null>(null);
   const [wiring, setWiring] = useState(false);
 
+  // Phase 7c — inline key-gen offer after a database is created on a service.
+  // keyOfferFor is set the moment the create succeeds; keyOfferMinted holds
+  // the secrets after the user clicks Generate so they're displayed exactly
+  // once (until Dismiss).
+  const [keyOfferFor, setKeyOfferFor] = useState<{ conn: Connection; dbName: string } | null>(null);
+  const [keyOfferMinted, setKeyOfferMinted] = useState<MintedKey[] | null>(null);
+  const [keyMinting, setKeyMinting] = useState(false);
+
   const [nodes, setNodes] = useNodesState<Node>([]);
   const [edges, setEdges] = useEdgesState<Edge>([]);
   const nodeTypes = useMemo(() => ({ cluster: ClusterNode, service: ServiceFrameNode, database: BuilderDBNode }), []);
@@ -513,7 +523,43 @@ function UnifiedCanvas({ connections }: { connections: Connection[] }) {
     window.setTimeout(() => fitView({ duration: 300 }), 80);
   }
 
-  async function confirmWire(port: number) {
+  // Phase 7c — mint the scoped keys the operator opted into. Failure is
+  // surfaced via the banner; the database itself is already created so
+  // the operator can always retry on the /admin/keys page.
+  async function confirmKeyOffer(picks: KeyOfferPicks) {
+    if (!keyOfferFor) return;
+    setKeyMinting(true);
+    const minted: MintedKey[] = [];
+    try {
+      if (picks.readWrite) {
+        const m = await createAdminKey(
+          [`db:${keyOfferFor.dbName}`],
+          picks.readWriteDescription || `${keyOfferFor.dbName} read+write`,
+          { connection: keyOfferFor.conn },
+        );
+        minted.push(m);
+      }
+      if (picks.readOnly) {
+        const m = await createAdminKey(
+          [`db:${keyOfferFor.dbName}:read`],
+          picks.readOnlyDescription || `${keyOfferFor.dbName} read-only`,
+          { connection: keyOfferFor.conn },
+        );
+        minted.push(m);
+      }
+      setKeyOfferMinted(minted);
+    } catch (e: unknown) {
+      setBanner({
+        kind: 'err',
+        text: `Key mint failed: ${e instanceof Error ? e.message : String(e)}. The DB was created — try /admin/keys to retry.`,
+      });
+      setKeyOfferFor(null);
+    } finally {
+      setKeyMinting(false);
+    }
+  }
+
+  async function confirmWire(port: number, alsoSystem: boolean = false) {
     if (!wireDraft) return;
     setWiring(true);
     try {
@@ -525,6 +571,27 @@ function UnifiedCanvas({ connections }: { connections: Connection[] }) {
       }
       const host = hostnameFromBaseUrl(wireDraft.sourceConn.baseUrl);
       await startDbAsFollower(wireDraft.targetName, host, port, { connection: wireDraft.targetConn });
+
+      // Phase 7d — co-replicate _system on a +1 port so managed keys stay
+      // in sync across the cluster. Best-effort: if the call fails (the
+      // backing service is pre-#73, _system isn't attached, port +1 is
+      // already taken, etc.) we surface a non-fatal banner — the user's
+      // chosen wire is already up.
+      if (alsoSystem) {
+        const sysPort = port + 1;
+        try {
+          // Use scoped /db/_system/replication/* — _system is hidden from
+          // /databases but the scoped routes still target it directly.
+          await startDbAsLeader('_system', sysPort, { connection: wireDraft.sourceConn });
+          await startDbAsFollower('_system', host, sysPort, { connection: wireDraft.targetConn });
+        } catch (e: unknown) {
+          setBanner({
+            kind: 'err',
+            text: `Primary wire OK, but _system co-replication on port ${sysPort} failed: ${e instanceof Error ? e.message : String(e)}. Keys may diverge across nodes — wire _system manually if needed.`,
+          });
+        }
+      }
+
       setWireDraft(null);
       await refresh();
     } catch (e: unknown) {
@@ -590,6 +657,9 @@ function UnifiedCanvas({ connections }: { connections: Connection[] }) {
           await createDatabase(name.trim(), { connection: conn });
           setBanner({ kind: 'ok', text: `Created “${name.trim()}” on ${conn.name}.` });
           await refresh();
+          // Phase 7c — offer matching scoped keys. Pure UX win;
+          // skippable. The modal closes itself on Skip.
+          setKeyOfferFor({ conn, dbName: name.trim() });
         } catch (err: unknown) {
           setBanner({ kind: 'err', text: `Create database failed: ${err instanceof Error ? err.message : String(err)}` });
         }
@@ -830,6 +900,18 @@ function UnifiedCanvas({ connections }: { connections: Connection[] }) {
           onConfirm={confirmWire}
         />
       )}
+
+      {keyOfferFor && (
+        <KeyOfferModal
+          dbName={keyOfferFor.dbName}
+          connName={keyOfferFor.conn.name}
+          minted={keyOfferMinted}
+          busy={keyMinting}
+          onSkip={() => { setKeyOfferFor(null); setKeyOfferMinted(null); }}
+          onConfirm={confirmKeyOffer}
+          onDismiss={() => { setKeyOfferFor(null); setKeyOfferMinted(null); }}
+        />
+      )}
     </>
   );
 }
@@ -865,9 +947,13 @@ function PaletteChip({ type, label }: { type: string; label: string }) {
 // ---------------------------------------------------------------- wire modal
 
 function WireModal({ busy, source, target, suggestedPort, onCancel, onConfirm }: {
-  busy: boolean; source: string; target: string; suggestedPort: number; onCancel: () => void; onConfirm: (port: number) => void;
+  busy: boolean; source: string; target: string; suggestedPort: number; onCancel: () => void;
+  onConfirm: (port: number, alsoSystem: boolean) => void;
 }) {
   const [port, setPort] = useState(suggestedPort);
+  // Phase 7d — co-replicate _system by default. Operators who explicitly
+  // don't want it (different ports across nodes, etc.) can untick.
+  const [alsoSystem, setAlsoSystem] = useState(true);
   return (
     <div className="topology-modal-backdrop" onClick={onCancel}>
       <div className="topology-modal" onClick={(e) => e.stopPropagation()}>
@@ -884,10 +970,152 @@ function WireModal({ busy, source, target, suggestedPort, onCancel, onConfirm }:
           <input type="number" value={port} onChange={(e) => setPort(parseInt(e.target.value) || 0)} style={{ width: 140, padding: '8px 10px', fontSize: 14, border: '1px solid var(--gray-200)', fontFamily: 'var(--mono)' }} />
           <div style={{ marginTop: 6, fontSize: 11, color: 'var(--gray-500)' }}>Leader listens here for the follower. Must be free + ≥ 1024.</div>
         </div>
+        <div style={{ marginBottom: 16, padding: '10px 12px', background: 'var(--gray-100)', borderLeft: '3px solid var(--red)' }}>
+          <label style={{ display: 'flex', alignItems: 'flex-start', gap: 8, cursor: 'pointer' }}>
+            <input
+              type="checkbox"
+              checked={alsoSystem}
+              onChange={(e) => setAlsoSystem(e.target.checked)}
+              style={{ marginTop: 2 }}
+            />
+            <span>
+              <span style={{ fontWeight: 600, fontSize: 13 }}>Also replicate <code style={{ fontFamily: 'var(--mono)' }}>_system</code></span>
+              <span style={{ display: 'block', fontSize: 11, color: 'var(--gray-500)', marginTop: 2 }}>
+                Co-wires the keys database on port <code style={{ fontFamily: 'var(--mono)' }}>{port + 1}</code> so managed API keys stay in sync. Recommended for any cluster that uses scoped keys (Issue #73).
+              </span>
+            </span>
+          </label>
+        </div>
         <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
           <button type="button" onClick={onCancel} style={ghostBtn()}>Cancel</button>
-          <button type="button" onClick={() => onConfirm(port)} disabled={busy || port < 1024} style={{ ...primaryBtn(), padding: '8px 18px' }}>{busy ? 'Wiring…' : 'Wire replication'}</button>
+          <button type="button" onClick={() => onConfirm(port, alsoSystem)} disabled={busy || port < 1024} style={{ ...primaryBtn(), padding: '8px 18px' }}>{busy ? 'Wiring…' : 'Wire replication'}</button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// Phase 7c — inline key-gen offer + reveal flow.
+interface KeyOfferPicks {
+  readWrite: boolean;
+  readOnly: boolean;
+  readWriteDescription: string;
+  readOnlyDescription: string;
+}
+
+function KeyOfferModal({ dbName, connName, minted, busy, onSkip, onConfirm, onDismiss }: {
+  dbName: string; connName: string;
+  minted: MintedKey[] | null;
+  busy: boolean;
+  onSkip: () => void;
+  onConfirm: (picks: KeyOfferPicks) => void;
+  onDismiss: () => void;
+}) {
+  const [readWrite, setReadWrite] = useState(true);
+  const [readOnly, setReadOnly] = useState(false);
+  const [rwDesc, setRwDesc] = useState(`${dbName} read+write`);
+  const [roDesc, setRoDesc] = useState(`${dbName} read-only`);
+  const [copied, setCopied] = useState<number | null>(null);
+
+  function copyOne(secret: string, i: number) {
+    navigator.clipboard.writeText(secret).then(
+      () => { setCopied(i); window.setTimeout(() => setCopied((c) => (c === i ? null : c)), 1800); },
+      () => alert('Copy failed — select + copy manually.'),
+    );
+  }
+
+  // Two-pane modal: question → mint → reveal.
+  return (
+    <div className="topology-modal-backdrop" onClick={minted ? onDismiss : onSkip}>
+      <div className="topology-modal" onClick={(e) => e.stopPropagation()} style={{ minWidth: 460 }}>
+        {!minted && (
+          <>
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--red)', fontWeight: 700, marginBottom: 8 }}>
+              Database created on {connName}
+            </div>
+            <h3 style={{ marginTop: 0, marginBottom: 4 }}>Generate scoped keys for <code style={{ fontFamily: 'var(--mono)' }}>{dbName}</code>?</h3>
+            <p style={{ fontSize: 13, color: 'var(--gray-500)', marginTop: 0 }}>
+              Optional — your tenant app needs a Bearer to talk to this DB. Skip and mint manually later from <code>/admin/keys</code> if you'd rather.
+            </p>
+
+            <label style={{ display: 'flex', gap: 8, padding: '10px 12px', border: `1px solid ${readWrite ? 'var(--red)' : 'var(--gray-200)'}`, background: readWrite ? 'rgba(217,4,41,0.04)' : 'white', cursor: 'pointer', marginBottom: 8 }}>
+              <input type="checkbox" checked={readWrite} onChange={(e) => setReadWrite(e.target.checked)} style={{ marginTop: 2 }} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 600, fontSize: 13 }}>
+                  Read + write key
+                  <code style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--gray-500)', fontWeight: 400, marginLeft: 6 }}>db:{dbName}</code>
+                </div>
+                {readWrite && (
+                  <input
+                    type="text"
+                    value={rwDesc}
+                    onChange={(e) => setRwDesc(e.target.value)}
+                    placeholder="description (optional)"
+                    style={{ marginTop: 4, width: '100%', padding: '4px 6px', fontSize: 12, border: '1px solid var(--gray-200)' }}
+                  />
+                )}
+              </div>
+            </label>
+
+            <label style={{ display: 'flex', gap: 8, padding: '10px 12px', border: `1px solid ${readOnly ? '#1d4ed8' : 'var(--gray-200)'}`, background: readOnly ? 'rgba(59,130,246,0.05)' : 'white', cursor: 'pointer', marginBottom: 12 }}>
+              <input type="checkbox" checked={readOnly} onChange={(e) => setReadOnly(e.target.checked)} style={{ marginTop: 2 }} />
+              <div style={{ flex: 1 }}>
+                <div style={{ fontWeight: 600, fontSize: 13 }}>
+                  Read-only key
+                  <code style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--gray-500)', fontWeight: 400, marginLeft: 6 }}>db:{dbName}:read</code>
+                </div>
+                {readOnly && (
+                  <input
+                    type="text"
+                    value={roDesc}
+                    onChange={(e) => setRoDesc(e.target.value)}
+                    placeholder="description (optional)"
+                    style={{ marginTop: 4, width: '100%', padding: '4px 6px', fontSize: 12, border: '1px solid var(--gray-200)' }}
+                  />
+                )}
+              </div>
+            </label>
+
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button type="button" onClick={onSkip} disabled={busy} style={ghostBtn()}>Skip</button>
+              <button
+                type="button"
+                onClick={() => onConfirm({ readWrite, readOnly, readWriteDescription: rwDesc, readOnlyDescription: roDesc })}
+                disabled={busy || (!readWrite && !readOnly)}
+                style={{ ...primaryBtn(), padding: '8px 18px' }}
+              >
+                {busy ? 'Minting…' : '⚡ Generate'}
+              </button>
+            </div>
+          </>
+        )}
+
+        {minted && (
+          <>
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--red)', fontWeight: 700, marginBottom: 12 }}>
+              ⚠ Copy these now — shown only once
+            </div>
+            <div style={{ display: 'grid', gap: 12 }}>
+              {minted.map((m, i) => (
+                <div key={m.id} style={{ border: '1px solid var(--gray-200)', padding: 12 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                    {m.scopes.map((s) => (
+                      <span key={s} style={{ fontFamily: 'var(--mono)', fontSize: 10, padding: '2px 6px', background: s.endsWith(':read') ? '#dbeafe' : 'var(--gray-100)', color: s.endsWith(':read') ? '#1d4ed8' : 'var(--ink)', fontWeight: 600 }}>{s}</span>
+                    ))}
+                    <span style={{ flex: 1, fontSize: 11, color: 'var(--gray-500)' }}>{m.description}</span>
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: 8 }}>
+                    <code style={{ fontFamily: 'var(--mono)', fontSize: 12, padding: '10px 12px', background: '#1a1a1a', color: '#fff', userSelect: 'all', wordBreak: 'break-all' }}>{m.secret}</code>
+                    <button onClick={() => copyOne(m.secret, i)} style={{ background: copied === i ? 'var(--green)' : 'var(--red)', color: 'white', border: 'none', padding: '8px 14px', fontSize: 12, fontWeight: 600, cursor: 'pointer' }}>{copied === i ? '✓' : '📋'}</button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={{ marginTop: 16, display: 'flex', justifyContent: 'flex-end' }}>
+              <button onClick={onDismiss} style={ghostBtn()}>I've copied them — dismiss</button>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );
