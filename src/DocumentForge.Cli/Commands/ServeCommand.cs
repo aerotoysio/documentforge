@@ -74,6 +74,20 @@ public static class ServeCommand
         var keyStore = new Auth.KeyStore(registry);
         keyStore.Reload();
 
+        // Issue #82 — persistent attach registry. Before this, any DB
+        // attached via POST /databases lived in process memory only;
+        // a restart dropped it. The catalog reads _system.databases at
+        // boot AND auto-discovers any *.dfdb files in the data-dir
+        // that aren't already attached, then keeps both in sync on
+        // every Attach/Detach/Drop call.
+        var dbCatalog = new DatabaseCatalog(registry);
+        var bootstrap = dbCatalog.Bootstrap(config.DataDir);
+        if (bootstrap.Errors.Count > 0)
+        {
+            foreach (var err in bootstrap.Errors)
+                Console.Error.WriteLine($"[DocumentForge] WARNING: bootstrap attach failed — {err}");
+        }
+
         // Optional replication wiring - leader / follower / none
         var replicationSummary = StartReplication(db, config);
 
@@ -241,8 +255,9 @@ public static class ServeCommand
         // Issue #66 Phase 2: multi-database admin verbs (list/attach/create/
         // detach/drop/set-default). The registry holds the engines; flat
         // data-plane routes still resolve to registry.GetDefault() so
-        // single-DB clients see no change.
-        DatabaseEndpoints.Map(app, registry, config.DataDir);
+        // single-DB clients see no change. The catalog argument (Issue
+        // #82) means attach/detach state survives restarts.
+        DatabaseEndpoints.Map(app, registry, config.DataDir, dbCatalog);
 
         // Issue #66 Phase 5: service orchestration. Lets Studio (or a CLI)
         // spawn sibling dfdb serve processes from one running service —
