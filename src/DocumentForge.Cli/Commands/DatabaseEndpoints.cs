@@ -31,7 +31,7 @@ public static class DatabaseEndpoints
     /// is where a path-less <c>POST /databases</c> drops the new <c>.dfdb</c>
     /// (defaults to <c>{dataDir}/{name}.dfdb</c>).
     /// </summary>
-    public static void Map(IEndpointRouteBuilder app, DatabaseRegistry registry, string defaultDataDir)
+    public static void Map(IEndpointRouteBuilder app, DatabaseRegistry registry, string defaultDataDir, DatabaseCatalog? catalog = null)
     {
         // List every attached database. Stable shape across phases.
         // Admin-scoped: enumerating tenants would leak names to a
@@ -79,6 +79,10 @@ public static class DatabaseEndpoints
                 else
                     registry.Attach(req.Name, path);
 
+                // Issue #82 — persist the attach so the next restart
+                // wires it back up automatically.
+                catalog?.RecordAttach(req.Name, path);
+
                 // Resolve the entry we just registered so we return the
                 // canonical casing + canonical path back to the caller.
                 var info = registry.List().First(e =>
@@ -108,6 +112,12 @@ public static class DatabaseEndpoints
                 var removed = drop ? registry.Drop(name) : registry.Detach(name);
                 if (!removed)
                     return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+                // Issue #82 — Detach is now PERSISTENT via a tombstone
+                // record (auto-discover honours it on next boot, even
+                // if the .dfdb file is still in data-dir). Drop wipes
+                // the record entirely because the file is gone too.
+                if (drop) catalog?.RecordDrop(name);
+                else      catalog?.RecordDetach(name);
                 return Results.Ok(new
                 {
                     name,
