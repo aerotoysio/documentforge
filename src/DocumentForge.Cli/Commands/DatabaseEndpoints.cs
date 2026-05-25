@@ -57,6 +57,63 @@ public static class DatabaseEndpoints
             });
         });
 
+        // Issue #83 — list .dfdb files in (or under) the data dir that
+        // AREN'T currently attached. Powers the Studio "Browse & attach"
+        // panel: the operator drops files into a mounted volume, the UI
+        // shows the leftovers, one click attaches them by path. Useful
+        // even with the #82 auto-discover because:
+        //   * recursive scan finds files in subfolders auto-discover skips
+        //   * surfaces tombstoned files (so the operator can intentionally
+        //     re-attach a previously-detached DB)
+        //   * fills the gap when the file lives OUTSIDE data-dir entirely
+        //     (handled via a follow-up "attach by absolute path" UX)
+        app.MapGet("/databases/unattached", (HttpContext ctx, bool? recursive) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (!Directory.Exists(defaultDataDir))
+                return Results.Ok(new { dataDir = defaultDataDir, count = 0, files = Array.Empty<object>() });
+
+            // Names already taken by attached engines — case-insensitive
+            // because that's how the registry stores them. Skip the
+            // implicit ones (data.dfdb, _system.dfdb) since they're
+            // never user-attached anyway.
+            var attachedNames = registry.List()
+                .Select(e => e.Name)
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var attachedPaths = registry.List()
+                .Select(e => Path.GetFullPath(e.FilePath))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
+            var searchOpt = recursive == true
+                ? SearchOption.AllDirectories
+                : SearchOption.TopDirectoryOnly;
+
+            var rows = new List<object>();
+            foreach (var path in Directory.EnumerateFiles(defaultDataDir, "*.dfdb", searchOpt))
+            {
+                var name = Path.GetFileNameWithoutExtension(path);
+                if (name == "data" || IsInternalDatabase(name)) continue;
+                if (attachedPaths.Contains(Path.GetFullPath(path))) continue;
+
+                var info = new FileInfo(path);
+                rows.Add(new
+                {
+                    suggestedName = name,
+                    nameConflict = attachedNames.Contains(name),
+                    path = Path.GetFullPath(path),
+                    sizeBytes = info.Length,
+                    modifiedUtc = info.LastWriteTimeUtc.ToString("O"),
+                });
+            }
+            return Results.Ok(new
+            {
+                dataDir = defaultDataDir,
+                recursive = recursive == true,
+                count = rows.Count,
+                files = rows,
+            });
+        });
+
         // Create-or-attach (Studio "+ Add Database").
         //   { "name": "acme" }                            -> {dataDir}/acme.dfdb, create-or-attach
         //   { "name": "acme", "path": "/abs/p.dfdb" }     -> use the supplied path, create-or-attach

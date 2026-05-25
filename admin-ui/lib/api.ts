@@ -322,6 +322,32 @@ export async function setDefaultDatabase(name: string, opts?: CallOptions) {
   return handle(r);
 }
 
+// Issue #83 — list .dfdb files in data-dir that aren't currently attached.
+// Powers Studio's "Browse & attach" panel: orphan files from a stale
+// service restart, files dropped into a mounted volume, etc.
+export interface UnattachedFile {
+  suggestedName: string;
+  nameConflict: boolean;     // basename collides with an already-attached DB
+  path: string;
+  sizeBytes: number;
+  modifiedUtc: string;
+}
+export interface UnattachedResponse {
+  dataDir: string;
+  recursive: boolean;
+  count: number;
+  files: UnattachedFile[];
+}
+export async function listUnattachedDatabases(
+  options?: { recursive?: boolean } & CallOptions,
+): Promise<UnattachedResponse> {
+  const qs = options?.recursive ? '?recursive=true' : '';
+  const r = await fetch(urlFor(`/databases/unattached${qs}`, options), {
+    headers: authHeaders(options),
+  });
+  return handle(r);
+}
+
 // ---------- Per-DB replication (Issue #66 Phase 2.5) ----------
 // Phase 2.5 scoped endpoints under /db/{name}/replication/*. Each attached
 // DB has its own role; Studio's topology page uses these to render and
