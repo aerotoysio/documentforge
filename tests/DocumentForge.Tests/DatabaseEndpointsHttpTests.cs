@@ -4,6 +4,7 @@ using System.Net.Sockets;
 using DocumentForge.Cli;
 using DocumentForge.Cli.Auth;
 using DocumentForge.Cli.Commands;
+using DocumentForge.Core;
 using DocumentForge.Engine;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -492,6 +493,166 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
         using var db = DocumentForgeDb.Create(path);
         // Sidecar files (.lock, .wal, .recovery) get dropped next to it
         // — that's fine, the endpoint only globs *.dfdb.
+    }
+
+    // Issue #86 — rebuild-catalog. Plan + execute against a real DB
+    // whose catalog page has been zeroed out (simulating the bbqdubai
+    // scenario). The rebuilder discovers the data chain and reconstructs
+    // a catalog entry pointing at it.
+    [Fact]
+    public async Task RebuildCatalogPreview_FileWithDataButZeroedCatalog_ReportsRecoverableChains()
+    {
+        var (_, baseUrl, dataDir) = BootServer();
+        var dbPath = Path.Combine(dataDir, "broken.dfdb");
+
+        // Build a real DB with data, then close it.
+        await _http.PostAsJsonAsync($"{baseUrl}/databases",
+            new { name = "broken", path = dbPath });
+        // Drop several docs to ensure data pages get linked into a chain.
+        for (int i = 0; i < 30; i++)
+        {
+            var body = new StringContent($$"""{"pnr":"P-{{i:D4}}"}""",
+                System.Text.Encoding.UTF8, "application/json");
+            await _http.PostAsync($"{baseUrl}/db/broken/collections/orders", body);
+        }
+        await _http.DeleteAsync($"{baseUrl}/databases/broken");
+
+        // Zero out page 1 to simulate catalog corruption. Page 0 (header)
+        // + data pages stay intact. After this, attaching reports "no
+        // collections" even though the documents are still on disk.
+        ZeroPage1(dbPath);
+
+        var preview = await _http.GetFromJsonAsync<RebuildPlanResponse>(
+            $"{baseUrl}/databases/rebuild-catalog/preview?path={Uri.EscapeDataString(dbPath)}");
+        Assert.NotNull(preview);
+        Assert.True(preview!.SafeToRebuild);
+        Assert.NotEmpty(preview.Chains);
+        // The orders collection's chain should be discovered. Document
+        // count is approximate (ItemCount includes deleted slots) but
+        // for a fresh insert run with no deletes it should equal 30.
+        Assert.Contains(preview.Chains, c => c.DocumentCount >= 30);
+    }
+
+    [Fact]
+    public async Task RebuildCatalog_Execute_WritesCatalogAndAllowsReattach()
+    {
+        var (_, baseUrl, dataDir) = BootServer();
+        var dbPath = Path.Combine(dataDir, "fix-me.dfdb");
+
+        await _http.PostAsJsonAsync($"{baseUrl}/databases",
+            new { name = "fix_me", path = dbPath });
+        for (int i = 0; i < 12; i++)
+        {
+            var body = new StringContent($$"""{"id":{{i}}}""",
+                System.Text.Encoding.UTF8, "application/json");
+            await _http.PostAsync($"{baseUrl}/db/fix_me/collections/widgets", body);
+        }
+        await _http.DeleteAsync($"{baseUrl}/databases/fix_me");
+
+        ZeroPage1(dbPath);
+
+        var resp = await _http.PostAsync(
+            $"{baseUrl}/databases/rebuild-catalog?path={Uri.EscapeDataString(dbPath)}",
+            content: null);
+        resp.EnsureSuccessStatusCode();
+        var result = await resp.Content.ReadFromJsonAsync<RebuildResultResponse>();
+        Assert.NotEmpty(result!.Recovered);
+        Assert.True(File.Exists(result.BackupPath));
+
+        // Re-attach with the rebuilt catalog and confirm the engine sees
+        // the synthesised collection name with the expected doc count.
+        var reattach = await _http.PostAsJsonAsync($"{baseUrl}/databases",
+            new { name = "fix_me_again", path = dbPath });
+        Assert.Equal(System.Net.HttpStatusCode.Created, reattach.StatusCode);
+        var recoveredName = result.Recovered[0].Name;
+        var q = await _http.PostAsJsonAsync($"{baseUrl}/db/fix_me_again/query",
+            new { sql = $"SELECT * FROM {recoveredName}" });
+        q.EnsureSuccessStatusCode();
+        var json = await q.Content.ReadAsStringAsync();
+        // Should contain at least one of our inserted docs.
+        Assert.Contains("\"id\"", json);
+    }
+
+    [Fact]
+    public async Task RebuildCatalogPreview_StillAttached_Returns409()
+    {
+        // The rebuilder needs exclusive access. If the operator hasn't
+        // Detached yet, the endpoint refuses with a clear message instead
+        // of "could not open file" — telling them what to do.
+        var (_, baseUrl, dataDir) = BootServer();
+        var dbPath = Path.Combine(dataDir, "still-live.dfdb");
+        await _http.PostAsJsonAsync($"{baseUrl}/databases",
+            new { name = "still_live", path = dbPath });
+
+        var resp = await _http.GetAsync(
+            $"{baseUrl}/databases/rebuild-catalog/preview?path={Uri.EscapeDataString(dbPath)}");
+        Assert.Equal(System.Net.HttpStatusCode.Conflict, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("still_live", body);  // mentions the name to detach
+    }
+
+    [Fact]
+    public async Task RebuildCatalog_HealthyCatalog_Refuses()
+    {
+        // A working catalog (with entries) must NOT be clobbered by an
+        // accidental rebuild request. The rebuilder's invariant catches
+        // this; the endpoint surfaces it as 409 with the refusal reason.
+        var (_, baseUrl, dataDir) = BootServer();
+        var dbPath = Path.Combine(dataDir, "healthy.dfdb");
+        await _http.PostAsJsonAsync($"{baseUrl}/databases",
+            new { name = "healthy", path = dbPath });
+        var body = new StringContent("""{"x":1}""", System.Text.Encoding.UTF8, "application/json");
+        await _http.PostAsync($"{baseUrl}/db/healthy/collections/things", body);
+        await _http.DeleteAsync($"{baseUrl}/databases/healthy");
+
+        // Note: catalog is INTACT here — we did not zero page 1.
+        var resp = await _http.PostAsync(
+            $"{baseUrl}/databases/rebuild-catalog?path={Uri.EscapeDataString(dbPath)}",
+            content: null);
+        Assert.Equal(System.Net.HttpStatusCode.Conflict, resp.StatusCode);
+        var json = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("not empty", json);
+    }
+
+    /// <summary>Overwrite page 1 (the collection catalog page) of a
+    /// .dfdb file with zeros to simulate the corruption seen in the
+    /// Issue #86 scenario. Header page 0 and data pages 2+ stay intact.</summary>
+    private static void ZeroPage1(string dbPath)
+    {
+        using var fs = new FileStream(dbPath, FileMode.Open, FileAccess.ReadWrite,
+            FileShare.None);
+        fs.Seek(Constants.PageSize, SeekOrigin.Begin);
+        var zeros = new byte[Constants.PageSize];
+        fs.Write(zeros, 0, zeros.Length);
+        fs.Flush(true);
+    }
+
+    private sealed class RebuildPlanResponse
+    {
+        public string Path { get; set; } = "";
+        public bool SafeToRebuild { get; set; }
+        public string? RefusalReason { get; set; }
+        public List<PlanChainRow> Chains { get; set; } = new();
+    }
+    private sealed class PlanChainRow
+    {
+        public string SuggestedName { get; set; } = "";
+        public uint FirstPageId { get; set; }
+        public long DocumentCount { get; set; }
+        public int PageCount { get; set; }
+    }
+    private sealed class RebuildResultResponse
+    {
+        public string Path { get; set; } = "";
+        public string BackupPath { get; set; } = "";
+        public int BackedUpPage1Bytes { get; set; }
+        public List<RecoveredRow> Recovered { get; set; } = new();
+    }
+    private sealed class RecoveredRow
+    {
+        public string Name { get; set; } = "";
+        public uint FirstPageId { get; set; }
+        public long DocumentCount { get; set; }
     }
 
     // Issue #85 — GET /databases/{name}/health. Diagnostic surface.

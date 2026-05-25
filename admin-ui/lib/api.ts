@@ -405,6 +405,42 @@ export async function getDatabaseHealth(
   return handle(r);
 }
 
+// Issue #86 — catalog rebuild. Operator workflow: Detach → preview →
+// confirm → execute → re-Attach. The rebuilder refuses to touch a
+// healthy catalog AND requires the file is not currently attached
+// (exclusive file access).
+export interface RebuildPlanChain {
+  suggestedName: string;
+  firstPageId: number;
+  documentCount: number;
+  pageCount: number;
+}
+export interface RebuildPlan {
+  path: string;
+  safeToRebuild: boolean;
+  refusalReason: string | null;
+  chains: RebuildPlanChain[];
+}
+export interface RebuildResult {
+  path: string;
+  backupPath: string;
+  backedUpPage1Bytes: number;
+  recovered: Array<{ name: string; firstPageId: number; documentCount: number }>;
+}
+export async function previewRebuildCatalog(path: string, opts?: CallOptions): Promise<RebuildPlan> {
+  const r = await fetch(urlFor(`/databases/rebuild-catalog/preview?path=${encodeURIComponent(path)}`, opts), {
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+export async function executeRebuildCatalog(path: string, opts?: CallOptions): Promise<RebuildResult> {
+  const r = await fetch(urlFor(`/databases/rebuild-catalog?path=${encodeURIComponent(path)}`, opts), {
+    method: 'POST',
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+
 // ---------- Per-DB replication (Issue #66 Phase 2.5) ----------
 // Phase 2.5 scoped endpoints under /db/{name}/replication/*. Each attached
 // DB has its own role; Studio's topology page uses these to render and

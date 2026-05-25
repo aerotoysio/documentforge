@@ -2,6 +2,7 @@ using System.Text.Json;
 using DocumentForge.Cli.Auth;
 using DocumentForge.Core;
 using DocumentForge.Engine;
+using DocumentForge.Storage;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -354,6 +355,122 @@ public static class DatabaseEndpoints
                 recommendation,
                 recommendationDetail,
             });
+        });
+
+        // Issue #86 — catalog rebuild. Two endpoints: GET preview (Studio
+        // confirmation dialog uses this to show what would be rebuilt
+        // BEFORE writing anything), POST commit (does the actual rebuild).
+        //
+        // Operator workflow:
+        //   1. Health endpoint flags recommendation = "rebuild-catalog"
+        //   2. Operator Detaches the DB (rebuilder needs exclusive file access)
+        //   3. POST /databases/discover-rebuild?path=... → preview
+        //   4. Confirm
+        //   5. POST /databases/discover-rebuild?path=...&execute=true → write
+        //   6. Re-attach the DB via existing POST /databases
+        //
+        // The endpoint operates on a FILE PATH rather than a registry name
+        // because the DB has to be detached first; there's nothing in the
+        // registry to address. Admin-scoped.
+        app.MapGet("/databases/rebuild-catalog/preview", (HttpContext ctx, string path) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (string.IsNullOrWhiteSpace(path))
+                return Results.BadRequest(new { error = "Missing 'path' query parameter." });
+            if (!File.Exists(path))
+                return Results.NotFound(new { error = $"No file at '{path}'." });
+            var canonical = Path.GetFullPath(path);
+
+            // Refuse if the file is still attached. Plan() opens read-only
+            // so it'd succeed, but offering a plan when the operator
+            // hasn't detached yet is misleading — Execute would fail.
+            var attached = registry.List().FirstOrDefault(e =>
+                string.Equals(Path.GetFullPath(e.FilePath), canonical,
+                    StringComparison.OrdinalIgnoreCase));
+            if (attached is not null)
+            {
+                return Results.Conflict(new
+                {
+                    error = $"Database is currently attached as '{attached.Name}'. " +
+                            "DELETE /databases/" + attached.Name + " first (detach without --drop), then preview.",
+                });
+            }
+
+            try
+            {
+                using var rb = CatalogRebuilder.Open(canonical);
+                var plan = rb.Plan();
+                return Results.Ok(new
+                {
+                    path = canonical,
+                    safeToRebuild = plan.SafeToRebuild,
+                    refusalReason = plan.RefusalReason,
+                    chains = plan.Chains.Select(c => new
+                    {
+                        suggestedName = c.SuggestedName,
+                        firstPageId = c.FirstPageId.Value,
+                        documentCount = c.DocumentCount,
+                        pageCount = c.PageCount,
+                    }),
+                });
+            }
+            catch (IOException ex)
+            {
+                return Results.Conflict(new { error = $"Could not open file for inspection: {ex.Message}" });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        app.MapPost("/databases/rebuild-catalog", (HttpContext ctx, string path) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (string.IsNullOrWhiteSpace(path))
+                return Results.BadRequest(new { error = "Missing 'path' query parameter." });
+            if (!File.Exists(path))
+                return Results.NotFound(new { error = $"No file at '{path}'." });
+            var canonical = Path.GetFullPath(path);
+
+            var attached = registry.List().FirstOrDefault(e =>
+                string.Equals(Path.GetFullPath(e.FilePath), canonical,
+                    StringComparison.OrdinalIgnoreCase));
+            if (attached is not null)
+            {
+                return Results.Conflict(new
+                {
+                    error = $"Database is currently attached as '{attached.Name}'. " +
+                            "DELETE /databases/" + attached.Name + " first (detach without --drop), then rebuild.",
+                });
+            }
+
+            try
+            {
+                using var rb = CatalogRebuilder.Open(canonical);
+                var result = rb.Execute();
+                return Results.Ok(new
+                {
+                    path = result.FilePath,
+                    backupPath = result.BackupPath,
+                    backedUpPage1Bytes = result.BackedUpPage1Bytes,
+                    recovered = result.Recovered.Select(r => new
+                    {
+                        name = r.Name,
+                        firstPageId = r.FirstPageId.Value,
+                        documentCount = r.DocumentCount,
+                    }),
+                });
+            }
+            catch (CatalogRebuildException ex)
+            {
+                // The rebuilder's safety invariants kicked in. 409 Conflict
+                // is the right shape — the operation is well-formed but
+                // refused given the current state.
+                return Results.Conflict(new { error = ex.Message });
+            }
+            catch (IOException ex)
+            {
+                return Results.Conflict(new { error = $"Could not open file for rebuild: {ex.Message}" });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
 
         // Phase 2 stopgap for "I'm working on DB X now" — Phase 4 will
