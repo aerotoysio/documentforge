@@ -11,9 +11,13 @@ import {
   listUnattachedDatabases,
   discoverDatabases,
   getDatabaseHealth,
+  previewRebuildCatalog,
+  executeRebuildCatalog,
   type DatabaseEntry,
   type UnattachedFile,
   type DatabaseHealth,
+  type RebuildPlan,
+  type RebuildResult,
 } from '@/lib/api';
 
 // Issue #66 Phase 2 — "create a swarm on one box" lives here. Drop a name
@@ -54,6 +58,16 @@ export default function DatabasesPage() {
   // main list comes back so the page paints fast and badges fill in.
   const [healthByName, setHealthByName] = useState<Record<string, DatabaseHealth>>({});
   const [healthInspect, setHealthInspect] = useState<DatabaseHealth | null>(null);
+
+  // Issue #86 — rebuild-catalog wizard state. Operator picks a file
+  // (typically from the health modal's "Rebuild catalog" CTA), we
+  // detach it if attached, fetch the plan, show the chain preview,
+  // and on confirm POST the execute.
+  const [rebuildPath, setRebuildPath] = useState<string | null>(null);
+  const [rebuildPlan, setRebuildPlan] = useState<RebuildPlan | null>(null);
+  const [rebuildResult, setRebuildResult] = useState<RebuildResult | null>(null);
+  const [rebuildError, setRebuildError] = useState<string | null>(null);
+  const [rebuildBusy, setRebuildBusy] = useState(false);
 
   async function refresh() {
     setLoading(true);
@@ -125,6 +139,52 @@ export default function DatabasesPage() {
     } finally {
       setDiscovering(false);
     }
+  }
+
+  async function openRebuildWizard(path: string, attachedAs: string | null) {
+    setRebuildBusy(true);
+    setRebuildError(null);
+    setRebuildPlan(null);
+    setRebuildResult(null);
+    setRebuildPath(path);
+    try {
+      // If the DB is currently attached, the rebuilder will refuse —
+      // detach first so the operator doesn't bounce off a 409.
+      if (attachedAs) {
+        await deleteDatabase(attachedAs);  // detach (not drop)
+      }
+      const plan = await previewRebuildCatalog(path);
+      setRebuildPlan(plan);
+      await refresh();
+    } catch (e: any) {
+      setRebuildError(e.message || String(e));
+    } finally {
+      setRebuildBusy(false);
+    }
+  }
+
+  async function confirmRebuild() {
+    if (!rebuildPath) return;
+    setRebuildBusy(true);
+    setRebuildError(null);
+    try {
+      const r = await executeRebuildCatalog(rebuildPath);
+      setRebuildResult(r);
+      // Health badges should refresh once the operator re-attaches —
+      // they can do that with the existing Browse & Attach panel.
+      await refresh();
+    } catch (e: any) {
+      setRebuildError(e.message || String(e));
+    } finally {
+      setRebuildBusy(false);
+    }
+  }
+
+  function closeRebuildWizard() {
+    setRebuildPath(null);
+    setRebuildPlan(null);
+    setRebuildResult(null);
+    setRebuildError(null);
   }
 
   async function attachUnattached(file: UnattachedFile) {
@@ -626,11 +686,162 @@ export default function DatabasesPage() {
             </table>
             {healthInspect.recommendation === 'rebuild-catalog' && (
               <div style={{ marginTop: 16, padding: 12, background: 'rgba(217,4,41,0.04)', border: '1px solid rgba(217,4,41,0.15)' }}>
-                <div style={{ fontWeight: 600, marginBottom: 6 }}>How to recover (manual, until #86 ships)</div>
-                <div style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--gray-700)' }}>
-                  Your data pages are likely intact but the catalog page (page 1 of the .dfdb file) that lists collection names + their first page IDs is empty. A reconstruct-from-data-pages CLI is coming in 1.2.1 (issue #86). Until then: keep this file <strong>read-only</strong>, copy it to a safe backup (<code style={{ fontFamily: 'var(--mono)' }}>cp {healthInspect.filePath} {healthInspect.filePath}.frozen</code>), and ping the team. Don't INSERT or run rebuild-index against it — that could overwrite still-recoverable pages.
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>Recover this database</div>
+                <div style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--gray-700)', marginBottom: 10 }}>
+                  Your data pages are likely intact but the catalog page (page 1 of the .dfdb file) that names collections is empty. The rebuilder scans the data pages, reconstructs the catalog, and writes a <code style={{ fontFamily: 'var(--mono)' }}>.page1.backup</code> sidecar first so the operation is reversible. The database will be detached briefly; you'll re-attach it once rebuild completes.
                 </div>
+                <button
+                  onClick={() => {
+                    const path = healthInspect.filePath;
+                    const name = healthInspect.database;
+                    setHealthInspect(null);
+                    openRebuildWizard(path, name);
+                  }}
+                  style={primaryBtn(false)}
+                >
+                  ⚙ Rebuild catalog
+                </button>
               </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Issue #86 — rebuild-catalog wizard. Multi-stage modal:
+            Loading → Plan preview → (optionally) Result
+          Backdrop click dismisses unless we're mid-execute. */}
+      {rebuildPath && (
+        <div
+          onClick={() => { if (!rebuildBusy) closeRebuildWizard(); }}
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            zIndex: 60,
+          }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{
+              background: 'white', padding: 24, maxWidth: 720, width: '92vw',
+              maxHeight: '85vh', overflow: 'auto',
+              border: '1px solid var(--gray-200)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+              <h2 style={{ margin: 0, fontSize: 20 }}>⚙ Rebuild catalog</h2>
+              <button
+                onClick={closeRebuildWizard}
+                disabled={rebuildBusy}
+                style={ghostBtn()}
+              >✕ Close</button>
+            </div>
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--gray-500)', marginBottom: 14, wordBreak: 'break-all' }}>
+              {rebuildPath}
+            </div>
+
+            {rebuildError && (
+              <div style={{ padding: 10, marginBottom: 14, background: 'rgba(217,4,41,0.08)', color: 'var(--red)', fontFamily: 'var(--mono)', fontSize: 12 }}>
+                ✗ {rebuildError}
+              </div>
+            )}
+
+            {!rebuildPlan && !rebuildResult && rebuildBusy && (
+              <div style={{ padding: 24, textAlign: 'center', color: 'var(--gray-500)' }}>
+                Detaching and scanning…
+              </div>
+            )}
+
+            {rebuildPlan && !rebuildResult && (
+              <>
+                <div style={{ marginBottom: 14 }}>
+                  {rebuildPlan.safeToRebuild ? (
+                    <>
+                      <div style={{ padding: 10, background: 'rgba(40,160,80,0.08)', color: 'rgb(20,120,60)', fontFamily: 'var(--mono)', fontSize: 12, marginBottom: 10 }}>
+                        ✓ Safe to rebuild · {rebuildPlan.chains.length} data chain{rebuildPlan.chains.length === 1 ? '' : 's'} discovered
+                      </div>
+                      <div style={{ fontSize: 13, color: 'var(--gray-700)', lineHeight: 1.5 }}>
+                        The current page-1 contents will be backed up to
+                        <code style={{ fontFamily: 'var(--mono)', fontSize: 12, margin: '0 4px' }}>.page1.backup</code>
+                        next to the data file. Recovered collections get auto-generated names — rename them with
+                        <code style={{ fontFamily: 'var(--mono)', fontSize: 12, margin: '0 4px' }}>RENAME COLLECTION recovered_pN TO real_name</code>
+                        once you identify each one.
+                      </div>
+                    </>
+                  ) : (
+                    <div style={{ padding: 10, background: 'rgba(217,4,41,0.08)', color: 'var(--red)', fontFamily: 'var(--mono)', fontSize: 12 }}>
+                      ⚠ Rebuilder refused: {rebuildPlan.refusalReason}
+                    </div>
+                  )}
+                </div>
+
+                {rebuildPlan.chains.length > 0 && (
+                  <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse', marginBottom: 14 }}>
+                    <thead>
+                      <tr style={{ borderBottom: '2px solid var(--gray-200)' }}>
+                        <th style={{ padding: '8px 0', textAlign: 'left', fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--gray-500)' }}>Suggested name</th>
+                        <th style={{ padding: '8px 0', textAlign: 'right', fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--gray-500)' }}>Pages</th>
+                        <th style={{ padding: '8px 0', textAlign: 'right', fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--gray-500)' }}>Docs</th>
+                        <th style={{ padding: '8px 0', textAlign: 'right', fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: '0.05em', textTransform: 'uppercase', color: 'var(--gray-500)' }}>First page</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {rebuildPlan.chains.map(c => (
+                        <tr key={c.firstPageId} style={{ borderBottom: '1px solid var(--gray-100)' }}>
+                          <td style={{ padding: '8px 0', fontFamily: 'var(--mono)', fontSize: 12 }}>{c.suggestedName}</td>
+                          <td style={{ padding: '8px 0', textAlign: 'right' }}>{c.pageCount}</td>
+                          <td style={{ padding: '8px 0', textAlign: 'right' }}>{c.documentCount.toLocaleString()}</td>
+                          <td style={{ padding: '8px 0', textAlign: 'right', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--gray-500)' }}>#{c.firstPageId}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+
+                {rebuildPlan.safeToRebuild && (
+                  <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                    <button onClick={closeRebuildWizard} disabled={rebuildBusy} style={ghostBtn()}>Cancel</button>
+                    <button onClick={confirmRebuild} disabled={rebuildBusy} style={primaryBtn(rebuildBusy)}>
+                      {rebuildBusy ? 'Rebuilding…' : '⚙ Commit rebuild'}
+                    </button>
+                  </div>
+                )}
+              </>
+            )}
+
+            {rebuildResult && (
+              <>
+                <div style={{ padding: 10, background: 'rgba(40,160,80,0.1)', color: 'rgb(20,120,60)', fontFamily: 'var(--mono)', fontSize: 12, marginBottom: 14 }}>
+                  ✓ Rebuilt · {rebuildResult.recovered.length} collection{rebuildResult.recovered.length === 1 ? '' : 's'} recovered
+                </div>
+                <div style={{ fontSize: 13, lineHeight: 1.6, color: 'var(--gray-700)' }}>
+                  <strong>Backup written:</strong>{' '}
+                  <code style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>{rebuildResult.backupPath}</code>{' '}
+                  ({rebuildResult.backedUpPage1Bytes.toLocaleString()} bytes). To revert: overwrite page 1 of the .dfdb with this file's contents.
+                </div>
+                <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse', margin: '14px 0' }}>
+                  <thead>
+                    <tr style={{ borderBottom: '2px solid var(--gray-200)' }}>
+                      <th style={{ padding: '8px 0', textAlign: 'left', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--gray-500)' }}>Recovered as</th>
+                      <th style={{ padding: '8px 0', textAlign: 'right', fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--gray-500)' }}>Docs</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rebuildResult.recovered.map(r => (
+                      <tr key={r.firstPageId} style={{ borderBottom: '1px solid var(--gray-100)' }}>
+                        <td style={{ padding: '8px 0', fontFamily: 'var(--mono)', fontSize: 12 }}>{r.name}</td>
+                        <td style={{ padding: '8px 0', textAlign: 'right' }}>{r.documentCount.toLocaleString()}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                <div style={{ fontSize: 12, color: 'var(--gray-500)', lineHeight: 1.5, marginBottom: 14 }}>
+                  <strong>Next step:</strong> Re-attach the database via the "+ Add Database" form above (it's currently detached), then inspect each recovered collection to identify it. Rename with{' '}
+                  <code style={{ fontFamily: 'var(--mono)', fontSize: 12 }}>RENAME COLLECTION recovered_pN TO real_name</code>.
+                </div>
+                <div style={{ display: 'flex', justifyContent: 'flex-end' }}>
+                  <button onClick={closeRebuildWizard} style={primaryBtn(false)}>Done</button>
+                </div>
+              </>
             )}
           </div>
         </div>

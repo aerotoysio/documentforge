@@ -107,7 +107,7 @@ export function Sidebar() {
         marginTop: 'auto', fontSize: 11, color: '#666',
         fontFamily: 'var(--mono)', letterSpacing: '0.05em', paddingTop: 40
       }}>
-        v1.2.0 · MIT
+        v1.2.1 · MIT
       </div>
     </aside>
   );
