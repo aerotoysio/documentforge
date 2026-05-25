@@ -8,7 +8,9 @@ import {
   createDatabase,
   deleteDatabase,
   setDefaultDatabase,
+  listUnattachedDatabases,
   type DatabaseEntry,
+  type UnattachedFile,
 } from '@/lib/api';
 
 // Issue #66 Phase 2 — "create a swarm on one box" lives here. Drop a name
@@ -30,6 +32,17 @@ export default function DatabasesPage() {
   const [createError, setCreateError] = useState<string | null>(null);
   const [pulse, setPulse] = useState<string | null>(null);
 
+  // Issue #83 — "Browse & attach" panel state. Surfaces .dfdb files on
+  // disk that aren't currently attached, so the operator doesn't have to
+  // type absolute paths or wait for the next service restart.
+  const [unattached, setUnattached] = useState<UnattachedFile[]>([]);
+  const [unattachedDataDir, setUnattachedDataDir] = useState<string | null>(null);
+  const [scanRecursive, setScanRecursive] = useState(false);
+  const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
+  const [attaching, setAttaching] = useState<string | null>(null);
+  const [renameDrafts, setRenameDrafts] = useState<Record<string, string>>({});
+
   async function refresh() {
     setLoading(true);
     setError(null);
@@ -45,6 +58,48 @@ export default function DatabasesPage() {
   }
 
   useEffect(() => { refresh(); /* eslint-disable-next-line */ }, [active?.id]);
+
+  async function scanUnattached(recursive: boolean) {
+    setScanning(true);
+    setScanError(null);
+    setScanRecursive(recursive);
+    try {
+      const resp = await listUnattachedDatabases({ recursive });
+      setUnattached(resp.files);
+      setUnattachedDataDir(resp.dataDir);
+      // Seed rename inputs to the suggested name so the operator
+      // can attach without typing in the no-conflict case.
+      const drafts: Record<string, string> = {};
+      for (const f of resp.files) drafts[f.path] = f.suggestedName;
+      setRenameDrafts(drafts);
+    } catch (e: any) {
+      setScanError(e.message || String(e));
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  async function attachUnattached(file: UnattachedFile) {
+    const name = (renameDrafts[file.path] || file.suggestedName).trim();
+    if (!name) {
+      setScanError('Pick a name first.');
+      return;
+    }
+    setAttaching(file.path);
+    setScanError(null);
+    try {
+      await createDatabase(name, { path: file.path, createIfMissing: false });
+      // Pulse the new row in the attached list, drop it from the scan results.
+      setPulse(name);
+      setTimeout(() => setPulse(p => (p === name ? null : p)), 900);
+      setUnattached(curr => curr.filter(f => f.path !== file.path));
+      await refresh();
+    } catch (e: any) {
+      setScanError(`Attach failed: ${e.message || String(e)}`);
+    } finally {
+      setAttaching(null);
+    }
+  }
 
   async function onCreate(e?: React.FormEvent) {
     e?.preventDefault();
@@ -160,6 +215,112 @@ export default function DatabasesPage() {
         {createError && (
           <div style={{ marginTop: 12, padding: 8, background: 'rgba(217,4,41,0.06)', color: 'var(--red)', fontFamily: 'var(--mono)', fontSize: 12 }}>
             ✗ {createError}
+          </div>
+        )}
+      </div>
+
+      {/* Issue #83 — Browse & attach panel. Sits between the Add form
+          (operator-driven) and the attached-DBs list (state). Scans the
+          service's data-dir for *.dfdb files not currently attached and
+          lets the operator one-click attach them — useful for:
+          * 1.0.x → 1.1.x upgrades where attach state was lost
+          * dropping a backup .dfdb into a mounted volume
+          * recovering after an accidental Detach */}
+      <div className="card" style={{ marginBottom: 24 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <div style={{ flex: 1 }}>
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--red)', fontWeight: 700, marginBottom: 4 }}>
+              ⌕ Browse & attach
+            </div>
+            <div style={{ fontSize: 12, color: 'var(--gray-500)' }}>
+              Scan the service's data dir for <code style={{ fontFamily: 'var(--mono)' }}>.dfdb</code> files that aren't attached yet. Pick a name + click Attach — no path typing needed.
+            </div>
+          </div>
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--gray-500)', cursor: 'pointer' }} title="Search subfolders too (useful for backup folders, container volumes with nested layouts).">
+            <input
+              type="checkbox"
+              checked={scanRecursive}
+              onChange={e => setScanRecursive(e.target.checked)}
+              disabled={scanning}
+            />
+            Recurse subfolders
+          </label>
+          <button
+            onClick={() => scanUnattached(scanRecursive)}
+            disabled={scanning}
+            style={ghostBtn()}
+          >
+            {scanning ? 'Scanning…' : '⌕ Scan'}
+          </button>
+        </div>
+
+        {unattachedDataDir && (
+          <div style={{ marginTop: 10, fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--gray-500)' }}>
+            data dir: {unattachedDataDir}{scanRecursive ? ' (recursive)' : ''}
+          </div>
+        )}
+
+        {scanError && (
+          <div style={{ marginTop: 12, padding: 8, background: 'rgba(217,4,41,0.06)', color: 'var(--red)', fontFamily: 'var(--mono)', fontSize: 12 }}>
+            ✗ {scanError}
+          </div>
+        )}
+
+        {unattachedDataDir !== null && !scanning && unattached.length === 0 && !scanError && (
+          <div style={{ marginTop: 12, fontSize: 13, color: 'var(--gray-500)' }}>
+            No unattached <code style={{ fontFamily: 'var(--mono)' }}>.dfdb</code> files found{scanRecursive ? ' (recursive scan)' : ''}. Everything on disk is already attached.
+          </div>
+        )}
+
+        {unattached.length > 0 && (
+          <div style={{ marginTop: 14, display: 'grid', gap: 8 }}>
+            {unattached.map(f => {
+              const isAttaching = attaching === f.path;
+              const draft = renameDrafts[f.path] ?? f.suggestedName;
+              return (
+                <div
+                  key={f.path}
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: '1fr 200px auto',
+                    gap: 10,
+                    alignItems: 'center',
+                    padding: 10,
+                    border: '1px solid var(--gray-200)',
+                    background: f.nameConflict ? 'rgba(217,4,41,0.03)' : 'white',
+                    opacity: isAttaching ? 0.5 : 1,
+                  }}
+                >
+                  <div>
+                    <div style={{ fontFamily: 'var(--mono)', fontSize: 12, wordBreak: 'break-all' }}>
+                      {f.path}
+                    </div>
+                    <div style={{ fontSize: 11, color: 'var(--gray-500)', marginTop: 2 }}>
+                      {(f.sizeBytes / 1024).toFixed(1)} KB · modified {new Date(f.modifiedUtc).toLocaleString()}
+                      {f.nameConflict && (
+                        <span style={{ color: 'var(--red)', marginLeft: 8 }}>
+                          ⚠ name <code style={{ fontFamily: 'var(--mono)' }}>{f.suggestedName}</code> already attached — pick another
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <input
+                    type="text"
+                    value={draft}
+                    onChange={e => setRenameDrafts(d => ({ ...d, [f.path]: e.target.value }))}
+                    placeholder="name"
+                    style={inputStyle()}
+                  />
+                  <button
+                    onClick={() => attachUnattached(f)}
+                    disabled={isAttaching || !draft.trim()}
+                    style={primaryBtn(isAttaching || !draft.trim())}
+                  >
+                    {isAttaching ? 'Attaching…' : '+ Attach'}
+                  </button>
+                </div>
+              );
+            })}
           </div>
         )}
       </div>

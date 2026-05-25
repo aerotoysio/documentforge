@@ -370,7 +370,117 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
         Assert.DoesNotContain(final.Databases, d => d.Name == "tenant_a");
     }
 
+    // Issue #83 — /databases/unattached. The endpoint that powers the
+    // Studio "Browse & attach" panel.
+    [Fact]
+    public async Task GetUnattached_DropOrphanFiles_ListsThem()
+    {
+        var (_, baseUrl, dataDir) = BootServer();
+
+        // Drop a .dfdb file directly in data-dir, untouched by the registry.
+        var orphan = Path.Combine(dataDir, "orphan_tenant.dfdb");
+        File.WriteAllBytes(orphan, new byte[] { 0, 0, 0, 0 });
+
+        var list = await _http.GetFromJsonAsync<UnattachedResponse>(
+            $"{baseUrl}/databases/unattached");
+        Assert.NotNull(list);
+        Assert.Equal(1, list!.Count);
+        Assert.False(list.Recursive);
+        Assert.Equal(Path.GetFullPath(orphan), list.Files[0].Path);
+        Assert.Equal("orphan_tenant", list.Files[0].SuggestedName);
+        Assert.False(list.Files[0].NameConflict);
+    }
+
+    [Fact]
+    public async Task GetUnattached_AttachedFile_Excluded()
+    {
+        var (_, baseUrl, dataDir) = BootServer();
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "live" });
+        // Drop a separate orphan so the response isn't empty.
+        File.WriteAllBytes(Path.Combine(dataDir, "ghost.dfdb"), new byte[] { 0 });
+
+        var list = await _http.GetFromJsonAsync<UnattachedResponse>(
+            $"{baseUrl}/databases/unattached");
+        Assert.Equal(1, list!.Count);
+        Assert.Equal("ghost", list.Files[0].SuggestedName);
+        Assert.DoesNotContain(list.Files, f => f.SuggestedName == "live");
+    }
+
+    [Fact]
+    public async Task GetUnattached_SkipsImplicitFiles()
+    {
+        // data.dfdb and _system.dfdb (had they been present) would be
+        // service implementation details — they must never appear as
+        // "unattached" candidates the operator could click.
+        var (_, baseUrl, dataDir) = BootServer();
+        File.WriteAllBytes(Path.Combine(dataDir, "data.dfdb"), new byte[] { 0 });
+        File.WriteAllBytes(Path.Combine(dataDir, "_system.dfdb"), new byte[] { 0 });
+        File.WriteAllBytes(Path.Combine(dataDir, "tenant_real.dfdb"), new byte[] { 0 });
+
+        var list = await _http.GetFromJsonAsync<UnattachedResponse>(
+            $"{baseUrl}/databases/unattached");
+        Assert.Equal(1, list!.Count);
+        Assert.Equal("tenant_real", list.Files[0].SuggestedName);
+    }
+
+    [Fact]
+    public async Task GetUnattached_RecursiveFlag_FindsSubfolderFiles()
+    {
+        // Container deployments often mount a volume containing nested
+        // folders; the recursive flag lets the operator surface those
+        // without manually typing paths.
+        var (_, baseUrl, dataDir) = BootServer();
+        var subdir = Path.Combine(dataDir, "_backup");
+        Directory.CreateDirectory(subdir);
+        File.WriteAllBytes(Path.Combine(subdir, "archived.dfdb"), new byte[] { 0 });
+
+        var nonRecursive = await _http.GetFromJsonAsync<UnattachedResponse>(
+            $"{baseUrl}/databases/unattached");
+        Assert.Equal(0, nonRecursive!.Count);
+
+        var recursive = await _http.GetFromJsonAsync<UnattachedResponse>(
+            $"{baseUrl}/databases/unattached?recursive=true");
+        Assert.Equal(1, recursive!.Count);
+        Assert.True(recursive.Recursive);
+        Assert.Equal("archived", recursive.Files[0].SuggestedName);
+    }
+
+    [Fact]
+    public async Task GetUnattached_NameConflictFlag_SurfacedOnDuplicate()
+    {
+        // If an orphan file's basename matches a name already in the
+        // registry, the UI needs to know — otherwise one-click attach
+        // would 409. Flag it so the panel can prompt for a rename.
+        var (_, baseUrl, dataDir) = BootServer();
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "shared" });
+        // Drop a file at a different path with the SAME basename.
+        var other = Path.Combine(dataDir, "_archive", "shared.dfdb");
+        Directory.CreateDirectory(Path.GetDirectoryName(other)!);
+        File.WriteAllBytes(other, new byte[] { 0 });
+
+        var list = await _http.GetFromJsonAsync<UnattachedResponse>(
+            $"{baseUrl}/databases/unattached?recursive=true");
+        var conflictRow = list!.Files.Single(f => f.Path == Path.GetFullPath(other));
+        Assert.True(conflictRow.NameConflict);
+    }
+
     // Response DTOs — narrow shapes for deserialization in tests.
+    private sealed class UnattachedResponse
+    {
+        public string DataDir { get; set; } = "";
+        public bool Recursive { get; set; }
+        public int Count { get; set; }
+        public List<UnattachedRow> Files { get; set; } = new();
+    }
+    private sealed class UnattachedRow
+    {
+        public string SuggestedName { get; set; } = "";
+        public bool NameConflict { get; set; }
+        public string Path { get; set; } = "";
+        public long SizeBytes { get; set; }
+        public string ModifiedUtc { get; set; } = "";
+    }
+
     private sealed class DatabasesListResponse
     {
         public string? Default { get; set; }
