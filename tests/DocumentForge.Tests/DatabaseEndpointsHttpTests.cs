@@ -494,6 +494,80 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
         // — that's fine, the endpoint only globs *.dfdb.
     }
 
+    // Issue #85 — GET /databases/{name}/health. Diagnostic surface.
+    [Fact]
+    public async Task GetHealth_FreshDatabase_ReturnsHealthy()
+    {
+        var (_, baseUrl, _) = BootServer();
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "alpha" });
+
+        var h = await _http.GetFromJsonAsync<HealthResponse>(
+            $"{baseUrl}/databases/alpha/health");
+        Assert.NotNull(h);
+        Assert.Equal("alpha", h!.Database);
+        Assert.True(h.Attached);
+        Assert.Equal("Healthy", h.HealthStatus);
+        Assert.Equal(0, h.Collections.Count);
+        Assert.Equal(0, h.Collections.TotalDocuments);
+        Assert.True(h.Files.DataSizeBytes > 0);
+        Assert.Equal(0, h.Files.RecoveryLogBytes);
+        Assert.Equal("healthy", h.Recommendation);
+    }
+
+    [Fact]
+    public async Task GetHealth_WithDocuments_ReportsCountAndCollections()
+    {
+        var (_, baseUrl, _) = BootServer();
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "beta" });
+        // Drop a couple of docs into a collection via the scoped /db/{name} insert.
+        var body = new StringContent("""{"pnr":"AAA"}""", System.Text.Encoding.UTF8, "application/json");
+        await _http.PostAsync($"{baseUrl}/db/beta/collections/orders", body);
+        var body2 = new StringContent("""{"pnr":"BBB"}""", System.Text.Encoding.UTF8, "application/json");
+        await _http.PostAsync($"{baseUrl}/db/beta/collections/orders", body2);
+
+        var h = await _http.GetFromJsonAsync<HealthResponse>(
+            $"{baseUrl}/databases/beta/health");
+        Assert.NotNull(h);
+        Assert.Equal(1, h!.Collections.Count);
+        Assert.Contains("orders", h.Collections.Names);
+        Assert.Equal(2, h.Collections.TotalDocuments);
+        Assert.Equal("healthy", h.Recommendation);
+    }
+
+    [Fact]
+    public async Task GetHealth_Unknown_Returns404()
+    {
+        var (_, baseUrl, _) = BootServer();
+        var resp = await _http.GetAsync($"{baseUrl}/databases/ghost/health");
+        Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
+    }
+
+    private sealed class HealthResponse
+    {
+        public string Database { get; set; } = "";
+        public string FilePath { get; set; } = "";
+        public bool Attached { get; set; }
+        public string HealthStatus { get; set; } = "";
+        public bool ReadOnly { get; set; }
+        public HealthCollections Collections { get; set; } = new();
+        public HealthFiles Files { get; set; } = new();
+        public string Recommendation { get; set; } = "";
+        public string? RecommendationDetail { get; set; }
+    }
+    private sealed class HealthCollections
+    {
+        public int Count { get; set; }
+        public List<string> Names { get; set; } = new();
+        public long TotalDocuments { get; set; }
+    }
+    private sealed class HealthFiles
+    {
+        public long DataSizeBytes { get; set; }
+        public long RecoveryLogBytes { get; set; }
+        public long WalBytes { get; set; }
+        public bool SnapshotMarkerPresent { get; set; }
+    }
+
     // Issue #84 — POST /databases/discover. Runtime rescan + auto-attach.
     [Fact]
     public async Task PostDiscover_DropOrphanFiles_AttachesAndReportsThem()

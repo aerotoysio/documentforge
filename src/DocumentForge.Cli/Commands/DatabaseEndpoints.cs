@@ -260,6 +260,102 @@ public static class DatabaseEndpoints
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
 
+        // Issue #85 — per-DB health & diagnostics. Surfaces enough state
+        // for Studio to render an "is this DB OK?" panel without the
+        // operator having to ssh in and `ls -la /data/*.dfdb*`.
+        //
+        // Returns sidecar-file sizes, lock holder metadata, collection
+        // count, total document count, and a coarse recommendation
+        // ("healthy" / "rebuild-catalog" / "recovery-pending" / etc).
+        // Cheap — reads file sizes and one collection enumeration; no
+        // page walks.
+        app.MapGet("/databases/{name}/health", (HttpContext ctx, string name) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null)
+                return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+
+            var filePath = db.FilePath;
+            var dataInfo = new FileInfo(filePath);
+            var recoveryInfo = new FileInfo(filePath + ".recovery");
+            var walInfo = new FileInfo(filePath + ".wal");
+            var lockInfo = new FileInfo(filePath + ".lock");
+            var snapshotMarker = new FileInfo(filePath + ".snapshot.incoming.seq");
+
+            // Engine-side state via GetStatistics — gives us doc counts
+            // per collection from the catalog page metadata (no page
+            // scans). Cheap; safe to call on every health request.
+            var collectionNames = db.GetCollectionNames();
+            long totalDocs = 0;
+            try
+            {
+                var stats = db.GetStatistics();
+                foreach (var c in stats.Collections) totalDocs += c.DocumentCount;
+            }
+            catch { /* engine in a bad state — fall back to 0 */ }
+
+            // Heuristic recommendation. The bad-state we most want to
+            // surface to the operator is "catalog empty but file has
+            // way more bytes than an empty DB ever would" — that's the
+            // classic Issue #85 scenario (catalog page corrupted, data
+            // pages intact, rebuild can recover it).
+            const long EmptyDbApproxBytes = 32 * 1024; // 2 pages of overhead
+            string recommendation;
+            string? recommendationDetail;
+            if (collectionNames.Count == 0 && dataInfo.Length > EmptyDbApproxBytes)
+            {
+                recommendation = "rebuild-catalog";
+                recommendationDetail =
+                    $"Catalog reports 0 collections but the data file is {dataInfo.Length:N0} bytes " +
+                    "(an empty database is ~32 KB). Document pages are probably intact but the " +
+                    "catalog page that names them is empty or zeroed. POST /databases/" + name +
+                    "/rebuild-catalog scans the data pages and reconstructs the catalog.";
+            }
+            else if (recoveryInfo.Exists && recoveryInfo.Length > 0)
+            {
+                recommendation = "recovery-pending";
+                recommendationDetail =
+                    $"Recovery log has {recoveryInfo.Length:N0} bytes of un-replayed page writes. " +
+                    "These get applied automatically on the next service restart.";
+            }
+            else if (db.HealthStatus != Core.DatabaseHealthStatus.Healthy)
+            {
+                recommendation = "engine-degraded";
+                recommendationDetail = $"Engine health status is {db.HealthStatus}.";
+            }
+            else
+            {
+                recommendation = "healthy";
+                recommendationDetail = null;
+            }
+
+            return Results.Ok(new
+            {
+                database = name,
+                filePath,
+                attached = true,
+                healthStatus = db.HealthStatus.ToString(),
+                readOnly = db.IsReadOnly,
+                collections = new
+                {
+                    count = collectionNames.Count,
+                    names = collectionNames,
+                    totalDocuments = totalDocs,
+                },
+                files = new
+                {
+                    dataSizeBytes = dataInfo.Length,
+                    recoveryLogBytes = recoveryInfo.Exists ? recoveryInfo.Length : 0L,
+                    walBytes = walInfo.Exists ? walInfo.Length : 0L,
+                    snapshotMarkerPresent = snapshotMarker.Exists,
+                },
+                lockHolder = lockInfo.Exists ? TryReadLockHolder(lockInfo.FullName) : null,
+                recommendation,
+                recommendationDetail,
+            });
+        });
+
         // Phase 2 stopgap for "I'm working on DB X now" — Phase 4 will
         // replace this with auth-scoped Bearer tokens.
         app.MapPost("/databases/{name}/set-default", (HttpContext ctx, string name) =>
@@ -473,6 +569,33 @@ public static class DatabaseEndpoints
     // so adding "_audit" / "_metrics" / etc. later only touches here.
     private static bool IsInternalDatabase(string name) =>
         !string.IsNullOrEmpty(name) && name.StartsWith("_", StringComparison.Ordinal);
+
+    /// <summary>Issue #85 — read the diagnostic JSON inside a .lock file
+    /// so the health endpoint can show who last held the lock. Defensive
+    /// — the file may be missing, empty, or corrupted (older versions of
+    /// the engine, partial writes, etc).</summary>
+    private static object? TryReadLockHolder(string lockPath)
+    {
+        try
+        {
+            using var fs = new FileStream(lockPath, FileMode.Open,
+                FileAccess.Read, FileShare.ReadWrite);
+            using var reader = new StreamReader(fs);
+            var json = reader.ReadToEnd();
+            if (string.IsNullOrWhiteSpace(json)) return null;
+            using var doc = JsonDocument.Parse(json);
+            return new
+            {
+                pid = doc.RootElement.TryGetProperty("Pid", out var p) ? (object)p.GetInt32() : null!,
+                host = doc.RootElement.TryGetProperty("Host", out var h) ? h.GetString() : null,
+                openedAtUtc = doc.RootElement.TryGetProperty("OpenedAtUtc", out var o) ? o.GetString() : null,
+            };
+        }
+        catch
+        {
+            return null;
+        }
+    }
 }
 
 // Phase 3a — scoped query body. Same field as the flat QueryRequest in

@@ -370,6 +370,41 @@ export async function discoverDatabases(
   return handle(r);
 }
 
+// Issue #85 — per-DB health diagnostic. Surfaces lock state, sidecar
+// file sizes, catalog state, and a coarse recommendation
+// ("healthy" / "rebuild-catalog" / "recovery-pending" / "engine-degraded")
+// the UI can use to badge each row + show a fix-it banner.
+export interface DatabaseHealth {
+  database: string;
+  filePath: string;
+  attached: boolean;
+  healthStatus: string;
+  readOnly: boolean;
+  collections: {
+    count: number;
+    names: string[];
+    totalDocuments: number;
+  };
+  files: {
+    dataSizeBytes: number;
+    recoveryLogBytes: number;
+    walBytes: number;
+    snapshotMarkerPresent: boolean;
+  };
+  lockHolder: { pid: number; host: string; openedAtUtc: string } | null;
+  recommendation: 'healthy' | 'rebuild-catalog' | 'recovery-pending' | 'engine-degraded' | string;
+  recommendationDetail: string | null;
+}
+export async function getDatabaseHealth(
+  name: string,
+  opts?: CallOptions,
+): Promise<DatabaseHealth> {
+  const r = await fetch(urlFor(`/databases/${encodeURIComponent(name)}/health`, opts), {
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+
 // ---------- Per-DB replication (Issue #66 Phase 2.5) ----------
 // Phase 2.5 scoped endpoints under /db/{name}/replication/*. Each attached
 // DB has its own role; Studio's topology page uses these to render and

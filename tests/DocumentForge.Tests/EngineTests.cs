@@ -3910,25 +3910,46 @@ public class EngineTests : IDisposable
     }
 
     [Fact]
-    public void Open_StaleLockFromDifferentHost_RefusesWithoutForce()
+    public void Open_StaleLockFromDifferentHost_AutoReclaims_85()
     {
+        // Issue #85 — pre-1.2.0 a lock file whose Host field didn't match
+        // the current machine name was treated as a poisoned cross-host
+        // lock and rejected. That was a false positive every time a Docker
+        // container redeployed (each container gets a fresh random hostname
+        // even on the same physical host), so an OOM-killed container left
+        // its database permanently un-openable.
+        //
+        // Now: the FileShare.None OS-level lock IS the truth. If the prior
+        // holder process is gone (which it is — the file is just text on
+        // disk with no live handle), the OS released the lock and the new
+        // Open succeeds. The hostname field becomes purely diagnostic.
         _db.Dispose();
         var lockPath = _dbPath + ".lock";
 
-        // Holder claims to be on a different host. We can't probe whether
-        // it's alive remotely, so the safe default is to refuse and surface
-        // the error. The user has to either delete the lock file or pass
-        // ForceUnlock = true.
-        var foreign = """{"Pid":1234,"Host":"some-other-machine","OpenedAtUtc":"2020-01-01T00:00:00Z"}""";
+        var foreign = """{"Pid":1234,"Host":"4ca385e4a08a","OpenedAtUtc":"2020-01-01T00:00:00Z"}""";
         File.WriteAllText(lockPath, foreign);
 
-        var ex = Assert.Throws<DatabaseLockedException>(() => DocumentForgeDb.Open(_dbPath));
-        Assert.Equal("some-other-machine", ex.HolderHost);
-        Assert.Equal(1234, ex.HolderPid);
+        // No ForceUnlock needed — should just work.
+        using var reopened = DocumentForgeDb.Open(_dbPath);
+        reopened.Insert("orders", """{"pnr":"AFTER-CRASH"}""");
+        Assert.Single(reopened.Execute("SELECT * FROM orders").Documents);
+    }
 
-        // ForceUnlock = true bypasses the cross-host check.
-        using var forced = DocumentForgeDb.Open(_dbPath, new DatabaseOptions { ForceUnlock = true });
-        Assert.Equal(0, forced.Execute("SELECT * FROM orders").Documents.Count);
+    [Fact]
+    public void Open_LiveSecondOpener_StillRejected_RegardlessOfHostname()
+    {
+        // The change from #85 mustn't open the door to genuine concurrent
+        // openers. _db is held by the test fixture (a real, live handle).
+        // Even if the lock file's hostname field were forged to match
+        // ours, the OS-level FileShare.None lock still rejects the
+        // second open.
+        var lockPath = _dbPath + ".lock";
+        // Forge a "looks legit" lock file pointing at this host — but
+        // the OS lock from _db is what blocks us.
+        var fake = $$"""{"Pid":1,"Host":{{System.Text.Json.JsonSerializer.Serialize(Environment.MachineName)}},"OpenedAtUtc":"2020-01-01T00:00:00Z"}""";
+        try { File.WriteAllText(lockPath, fake); } catch { /* held by _db, fine */ }
+
+        Assert.Throws<DatabaseLockedException>(() => DocumentForgeDb.Open(_dbPath));
     }
 
     // --- Scalar SQL functions (issue #16) ---
