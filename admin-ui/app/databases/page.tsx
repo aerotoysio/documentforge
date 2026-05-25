@@ -9,6 +9,7 @@ import {
   deleteDatabase,
   setDefaultDatabase,
   listUnattachedDatabases,
+  discoverDatabases,
   type DatabaseEntry,
   type UnattachedFile,
 } from '@/lib/api';
@@ -43,6 +44,10 @@ export default function DatabasesPage() {
   const [attaching, setAttaching] = useState<string | null>(null);
   const [renameDrafts, setRenameDrafts] = useState<Record<string, string>>({});
 
+  // Issue #84 — runtime rescan + auto-attach (one-click bulk).
+  const [discovering, setDiscovering] = useState(false);
+  const [discoverBanner, setDiscoverBanner] = useState<string | null>(null);
+
   async function refresh() {
     setLoading(true);
     setError(null);
@@ -76,6 +81,34 @@ export default function DatabasesPage() {
       setScanError(e.message || String(e));
     } finally {
       setScanning(false);
+    }
+  }
+
+  async function discoverAndAttachAll(recursive: boolean) {
+    setDiscovering(true);
+    setDiscoverBanner(null);
+    setScanError(null);
+    try {
+      const resp = await discoverDatabases({ recursive });
+      // Refresh both the attached list AND the unattached panel so the
+      // user sees the new state immediately. If there's any unattached
+      // list visible, re-run that scan too to keep it consistent.
+      await refresh();
+      if (unattachedDataDir !== null) await scanUnattached(scanRecursive);
+      const errPart = resp.errors.length > 0 ? ` · ${resp.errors.length} error${resp.errors.length === 1 ? '' : 's'}` : '';
+      const tombPart = resp.skippedTombstoned > 0
+        ? ` · ${resp.skippedTombstoned} tombstoned skipped (use Scan + Attach to override)`
+        : '';
+      setDiscoverBanner(
+        resp.discovered > 0
+          ? `✓ Attached ${resp.discovered} database${resp.discovered === 1 ? '' : 's'}${tombPart}${errPart}`
+          : `No new databases found${tombPart}${errPart}`,
+      );
+      setTimeout(() => setDiscoverBanner(null), 5000);
+    } catch (e: any) {
+      setScanError(`Discover failed: ${e.message || String(e)}`);
+    } finally {
+      setDiscovering(false);
     }
   }
 
@@ -246,13 +279,28 @@ export default function DatabasesPage() {
             Recurse subfolders
           </label>
           <button
-            onClick={() => scanUnattached(scanRecursive)}
-            disabled={scanning}
-            style={ghostBtn()}
+            onClick={() => discoverAndAttachAll(scanRecursive)}
+            disabled={discovering || scanning}
+            style={primaryBtn(discovering || scanning)}
+            title="Scan the data dir AND auto-attach every .dfdb file found. Honours Detach tombstones — those need manual Attach via Scan."
           >
-            {scanning ? 'Scanning…' : '⌕ Scan'}
+            {discovering ? 'Discovering…' : '↻ Scan & attach all'}
+          </button>
+          <button
+            onClick={() => scanUnattached(scanRecursive)}
+            disabled={scanning || discovering}
+            style={ghostBtn()}
+            title="Just list unattached files — useful when you want to rename before attaching, or skip particular files."
+          >
+            {scanning ? 'Scanning…' : '⌕ Scan (preview)'}
           </button>
         </div>
+
+        {discoverBanner && (
+          <div style={{ marginTop: 10, padding: 8, background: discoverBanner.startsWith('✓') ? 'rgba(40,160,80,0.08)' : 'rgba(0,0,0,0.04)', color: 'var(--ink)', fontFamily: 'var(--mono)', fontSize: 12 }}>
+            {discoverBanner}
+          </div>
+        )}
 
         {unattachedDataDir && (
           <div style={{ marginTop: 10, fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--gray-500)' }}>

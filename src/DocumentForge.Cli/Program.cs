@@ -53,7 +53,7 @@ public class Program
 
     private static int PrintVersion()
     {
-        Console.WriteLine("dfdb 1.1.1");
+        Console.WriteLine("dfdb 1.1.2");
         Console.WriteLine("DocumentForge - embedded JSON document database with replication and sharding");
         return 0;
     }

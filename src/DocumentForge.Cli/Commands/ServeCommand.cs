@@ -943,7 +943,7 @@ public static class ServeCommand
             {
                 status = healthy ? "ok" : "degraded",
                 node = config.NodeName,
-                version = "1.1.1",
+                version = "1.1.2",
                 readOnly = db.IsReadOnly,
                 uptimeSeconds = Math.Round((DateTime.UtcNow - _startedAt).TotalSeconds, 1),
                 health = healthy ? null : new

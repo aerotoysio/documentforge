@@ -114,6 +114,81 @@ public static class DatabaseEndpoints
             });
         });
 
+        // Issue #84 — runtime rescan + auto-attach. The boot-time
+        // auto-discover in DatabaseCatalog.Bootstrap only fires once at
+        // startup. After that, files dropped into data-dir are invisible
+        // until the next restart. This endpoint is the "I dropped 10
+        // tenant.dfdb files into the volume, attach them all now"
+        // workflow — same logic as the bootstrap, just at runtime.
+        //
+        // Respects:
+        //   * already-attached files (skipped, no double-attach error)
+        //   * implicit names (data.dfdb / _system.dfdb)
+        //   * Detach tombstones (catalog?.TombstonedNames())
+        //
+        // For one-off manual attach with a custom name, use the existing
+        // /databases/unattached + per-row POST /databases flow.
+        app.MapPost("/databases/discover", (HttpContext ctx, bool? recursive) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (!Directory.Exists(defaultDataDir))
+                return Results.Ok(new
+                {
+                    dataDir = defaultDataDir,
+                    discovered = 0,
+                    skippedTombstoned = 0,
+                    errors = Array.Empty<string>(),
+                    attached = Array.Empty<object>(),
+                });
+
+            var attachedPaths = registry.List()
+                .Select(e => Path.GetFullPath(e.FilePath))
+                .ToHashSet(StringComparer.OrdinalIgnoreCase);
+            var tombstoned = catalog?.TombstonedNames()
+                ?? new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+            var searchOpt = recursive == true
+                ? SearchOption.AllDirectories
+                : SearchOption.TopDirectoryOnly;
+
+            var attached = new List<object>();
+            var errors = new List<string>();
+            var skippedTombstoned = 0;
+
+            foreach (var path in Directory.EnumerateFiles(defaultDataDir, "*.dfdb", searchOpt))
+            {
+                var name = Path.GetFileNameWithoutExtension(path);
+                if (name == "data" || IsInternalDatabase(name)) continue;
+                var fullPath = Path.GetFullPath(path);
+                if (attachedPaths.Contains(fullPath)) continue;
+                if (tombstoned.Contains(name))
+                {
+                    skippedTombstoned++;
+                    continue;
+                }
+                try
+                {
+                    registry.AttachOrCreate(name, fullPath);
+                    catalog?.RecordAttach(name, fullPath);
+                    attached.Add(new { name, path = fullPath });
+                }
+                catch (Exception ex)
+                {
+                    errors.Add($"'{name}' @ {path}: {ex.Message}");
+                }
+            }
+
+            return Results.Ok(new
+            {
+                dataDir = defaultDataDir,
+                recursive = recursive == true,
+                discovered = attached.Count,
+                skippedTombstoned,
+                errors,
+                attached,
+            });
+        });
+
         // Create-or-attach (Studio "+ Add Database").
         //   { "name": "acme" }                            -> {dataDir}/acme.dfdb, create-or-attach
         //   { "name": "acme", "path": "/abs/p.dfdb" }     -> use the supplied path, create-or-attach

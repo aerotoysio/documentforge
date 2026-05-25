@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Net.Sockets;
+using DocumentForge.Cli;
 using DocumentForge.Cli.Auth;
 using DocumentForge.Cli.Commands;
 using DocumentForge.Engine;
@@ -25,6 +26,12 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
 
     private (DatabaseRegistry registry, string baseUrl, string dataDir) BootServer()
     {
+        var (r, url, d, _) = BootServerWithCatalog(includeCatalog: false);
+        return (r, url, d);
+    }
+
+    private (DatabaseRegistry registry, string baseUrl, string dataDir, DatabaseCatalog? catalog) BootServerWithCatalog(bool includeCatalog)
+    {
         var port = FindFreePort();
         var dataDir = Path.Combine(Path.GetTempPath(), $"dbep_{Guid.NewGuid():N}");
         Directory.CreateDirectory(dataDir);
@@ -32,6 +39,18 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
 
         var registry = new DatabaseRegistry();
         _disposables.Add(registry);
+
+        // Catalog requires the _system DB to be attached on the registry
+        // before any RecordAttach / TombstonedNames call. ServeCommand
+        // does this before constructing the catalog; mirror that here
+        // for the subset of tests that exercise the runtime discover
+        // endpoint with tombstone semantics.
+        DatabaseCatalog? catalog = null;
+        if (includeCatalog)
+        {
+            registry.AttachOrCreate("_system", Path.Combine(dataDir, "_system.dfdb"));
+            catalog = new DatabaseCatalog(registry);
+        }
 
         var builder = WebApplication.CreateBuilder();
         builder.Logging.ClearProviders();
@@ -47,12 +66,12 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
             ctx.Items[AuthContext.ContextKey] = AuthContext.DevMode();
             await next();
         });
-        DatabaseEndpoints.Map(app, registry, dataDir);
+        DatabaseEndpoints.Map(app, registry, dataDir, catalog);
 
         app.StartAsync().GetAwaiter().GetResult();
         _disposables.Add(new HostStopper(app));
 
-        return (registry, $"http://127.0.0.1:{port}", dataDir);
+        return (registry, $"http://127.0.0.1:{port}", dataDir, catalog);
     }
 
     private static int FindFreePort()
@@ -462,6 +481,140 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
             $"{baseUrl}/databases/unattached?recursive=true");
         var conflictRow = list!.Files.Single(f => f.Path == Path.GetFullPath(other));
         Assert.True(conflictRow.NameConflict);
+    }
+
+    /// <summary>Stamp a real .dfdb file on disk and immediately close it,
+    /// so an Attach against the same path succeeds (vs. a 1-byte stub
+    /// which would throw on header validation and silently land in the
+    /// endpoint's errors list).</summary>
+    private static void MakeRealDfdbFile(string path)
+    {
+        using var db = DocumentForgeDb.Create(path);
+        // Sidecar files (.lock, .wal, .recovery) get dropped next to it
+        // — that's fine, the endpoint only globs *.dfdb.
+    }
+
+    // Issue #84 — POST /databases/discover. Runtime rescan + auto-attach.
+    [Fact]
+    public async Task PostDiscover_DropOrphanFiles_AttachesAndReportsThem()
+    {
+        // The "I dropped a file into the volume, no restart needed"
+        // workflow. Same shape as boot-time auto-discover.
+        var (registry, baseUrl, dataDir) = BootServer();
+
+        MakeRealDfdbFile(Path.Combine(dataDir, "orphan_a.dfdb"));
+        MakeRealDfdbFile(Path.Combine(dataDir, "orphan_b.dfdb"));
+
+        var resp = await _http.PostAsync($"{baseUrl}/databases/discover", content: null);
+        resp.EnsureSuccessStatusCode();
+        var body = await resp.Content.ReadFromJsonAsync<DiscoverResponse>();
+
+        Assert.Equal(2, body!.Discovered);
+        Assert.Equal(0, body.SkippedTombstoned);
+        Assert.NotNull(registry.TryGet("orphan_a"));
+        Assert.NotNull(registry.TryGet("orphan_b"));
+    }
+
+    [Fact]
+    public async Task PostDiscover_AlreadyAttached_Skipped()
+    {
+        // A second call shouldn't re-attach anything (idempotent) and
+        // shouldn't 409 on the in-registry entries.
+        var (_, baseUrl, dataDir) = BootServer();
+        MakeRealDfdbFile(Path.Combine(dataDir, "tenant_x.dfdb"));
+
+        var first = await _http.PostAsync($"{baseUrl}/databases/discover", content: null);
+        var firstBody = await first.Content.ReadFromJsonAsync<DiscoverResponse>();
+        Assert.Equal(1, firstBody!.Discovered);
+
+        var second = await _http.PostAsync($"{baseUrl}/databases/discover", content: null);
+        second.EnsureSuccessStatusCode();
+        var secondBody = await second.Content.ReadFromJsonAsync<DiscoverResponse>();
+        Assert.Equal(0, secondBody!.Discovered);
+        Assert.Empty(secondBody.Errors);
+    }
+
+    [Fact]
+    public async Task PostDiscover_RecursiveFlag_AttachesSubfolderFiles()
+    {
+        var (registry, baseUrl, dataDir) = BootServer();
+        var subdir = Path.Combine(dataDir, "_volume_b");
+        Directory.CreateDirectory(subdir);
+        MakeRealDfdbFile(Path.Combine(subdir, "tenant_nested.dfdb"));
+
+        var nonRecursive = await _http.PostAsync($"{baseUrl}/databases/discover", content: null);
+        var nrBody = await nonRecursive.Content.ReadFromJsonAsync<DiscoverResponse>();
+        Assert.Equal(0, nrBody!.Discovered);
+        Assert.Null(registry.TryGet("tenant_nested"));
+
+        var recursive = await _http.PostAsync($"{baseUrl}/databases/discover?recursive=true", content: null);
+        var rBody = await recursive.Content.ReadFromJsonAsync<DiscoverResponse>();
+        Assert.Equal(1, rBody!.Discovered);
+        Assert.NotNull(registry.TryGet("tenant_nested"));
+    }
+
+    [Fact]
+    public async Task PostDiscover_HonoursTombstones()
+    {
+        // Detach intent must survive a runtime rescan. Otherwise pressing
+        // "Refresh & attach all" would silently undo a deliberate detach
+        // — surprising and risky. Manual one-click Attach via the
+        // /databases/unattached + per-row attach flow still works because
+        // that's an explicit operator decision per file.
+        var (registry, baseUrl, dataDir, catalog) = BootServerWithCatalog(includeCatalog: true);
+        Assert.NotNull(catalog);
+
+        // Attach + Detach to produce a tombstone for "drained".
+        await _http.PostAsJsonAsync($"{baseUrl}/databases",
+            new { name = "drained", path = Path.Combine(dataDir, "drained.dfdb") });
+        await _http.DeleteAsync($"{baseUrl}/databases/drained");
+        // File still on disk (Detach != Drop).
+        Assert.True(File.Exists(Path.Combine(dataDir, "drained.dfdb")));
+        // And there's a fresh tenant to discover.
+        MakeRealDfdbFile(Path.Combine(dataDir, "fresh.dfdb"));
+
+        var resp = await _http.PostAsync($"{baseUrl}/databases/discover", content: null);
+        resp.EnsureSuccessStatusCode();
+        var body = await resp.Content.ReadFromJsonAsync<DiscoverResponse>();
+
+        Assert.Equal(1, body!.Discovered);            // fresh attached
+        Assert.Equal(1, body.SkippedTombstoned);      // drained skipped
+        Assert.NotNull(registry.TryGet("fresh"));
+        Assert.Null(registry.TryGet("drained"));
+    }
+
+    [Fact]
+    public async Task PostDiscover_SkipsImplicitFiles()
+    {
+        var (registry, baseUrl, dataDir) = BootServer();
+        // Stubs are fine here — we never try to Attach data.dfdb or
+        // _system.dfdb via this endpoint (they're explicitly skipped).
+        File.WriteAllBytes(Path.Combine(dataDir, "data.dfdb"), new byte[] { 0 });
+        File.WriteAllBytes(Path.Combine(dataDir, "_system.dfdb"), new byte[] { 0 });
+        MakeRealDfdbFile(Path.Combine(dataDir, "tenant_real.dfdb"));
+
+        var resp = await _http.PostAsync($"{baseUrl}/databases/discover", content: null);
+        var body = await resp.Content.ReadFromJsonAsync<DiscoverResponse>();
+        Assert.Equal(1, body!.Discovered);
+        // data + _system should remain untouched (not auto-attached as tenants).
+        Assert.Null(registry.TryGet("data"));
+        Assert.Null(registry.TryGet("_system"));
+        Assert.NotNull(registry.TryGet("tenant_real"));
+    }
+
+    private sealed class DiscoverResponse
+    {
+        public string DataDir { get; set; } = "";
+        public bool Recursive { get; set; }
+        public int Discovered { get; set; }
+        public int SkippedTombstoned { get; set; }
+        public List<string> Errors { get; set; } = new();
+        public List<DiscoveredEntry> Attached { get; set; } = new();
+    }
+    private sealed class DiscoveredEntry
+    {
+        public string Name { get; set; } = "";
+        public string Path { get; set; } = "";
     }
 
     // Response DTOs — narrow shapes for deserialization in tests.

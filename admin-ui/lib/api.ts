@@ -348,6 +348,28 @@ export async function listUnattachedDatabases(
   return handle(r);
 }
 
+// Issue #84 — runtime rescan + auto-attach. One-click "I dropped N
+// files into the volume, attach them all now." Honours Detach
+// tombstones (those need explicit re-attach via the Browse panel).
+export interface DiscoverResponse {
+  dataDir: string;
+  recursive: boolean;
+  discovered: number;
+  skippedTombstoned: number;
+  errors: string[];
+  attached: Array<{ name: string; path: string }>;
+}
+export async function discoverDatabases(
+  options?: { recursive?: boolean } & CallOptions,
+): Promise<DiscoverResponse> {
+  const qs = options?.recursive ? '?recursive=true' : '';
+  const r = await fetch(urlFor(`/databases/discover${qs}`, options), {
+    method: 'POST',
+    headers: authHeaders(options),
+  });
+  return handle(r);
+}
+
 // ---------- Per-DB replication (Issue #66 Phase 2.5) ----------
 // Phase 2.5 scoped endpoints under /db/{name}/replication/*. Each attached
 // DB has its own role; Studio's topology page uses these to render and
