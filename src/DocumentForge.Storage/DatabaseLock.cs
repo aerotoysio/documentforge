@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using DocumentForge.Core;
@@ -43,81 +42,68 @@ public sealed class DatabaseLock : IDisposable
 
     /// <summary>
     /// Acquire the lock for <paramref name="dataFilePath"/>. Throws
-    /// <see cref="DatabaseLockedException"/> if another live process holds it
-    /// or the prior holder was on a different machine (which we can't probe).
+    /// <see cref="DatabaseLockedException"/> if another live process is
+    /// currently holding the file open with <c>FileShare.None</c>.
+    ///
+    /// <para>
+    /// As of #85 (1.2.0) the OS-level file handle IS the source of truth.
+    /// The on-disk <c>.lock</c> file's JSON metadata is kept for diagnostic
+    /// purposes — it tells you who LAST held the lock — but the hostname
+    /// in it is no longer used to gate Acquire. That earlier behaviour
+    /// fired false positives on every Docker container redeploy (each
+    /// container gets a fresh random hostname even on the same physical
+    /// host), leaving OOM-killed databases permanently un-openable until
+    /// the operator manually <c>rm</c>'d the lock file. The OS releases
+    /// the FileShare.None handle automatically when the holder process
+    /// exits (even on SIGKILL), so reclaiming a stale lock is just a
+    /// matter of opening it again.
+    /// </para>
+    ///
+    /// <para>
+    /// Networked filesystems caveat: NFS and SMB don't propagate
+    /// FileShare.None semantics reliably across hosts. If you mount the
+    /// same data dir from two machines simultaneously, both can pass
+    /// this check and you'll get dual-writer corruption. Use a clustered
+    /// filesystem (e.g. CephFS with proper locking) or only mount the
+    /// data dir on one host at a time.
+    /// </para>
     /// </summary>
-    /// <param name="force">Reclaim the lock regardless of whether the prior
-    /// holder still appears alive. Use only when you're certain no other
-    /// writer is active (e.g. a containerised redeploy where the previous
-    /// container has been terminated but its pid isn't visible from the new
-    /// one, or a different-host stale lock you've manually verified).</param>
+    /// <param name="force">Legacy flag — pre-1.2.0 it bypassed the
+    /// hostname check. Since that check is gone, <c>force</c> now only
+    /// affects what happens if FileShare.None still fails: it triggers
+    /// a brief retry to handle a previous container that's still in its
+    /// Dispose phase. Setting it cannot override a genuinely-live holder
+    /// — that would risk dual writers and the OS won't let us anyway.</param>
     public static DatabaseLock Acquire(string dataFilePath, bool force = false)
     {
         var lockPath = dataFilePath + ".lock";
 
-        // Two distinct checks. Both have to pass.
-        //
-        // (1) Stale-file metadata check. If a lock file already exists on disk,
-        // its content tells us who PREVIOUSLY held it. FileShare.None will not
-        // raise on a stale lock file (the holder is dead, no handle is open),
-        // so without this peek a different-host crashed holder would silently
-        // get its lock taken — exactly the cross-host accident we're trying
-        // to prevent.
-        //
-        // (2) FileShare.None acquire. Catches the case where the prior holder
-        // is still alive on this machine (or, on POSIX, where another process
-        // happened to hit the file between (1) and (2)).
-        if (!force && File.Exists(lockPath))
+        // First attempt — the common path. FileShare.None is the truth.
+        // If the previous holder died (OOM, SIGKILL, host crash), the OS
+        // released its handle and this just works, regardless of what
+        // stale text content sits in the file.
+        try { return Open(lockPath); }
+        catch (IOException firstEx)
         {
-            var holder = TryReadHolder(lockPath);
-            if (holder is not null)
+            // Someone has the file genuinely open right now. Retry briefly
+            // if the caller asked us to (handles "previous container is
+            // still in Dispose" — a real edge case during fast restarts).
+            if (force)
             {
-                bool sameHost = string.Equals(holder.Value.Host, Environment.MachineName,
-                    StringComparison.OrdinalIgnoreCase);
-
-                if (!sameHost)
+                for (int i = 0; i < 5; i++)
                 {
-                    // Cross-host stale lock — we can't tell whether the foreign
-                    // process is still alive. Refuse rather than risk dual writers.
-                    throw new DatabaseLockedException(dataFilePath,
-                        holder.Value.Pid, holder.Value.Host,
-                        $"Database '{dataFilePath}' has a lock file from pid {holder.Value.Pid} on host '{holder.Value.Host}' " +
-                        $"(opened {holder.Value.OpenedAtUtc:o}). Cross-host liveness can't be probed; if that process is " +
-                        $"no longer running, delete '{lockPath}' or pass DatabaseOptions.ForceUnlock = true.");
+                    System.Threading.Thread.Sleep(200);
+                    try { return Open(lockPath); }
+                    catch (IOException) { /* still held — retry */ }
                 }
-
-                if (sameHost && IsProcessAlive(holder.Value.Pid))
-                {
-                    throw new DatabaseLockedException(dataFilePath,
-                        holder.Value.Pid, holder.Value.Host,
-                        $"Database '{dataFilePath}' is locked by pid {holder.Value.Pid} on this host " +
-                        $"(opened {holder.Value.OpenedAtUtc:o}). Either stop that process or pass " +
-                        $"DatabaseOptions.ForceUnlock = true if you're sure it's gone.");
-                }
-
-                // Same host, dead pid → stale local lock from a crashed run.
-                // Delete the file so Open below starts clean. If a race leaves
-                // the file held by a third party, the Open will throw and we
-                // surface the error fresh.
-                try { File.Delete(lockPath); } catch { }
             }
-            // If TryReadHolder returned null (corrupt/empty/unparseable), we
-            // fall through to the Open attempt — FileShare.None will catch a
-            // genuine concurrent holder.
-        }
 
-        try
-        {
-            return Open(lockPath);
-        }
-        catch (IOException ex)
-        {
-            // The peek above said nothing was holding it, but Open still failed.
-            // That means a concurrent Acquire raced past us and took it. Surface
-            // the holder info we have at THIS instant — it'll be the new holder.
+            // Read the diagnostic metadata so the error tells the operator
+            // WHO is holding it. The hostname in here may or may not match
+            // ours — that's fine, we're no longer using it for gating.
             var holder = TryReadHolder(lockPath);
             var msg = holder is null
-                ? $"Database '{dataFilePath}' is locked by another process (and the lock file is unreadable: {ex.Message})."
+                ? $"Database '{dataFilePath}' is locked by another live process (and the lock file's metadata is unreadable: {firstEx.Message})."
                 : $"Database '{dataFilePath}' is locked by pid {holder.Value.Pid} on host '{holder.Value.Host}', opened {holder.Value.OpenedAtUtc:o}.";
             throw new DatabaseLockedException(dataFilePath,
                 holder?.Pid ?? 0, holder?.Host ?? "unknown", msg);
@@ -174,27 +160,6 @@ public sealed class DatabaseLock : IDisposable
         catch
         {
             return null;
-        }
-    }
-
-    private static bool IsProcessAlive(int pid)
-    {
-        if (pid <= 0) return false;
-        try
-        {
-            using var p = Process.GetProcessById(pid);
-            return !p.HasExited;
-        }
-        catch (ArgumentException)
-        {
-            // GetProcessById throws ArgumentException if no such process.
-            return false;
-        }
-        catch
-        {
-            // Permission error or similar — be conservative and say "alive"
-            // so we don't reclaim a lock we can't actually verify is dead.
-            return true;
         }
     }
 

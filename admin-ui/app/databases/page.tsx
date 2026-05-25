@@ -10,8 +10,10 @@ import {
   setDefaultDatabase,
   listUnattachedDatabases,
   discoverDatabases,
+  getDatabaseHealth,
   type DatabaseEntry,
   type UnattachedFile,
+  type DatabaseHealth,
 } from '@/lib/api';
 
 // Issue #66 Phase 2 — "create a swarm on one box" lives here. Drop a name
@@ -48,6 +50,11 @@ export default function DatabasesPage() {
   const [discovering, setDiscovering] = useState(false);
   const [discoverBanner, setDiscoverBanner] = useState<string | null>(null);
 
+  // Issue #85 — per-DB health map. Loaded in the background after the
+  // main list comes back so the page paints fast and badges fill in.
+  const [healthByName, setHealthByName] = useState<Record<string, DatabaseHealth>>({});
+  const [healthInspect, setHealthInspect] = useState<DatabaseHealth | null>(null);
+
   async function refresh() {
     setLoading(true);
     setError(null);
@@ -55,6 +62,14 @@ export default function DatabasesPage() {
       const list = await listDatabases();
       setDatabases(list.databases);
       setDefaultName(list.default);
+      // Issue #85 — kick off background health fetches per DB. Each is
+      // independent so a slow / failing one doesn't block the others.
+      // No await on the loop — we paint immediately and badges fill in.
+      list.databases.forEach(d => {
+        getDatabaseHealth(d.name)
+          .then(h => setHealthByName(curr => ({ ...curr, [d.name]: h })))
+          .catch(() => { /* leave the row badge-less on health-fetch failure */ });
+      });
     } catch (e: any) {
       setError(e.message || String(e));
     } finally {
@@ -402,6 +417,48 @@ export default function DatabasesPage() {
         </div>
       )}
 
+      {/* Issue #85 — top-level attention banner. If any DB needs operator
+          action (rebuild-catalog, recovery-pending, engine-degraded),
+          surface it here so the operator doesn't have to scan every row. */}
+      {(() => {
+        const attn = databases
+          .map(d => healthByName[d.name])
+          .filter((h): h is DatabaseHealth => h !== undefined && h.recommendation !== 'healthy');
+        if (attn.length === 0) return null;
+        return (
+          <div className="card" style={{
+            marginBottom: 16,
+            borderLeft: '4px solid var(--red)',
+            background: 'rgba(217,4,41,0.04)',
+          }}>
+            <div style={{ fontFamily: 'var(--mono)', fontSize: 11, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--red)', fontWeight: 700, marginBottom: 6 }}>
+              ⚠ {attn.length} database{attn.length === 1 ? '' : 's'} need{attn.length === 1 ? 's' : ''} attention
+            </div>
+            <div style={{ display: 'grid', gap: 6 }}>
+              {attn.map(h => (
+                <div key={h.database} style={{ fontSize: 13 }}>
+                  <strong>{h.database}</strong>
+                  <span style={{ marginLeft: 6, fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--red)' }}>
+                    [{h.recommendation}]
+                  </span>
+                  <button
+                    onClick={() => setHealthInspect(h)}
+                    style={{ ...ghostBtn(), marginLeft: 8, fontSize: 11, padding: '2px 8px' }}
+                  >
+                    Details
+                  </button>
+                  {h.recommendationDetail && (
+                    <div style={{ fontSize: 12, color: 'var(--gray-500)', marginTop: 2 }}>
+                      {h.recommendationDetail}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        );
+      })()}
+
       {!error && databases.length > 0 && (
         <div style={{ display: 'grid', gap: 10 }}>
           {databases.map(db => {
@@ -409,6 +466,7 @@ export default function DatabasesPage() {
             const isDropping = dropping === db.name;
             const isSwitching = switching === db.name;
             const isPulsing = pulse === db.name;
+            const health = healthByName[db.name];
             return (
               <div
                 key={db.name}
@@ -428,9 +486,39 @@ export default function DatabasesPage() {
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                     <span style={{ fontSize: 16, fontWeight: 600 }}>{db.name}</span>
                     {isDefault && <span className="pill red" style={{ fontSize: 10 }}>ACTIVE</span>}
+                    {/* Issue #85 — health badge. Click for full diagnostic. */}
+                    {health && (
+                      <button
+                        onClick={() => setHealthInspect(health)}
+                        title={
+                          health.recommendation === 'healthy'
+                            ? `${health.collections.count} collection${health.collections.count === 1 ? '' : 's'} · ${health.collections.totalDocuments.toLocaleString()} docs · ${(health.files.dataSizeBytes / 1024).toFixed(0)} KB`
+                            : health.recommendationDetail || health.recommendation
+                        }
+                        style={{
+                          background: health.recommendation === 'healthy' ? 'rgba(40,160,80,0.1)' : 'rgba(217,4,41,0.1)',
+                          color: health.recommendation === 'healthy' ? 'rgb(20,120,60)' : 'var(--red)',
+                          border: 'none',
+                          fontSize: 10,
+                          fontWeight: 700,
+                          fontFamily: 'var(--mono)',
+                          letterSpacing: '0.05em',
+                          textTransform: 'uppercase',
+                          padding: '2px 8px',
+                          cursor: 'pointer',
+                        }}
+                      >
+                        {health.recommendation === 'healthy' ? '● healthy' : `⚠ ${health.recommendation}`}
+                      </button>
+                    )}
                   </div>
                   <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--gray-500)', marginTop: 4, wordBreak: 'break-all' }}>
                     {db.filePath}
+                    {health && (
+                      <span style={{ marginLeft: 12 }}>
+                        {health.collections.count} collection{health.collections.count === 1 ? '' : 's'} · {health.collections.totalDocuments.toLocaleString()} docs · {(health.files.dataSizeBytes / 1024).toFixed(0)} KB
+                      </span>
+                    )}
                   </div>
                 </div>
                 <div style={{ display: 'flex', gap: 6 }}>
@@ -470,6 +558,83 @@ export default function DatabasesPage() {
       <div style={{ color: 'var(--gray-500)', fontSize: 12, marginTop: 32, lineHeight: 1.6 }}>
         💡 Tip — each attached database is a fully independent engine (own WAL, recovery log, lock file, page cache, replication followers). The registry is just a name → instance dictionary; it adds zero hot-path cost.
       </div>
+
+      {/* Issue #85 — health inspect modal. Plain content reveal — no
+          backdrop dimming because we want the operator to still see the
+          row they clicked. Click outside or hit the X to close. */}
+      {healthInspect && (
+        <div
+          onClick={() => setHealthInspect(null)}
+          style={{
+            position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.4)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            zIndex: 50,
+          }}
+        >
+          <div
+            onClick={e => e.stopPropagation()}
+            style={{
+              background: 'white', padding: 24, maxWidth: 720, width: '92vw',
+              maxHeight: '80vh', overflow: 'auto',
+              border: '1px solid var(--gray-200)',
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+              <h2 style={{ margin: 0, fontSize: 20 }}>
+                Health · <code style={{ fontFamily: 'var(--mono)' }}>{healthInspect.database}</code>
+              </h2>
+              <button onClick={() => setHealthInspect(null)} style={ghostBtn()}>✕ Close</button>
+            </div>
+            <div style={{
+              padding: 10,
+              marginBottom: 14,
+              background: healthInspect.recommendation === 'healthy' ? 'rgba(40,160,80,0.08)' : 'rgba(217,4,41,0.06)',
+              color: healthInspect.recommendation === 'healthy' ? 'rgb(20,120,60)' : 'var(--red)',
+              fontFamily: 'var(--mono)', fontSize: 12,
+            }}>
+              {healthInspect.recommendation === 'healthy' ? '● ' : '⚠ '}
+              {healthInspect.recommendation}
+              {healthInspect.recommendationDetail && (
+                <div style={{ marginTop: 6, color: 'var(--ink)', fontFamily: 'var(--sans)', fontSize: 13, lineHeight: 1.5 }}>
+                  {healthInspect.recommendationDetail}
+                </div>
+              )}
+            </div>
+            <table style={{ width: '100%', fontSize: 13, borderCollapse: 'collapse' }}>
+              <tbody>
+                {[
+                  ['File path', <code key="fp" style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{healthInspect.filePath}</code>],
+                  ['Engine health', healthInspect.healthStatus + (healthInspect.readOnly ? ' (read-only)' : '')],
+                  ['Collections', `${healthInspect.collections.count} · ${healthInspect.collections.totalDocuments.toLocaleString()} docs total`],
+                  ...(healthInspect.collections.names.length > 0
+                    ? [['Collection names', healthInspect.collections.names.join(', ')] as [string, any]]
+                    : []),
+                  ['Data file', `${healthInspect.files.dataSizeBytes.toLocaleString()} bytes (${(healthInspect.files.dataSizeBytes / 1024).toFixed(1)} KB)`],
+                  ['Recovery log', healthInspect.files.recoveryLogBytes === 0 ? 'empty' : `${healthInspect.files.recoveryLogBytes.toLocaleString()} bytes pending replay`],
+                  ['WAL', healthInspect.files.walBytes === 0 ? 'empty' : `${healthInspect.files.walBytes.toLocaleString()} bytes`],
+                  ['Snapshot incoming', healthInspect.files.snapshotMarkerPresent ? 'YES — partial snapshot present' : 'no'],
+                  ...(healthInspect.lockHolder
+                    ? [['Lock holder', `pid ${healthInspect.lockHolder.pid} on ${healthInspect.lockHolder.host} (opened ${healthInspect.lockHolder.openedAtUtc})`] as [string, any]]
+                    : [['Lock holder', 'this service'] as [string, any]]),
+                ].map(([label, val], i) => (
+                  <tr key={i} style={{ borderBottom: '1px solid var(--gray-100)' }}>
+                    <td style={{ padding: '8px 0', color: 'var(--gray-500)', width: 160, verticalAlign: 'top', fontSize: 11, fontFamily: 'var(--mono)', letterSpacing: '0.05em', textTransform: 'uppercase' }}>{label}</td>
+                    <td style={{ padding: '8px 0', wordBreak: 'break-all' }}>{val as React.ReactNode}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {healthInspect.recommendation === 'rebuild-catalog' && (
+              <div style={{ marginTop: 16, padding: 12, background: 'rgba(217,4,41,0.04)', border: '1px solid rgba(217,4,41,0.15)' }}>
+                <div style={{ fontWeight: 600, marginBottom: 6 }}>How to recover (manual, until #86 ships)</div>
+                <div style={{ fontSize: 12, lineHeight: 1.5, color: 'var(--gray-700)' }}>
+                  Your data pages are likely intact but the catalog page (page 1 of the .dfdb file) that lists collection names + their first page IDs is empty. A reconstruct-from-data-pages CLI is coming in 1.2.1 (issue #86). Until then: keep this file <strong>read-only</strong>, copy it to a safe backup (<code style={{ fontFamily: 'var(--mono)' }}>cp {healthInspect.filePath} {healthInspect.filePath}.frozen</code>), and ping the team. Don't INSERT or run rebuild-index against it — that could overwrite still-recoverable pages.
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </>
   );
 }

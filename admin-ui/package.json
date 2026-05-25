@@ -1,6 +1,6 @@
 {
   "name": "documentforge-admin",
-  "version": "1.1.2",
+  "version": "1.2.0",
   "private": true,
   "description": "Admin UI for DocumentForge clusters",
   "scripts": {

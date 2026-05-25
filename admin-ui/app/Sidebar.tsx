@@ -96,6 +96,7 @@ export function Sidebar() {
       <nav>
         <Link href="/">Dashboard</Link>
         <Link href="/studio" className="nav-headline">✦ Studio</Link>
+        <Link href="/databases">⊟ Databases</Link>
         <Link href="/topology">⌬ Topology</Link>
         <Link href="/admin">⚙ Admin</Link>
         <Link href="/admin/keys">🔑 API Keys</Link>
@@ -106,7 +107,7 @@ export function Sidebar() {
         marginTop: 'auto', fontSize: 11, color: '#666',
         fontFamily: 'var(--mono)', letterSpacing: '0.05em', paddingTop: 40
       }}>
-        v1.1.2 · MIT
+        v1.2.0 · MIT
       </div>
     </aside>
   );
