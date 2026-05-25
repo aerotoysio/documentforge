@@ -214,6 +214,17 @@ public sealed class DatabaseCatalog
         .Select(e => new CatalogEntry(e.Name, e.Path))
         .ToList();
 
+    /// <summary>Names operators have explicitly Detached. Issue #84 —
+    /// the runtime <c>/databases/discover</c> rescan honours these
+    /// (same as the boot-time auto-discover): an operator's explicit
+    /// "remove this from the registry" decision shouldn't be reverted
+    /// by a refresh button. Manual one-click Attach on the Browse &amp;
+    /// attach panel still works — that overwrites the tombstone.</summary>
+    public IReadOnlySet<string> TombstonedNames() => ReadCatalogAll()
+        .Where(e => e.Detached)
+        .Select(e => e.Name)
+        .ToHashSet(StringComparer.OrdinalIgnoreCase);
+
     // ----------------------------------------------------------------
 
     /// <summary>Reads everything — live records AND tombstones. The
