@@ -32,7 +32,7 @@ public static class DatabaseEndpoints
     /// is where a path-less <c>POST /databases</c> drops the new <c>.dfdb</c>
     /// (defaults to <c>{dataDir}/{name}.dfdb</c>).
     /// </summary>
-    public static void Map(IEndpointRouteBuilder app, DatabaseRegistry registry, string defaultDataDir, DatabaseCatalog? catalog = null, BackupManager? backupManager = null)
+    public static void Map(IEndpointRouteBuilder app, DatabaseRegistry registry, string defaultDataDir, DatabaseCatalog? catalog = null, BackupManager? backupManager = null, WalArchiver? walArchiver = null)
     {
         // List every attached database. Stable shape across phases.
         // Admin-scoped: enumerating tenants would leak names to a
@@ -321,6 +321,86 @@ public static class DatabaseEndpoints
             createdAtUtc = r.CreatedAtUtc.ToString("O"),
             kind = r.Kind,
         };
+
+        // ----------------------------------------------------------------
+        // Issue #88 phase 1 — WAL archiving (continuous PITR data source).
+        // Per-DB enable/disable, status, list shipped segments. The
+        // restore-with-target endpoint that consumes these segments is
+        // phase 2 (next iteration).
+        // ----------------------------------------------------------------
+
+        app.MapPost("/databases/{name}/archive/enable", (HttpContext ctx, string name) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (walArchiver is null)
+                return Results.NotFound(new { error = "WAL archiver not configured." });
+            try
+            {
+                walArchiver.EnableForDatabase(name);
+                return Results.Ok(new { database = name, enabled = true });
+            }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        app.MapPost("/databases/{name}/archive/disable", (HttpContext ctx, string name) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (walArchiver is null)
+                return Results.NotFound(new { error = "WAL archiver not configured." });
+            walArchiver.DisableForDatabase(name);
+            return Results.Ok(new { database = name, enabled = false });
+        });
+
+        app.MapGet("/databases/{name}/archive/status", (HttpContext ctx, string name) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (walArchiver is null)
+                return Results.NotFound(new { error = "WAL archiver not configured." });
+            var s = walArchiver.GetStatus(name);
+            return Results.Ok(new
+            {
+                database = s.Database,
+                enabled = s.Enabled,
+                nextSequence = s.NextSequence,
+                lastShippedAtUtc = s.LastShippedAtUtc?.ToString("O"),
+                segmentsThisSession = s.SegmentsThisSession,
+            });
+        });
+
+        app.MapGet("/databases/{name}/archive/segments", (HttpContext ctx, string name) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (walArchiver is null)
+                return Results.NotFound(new { error = "WAL archiver not configured." });
+            var segs = walArchiver.ListSegments(name);
+            return Results.Ok(new
+            {
+                database = name,
+                count = segs.Count,
+                totalBytes = segs.Sum(s => s.ByteCount),
+                segments = segs.Select(s => new
+                {
+                    sequenceNumber = s.SequenceNumber,
+                    archivedAtUtc = s.ArchivedAtUtc.ToString("O"),
+                    byteCount = s.ByteCount,
+                    recordCount = s.RecordCount,
+                    segmentPath = s.SegmentPath,
+                }),
+            });
+        });
+
+        app.MapPost("/admin/archive/flush", (HttpContext ctx) =>
+        {
+            // Drive an immediate engine-Flush across every archive-
+            // enabled database. The hook fires synchronously during
+            // the flush, so by the time this returns, all dirty
+            // pages have been shipped as new segments.
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (walArchiver is null)
+                return Results.NotFound(new { error = "WAL archiver not configured." });
+            walArchiver.FlushNow();
+            return Results.Ok(new { flushed = true });
+        });
 
         // Create-or-attach (Studio "+ Add Database").
         //   { "name": "acme" }                            -> {dataDir}/acme.dfdb, create-or-attach
