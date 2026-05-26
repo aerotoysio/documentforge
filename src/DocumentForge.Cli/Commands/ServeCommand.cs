@@ -88,6 +88,23 @@ public static class ServeCommand
         // Default backup dir is {data-dir}/backups; operators can
         // override via Studio's Backups settings panel.
         var backupManager = new BackupManager(registry, config.DataDir);
+
+        // Issue #88 phase 1 — continuous WAL archiver. Tails each
+        // enabled database's .recovery sidecar and ships new bytes as
+        // timestamped segments. Restore-with-target (next phase)
+        // concatenates the relevant segments into a synthetic
+        // .recovery next to a restored snapshot and lets the engine's
+        // existing replay path do the rest. Per-DB enable persists in
+        // _system.wal_archive_state so PITR resumes after restart.
+        var walArchiver = new WalArchiver(registry, backupManager);
+        walArchiver.RestoreFromPersistedState();
+
+        // Issue #88 phase 2 — point-in-time restore engine. Combines a
+        // base snapshot from BackupManager with archived WAL segments
+        // from WalArchiver, materialised through the engine's existing
+        // recovery-log replay path on Open. No new replay code in the
+        // engine — pure plumbing.
+        var pitr = new PointInTimeRestore(registry, backupManager, walArchiver, config.DataDir);
         if (bootstrap.Errors.Count > 0)
         {
             foreach (var err in bootstrap.Errors)
@@ -263,7 +280,7 @@ public static class ServeCommand
         // data-plane routes still resolve to registry.GetDefault() so
         // single-DB clients see no change. The catalog argument (Issue
         // #82) means attach/detach state survives restarts.
-        DatabaseEndpoints.Map(app, registry, config.DataDir, dbCatalog, backupManager);
+        DatabaseEndpoints.Map(app, registry, config.DataDir, dbCatalog, backupManager, walArchiver, pitr);
 
         // Issue #66 Phase 5: service orchestration. Lets Studio (or a CLI)
         // spawn sibling dfdb serve processes from one running service —
@@ -949,7 +966,7 @@ public static class ServeCommand
             {
                 status = healthy ? "ok" : "degraded",
                 node = config.NodeName,
-                version = "1.3.0",
+                version = "1.4.0",
                 readOnly = db.IsReadOnly,
                 uptimeSeconds = Math.Round((DateTime.UtcNow - _startedAt).TotalSeconds, 1),
                 health = healthy ? null : new

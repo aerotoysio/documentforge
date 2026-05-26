@@ -514,6 +514,106 @@ export async function saveBackupConfig(cfg: { backupDir?: string | null; retenti
   return handle(r);
 }
 
+// Issue #88 — WAL archiving controls + point-in-time restore. Phase 1
+// puts continuous capture in place; phase 2 lets the operator pick a
+// recovery target and roll forward to it.
+
+export interface ArchiveStatusResponse {
+  database: string;
+  enabled: boolean;
+  nextSequence: number;
+  lastShippedAtUtc: string | null;
+  segmentsThisSession: number;
+}
+export interface WalSegmentRow {
+  sequenceNumber: number;
+  archivedAtUtc: string;
+  byteCount: number;
+  recordCount: number;
+  segmentPath?: string;
+}
+export interface ArchiveSegmentsResponse {
+  database: string;
+  count: number;
+  totalBytes: number;
+  segments: WalSegmentRow[];
+}
+export async function getArchiveStatus(dbName: string, opts?: CallOptions): Promise<ArchiveStatusResponse> {
+  const r = await fetch(urlFor(`/databases/${encodeURIComponent(dbName)}/archive/status`, opts), {
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+export async function listArchiveSegments(dbName: string, opts?: CallOptions): Promise<ArchiveSegmentsResponse> {
+  const r = await fetch(urlFor(`/databases/${encodeURIComponent(dbName)}/archive/segments`, opts), {
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+export async function enableArchiving(dbName: string, opts?: CallOptions): Promise<void> {
+  const r = await fetch(urlFor(`/databases/${encodeURIComponent(dbName)}/archive/enable`, opts), {
+    method: 'POST',
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+export async function disableArchiving(dbName: string, opts?: CallOptions): Promise<void> {
+  const r = await fetch(urlFor(`/databases/${encodeURIComponent(dbName)}/archive/disable`, opts), {
+    method: 'POST',
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+export async function flushArchive(opts?: CallOptions): Promise<void> {
+  const r = await fetch(urlFor('/admin/archive/flush', opts), {
+    method: 'POST',
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+
+export interface PitrPreviewResponse {
+  feasibleToRestore: boolean;
+  refusalReason: string | null;
+  baseBackup: {
+    id: string;
+    database: string;
+    createdAtUtc: string;
+    sizeBytes: number;
+  };
+  targetTimeUtc: string;
+  segments: WalSegmentRow[];
+  segmentCount: number;
+  bytesToReplay: number;
+  sequenceGaps: Array<{ afterSequence: number; beforeSequence: number; missingCount: number }>;
+}
+export interface PitrRestoreResponse {
+  database: string;
+  filePath: string;
+  sourceDatabase: string;
+  baseBackupId: string;
+  targetTimeUtc: string;
+  segmentsApplied: number;
+  bytesReplayed: number;
+  sequenceGaps: Array<{ afterSequence: number; beforeSequence: number; missingCount: number }>;
+}
+export async function previewPitr(backupId: string, targetTimeUtc: string, opts?: CallOptions): Promise<PitrPreviewResponse> {
+  const r = await fetch(urlFor('/admin/backup/restore-pitr/preview', opts), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
+    body: JSON.stringify({ backupId, targetTimeUtc }),
+  });
+  return handle(r);
+}
+export async function executePitr(backupId: string, targetTimeUtc: string, newDatabaseName: string, opts?: CallOptions): Promise<PitrRestoreResponse> {
+  const r = await fetch(urlFor('/admin/backup/restore-pitr', opts), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
+    body: JSON.stringify({ backupId, targetTimeUtc, newDatabaseName }),
+  });
+  return handle(r);
+}
+
 // ---------- Per-DB replication (Issue #66 Phase 2.5) ----------
 // Phase 2.5 scoped endpoints under /db/{name}/replication/*. Each attached
 // DB has its own role; Studio's topology page uses these to render and

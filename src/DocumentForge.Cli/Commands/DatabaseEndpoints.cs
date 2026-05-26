@@ -32,7 +32,7 @@ public static class DatabaseEndpoints
     /// is where a path-less <c>POST /databases</c> drops the new <c>.dfdb</c>
     /// (defaults to <c>{dataDir}/{name}.dfdb</c>).
     /// </summary>
-    public static void Map(IEndpointRouteBuilder app, DatabaseRegistry registry, string defaultDataDir, DatabaseCatalog? catalog = null, BackupManager? backupManager = null)
+    public static void Map(IEndpointRouteBuilder app, DatabaseRegistry registry, string defaultDataDir, DatabaseCatalog? catalog = null, BackupManager? backupManager = null, WalArchiver? walArchiver = null, PointInTimeRestore? pitr = null)
     {
         // List every attached database. Stable shape across phases.
         // Admin-scoped: enumerating tenants would leak names to a
@@ -321,6 +321,171 @@ public static class DatabaseEndpoints
             createdAtUtc = r.CreatedAtUtc.ToString("O"),
             kind = r.Kind,
         };
+
+        // ----------------------------------------------------------------
+        // Issue #88 phase 1 — WAL archiving (continuous PITR data source).
+        // Per-DB enable/disable, status, list shipped segments. The
+        // restore-with-target endpoint that consumes these segments is
+        // phase 2 (next iteration).
+        // ----------------------------------------------------------------
+
+        app.MapPost("/databases/{name}/archive/enable", (HttpContext ctx, string name) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (walArchiver is null)
+                return Results.NotFound(new { error = "WAL archiver not configured." });
+            try
+            {
+                walArchiver.EnableForDatabase(name);
+                return Results.Ok(new { database = name, enabled = true });
+            }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        app.MapPost("/databases/{name}/archive/disable", (HttpContext ctx, string name) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (walArchiver is null)
+                return Results.NotFound(new { error = "WAL archiver not configured." });
+            walArchiver.DisableForDatabase(name);
+            return Results.Ok(new { database = name, enabled = false });
+        });
+
+        app.MapGet("/databases/{name}/archive/status", (HttpContext ctx, string name) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (walArchiver is null)
+                return Results.NotFound(new { error = "WAL archiver not configured." });
+            var s = walArchiver.GetStatus(name);
+            return Results.Ok(new
+            {
+                database = s.Database,
+                enabled = s.Enabled,
+                nextSequence = s.NextSequence,
+                lastShippedAtUtc = s.LastShippedAtUtc?.ToString("O"),
+                segmentsThisSession = s.SegmentsThisSession,
+            });
+        });
+
+        app.MapGet("/databases/{name}/archive/segments", (HttpContext ctx, string name) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (walArchiver is null)
+                return Results.NotFound(new { error = "WAL archiver not configured." });
+            var segs = walArchiver.ListSegments(name);
+            return Results.Ok(new
+            {
+                database = name,
+                count = segs.Count,
+                totalBytes = segs.Sum(s => s.ByteCount),
+                segments = segs.Select(s => new
+                {
+                    sequenceNumber = s.SequenceNumber,
+                    archivedAtUtc = s.ArchivedAtUtc.ToString("O"),
+                    byteCount = s.ByteCount,
+                    recordCount = s.RecordCount,
+                    segmentPath = s.SegmentPath,
+                }),
+            });
+        });
+
+        app.MapPost("/admin/archive/flush", (HttpContext ctx) =>
+        {
+            // Drive an immediate engine-Flush across every archive-
+            // enabled database. The hook fires synchronously during
+            // the flush, so by the time this returns, all dirty
+            // pages have been shipped as new segments.
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (walArchiver is null)
+                return Results.NotFound(new { error = "WAL archiver not configured." });
+            walArchiver.FlushNow();
+            return Results.Ok(new { flushed = true });
+        });
+
+        // ----------------------------------------------------------------
+        // Issue #88 phase 2 — point-in-time restore. Preview + execute.
+        // Preview shows the operator the segments that would be applied
+        // BEFORE any filesystem mutations happen, so the Studio timeline
+        // UI can render "X segments, Y MB" before the operator commits.
+        // ----------------------------------------------------------------
+
+        app.MapPost("/admin/backup/restore-pitr/preview", (HttpContext ctx, PitrPreviewBody body) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (pitr is null)
+                return Results.NotFound(new { error = "PITR not configured." });
+            if (string.IsNullOrWhiteSpace(body.BackupId))
+                return Results.BadRequest(new { error = "Missing 'backupId'." });
+            try
+            {
+                var plan = pitr.Plan(body.BackupId, body.TargetTimeUtc);
+                return Results.Ok(new
+                {
+                    feasibleToRestore = plan.FeasibleToRestore,
+                    refusalReason = plan.RefusalReason,
+                    baseBackup = new
+                    {
+                        id = plan.BaseBackup.Id,
+                        database = plan.BaseBackup.Database,
+                        createdAtUtc = plan.BaseBackup.CreatedAtUtc.ToString("O"),
+                        sizeBytes = plan.BaseBackup.SizeBytes,
+                    },
+                    targetTimeUtc = body.TargetTimeUtc.ToString("O"),
+                    segments = plan.Segments.Select(s => new
+                    {
+                        sequenceNumber = s.SequenceNumber,
+                        archivedAtUtc = s.ArchivedAtUtc.ToString("O"),
+                        byteCount = s.ByteCount,
+                        recordCount = s.RecordCount,
+                    }),
+                    segmentCount = plan.Segments.Count,
+                    bytesToReplay = plan.Segments.Sum(s => s.ByteCount),
+                    sequenceGaps = plan.SequenceGaps.Select(g => new
+                    {
+                        afterSequence = g.AfterSequence,
+                        beforeSequence = g.BeforeSequence,
+                        missingCount = g.MissingCount,
+                    }),
+                });
+            }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        app.MapPost("/admin/backup/restore-pitr", (HttpContext ctx, PitrRestoreBody body) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (pitr is null)
+                return Results.NotFound(new { error = "PITR not configured." });
+            if (string.IsNullOrWhiteSpace(body.BackupId))
+                return Results.BadRequest(new { error = "Missing 'backupId'." });
+            if (string.IsNullOrWhiteSpace(body.NewDatabaseName))
+                return Results.BadRequest(new { error = "Missing 'newDatabaseName'." });
+            try
+            {
+                var result = pitr.Restore(body.BackupId, body.TargetTimeUtc, body.NewDatabaseName);
+                // Persist the attach so it survives the next restart.
+                catalog?.RecordAttach(result.NewDatabaseName, result.NewDatabaseFilePath);
+                return Results.Ok(new
+                {
+                    database = result.NewDatabaseName,
+                    filePath = result.NewDatabaseFilePath,
+                    sourceDatabase = result.SourceDatabase,
+                    baseBackupId = result.BaseBackupId,
+                    targetTimeUtc = result.TargetTimeUtc.ToString("O"),
+                    segmentsApplied = result.SegmentsApplied,
+                    bytesReplayed = result.BytesReplayed,
+                    sequenceGaps = result.SequenceGaps.Select(g => new
+                    {
+                        afterSequence = g.AfterSequence,
+                        beforeSequence = g.BeforeSequence,
+                        missingCount = g.MissingCount,
+                    }),
+                });
+            }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            catch (InvalidOperationException ex) { return Results.Conflict(new { error = ex.Message }); }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
 
         // Create-or-attach (Studio "+ Add Database").
         //   { "name": "acme" }                            -> {dataDir}/acme.dfdb, create-or-attach
@@ -880,3 +1045,8 @@ public record CreateDatabaseRequest(string Name, string? Path = null, bool? Crea
 // schedule + offsite shipping fields will land in follow-up iterations.
 public record BackupConfigBody(string? BackupDir = null, int? RetentionCount = null, string? ScheduleCron = null);
 public record RestoreBody(string BackupId, string NewDatabaseName);
+
+// Issue #88 phase 2 — PITR preview + execute. TargetTimeUtc is the
+// recovery target; the engine replays WAL segments up to that time.
+public record PitrPreviewBody(string BackupId, DateTime TargetTimeUtc);
+public record PitrRestoreBody(string BackupId, DateTime TargetTimeUtc, string NewDatabaseName);

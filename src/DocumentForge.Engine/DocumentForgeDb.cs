@@ -26,6 +26,18 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     private LogicalReplicationServer? _logicalServer;
     private LogicalReplicationFollower? _logicalFollower;
     private CombinedPreFlushHook? _combinedHook;
+
+    /// <summary>Issue #88 — attach an external pre-flush hook so the PITR
+    /// archiver can capture every page write at the moment it's about to
+    /// be flushed to the data file. Used by <c>WalArchiver</c> in
+    /// DocumentForge.Cli; symmetric with the way the replication
+    /// subsystem attaches its own hook internally. Safe to call after
+    /// Open; the hook is invoked synchronously on the flush path, so
+    /// implementations must be fast and non-blocking.</summary>
+    public void AddPreFlushHook(IPreFlushHook hook) => _combinedHook?.Add(hook);
+
+    /// <summary>Detach a previously-added hook. No-op if not present.</summary>
+    public void RemovePreFlushHook(IPreFlushHook hook) => _combinedHook?.Remove(hook);
     private bool _disposed;
 
     public string FilePath { get; }

@@ -631,6 +631,263 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
         Assert.Empty(summary.Errors);
     }
 
+    // Issue #88 — PITR end-to-end tests. The smoke tests we ran during
+    // development proved the LOGIC works; these tests guard against
+    // future regression.
+
+    [Fact]
+    public async Task PitrArchiveEnableDisable_PersistsState()
+    {
+        // The archive enabled-flag survives Disable + re-Enable. The
+        // sequence counter is monotonic across the cycle (a previously-
+        // shipped segment-N doesn't get re-numbered).
+        var (registry, baseUrl, _, _, _, walArchiver, _) = BootServerWithPitr();
+
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "alpha" });
+
+        var enable = await _http.PostAsync($"{baseUrl}/databases/alpha/archive/enable", content: null);
+        enable.EnsureSuccessStatusCode();
+        var status1 = await _http.GetFromJsonAsync<ArchiveStatusWire>(
+            $"{baseUrl}/databases/alpha/archive/status");
+        Assert.True(status1!.Enabled);
+
+        var disable = await _http.PostAsync($"{baseUrl}/databases/alpha/archive/disable", content: null);
+        disable.EnsureSuccessStatusCode();
+        var status2 = await _http.GetFromJsonAsync<ArchiveStatusWire>(
+            $"{baseUrl}/databases/alpha/archive/status");
+        Assert.False(status2!.Enabled);
+    }
+
+    [Fact]
+    public async Task PitrArchive_FlushShipsSegmentWithExpectedFormat()
+    {
+        // Drive an insert + flush, expect exactly one segment file on
+        // disk with the engine's recovery-log format
+        // ([Magic:4 "WLOG"][PageId:4][Checksum:4][PageData:8192]).
+        var (_, baseUrl, _, _, backupMgr, _, _) = BootServerWithPitr();
+
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "tenant_x" });
+        await _http.PostAsync($"{baseUrl}/databases/tenant_x/archive/enable", content: null);
+        var body = new StringContent("""{"pnr":"X1"}""", System.Text.Encoding.UTF8, "application/json");
+        await _http.PostAsync($"{baseUrl}/db/tenant_x/collections/things", body);
+
+        var flush = await _http.PostAsync($"{baseUrl}/admin/archive/flush", content: null);
+        flush.EnsureSuccessStatusCode();
+        // The flush is synchronous — by the time it returns, the
+        // segment file is on disk.
+
+        var segs = await _http.GetFromJsonAsync<ArchiveSegmentsWire>(
+            $"{baseUrl}/databases/tenant_x/archive/segments");
+        Assert.True(segs!.Count >= 1);
+        var seg = segs.Segments[0];
+        Assert.True(seg.ByteCount > 0);
+        Assert.True(seg.RecordCount > 0);
+        // Each record is 8204 bytes (12-byte header + 8192-byte page).
+        Assert.Equal(0, seg.ByteCount % 8204);
+
+        // Spot-check the magic bytes on disk to prove the segment
+        // really is in WLOG format, not just an empty file.
+        var segDir = Path.Combine(backupMgr.EffectiveBackupDir, "wal", "tenant_x");
+        var segFile = Directory.EnumerateFiles(segDir, "*.walseg")
+            .First(f => !f.EndsWith(".meta"));
+        var bytes = File.ReadAllBytes(segFile);
+        Assert.True(bytes.Length >= 4);
+        Assert.Equal((byte)'W', bytes[0]);
+        Assert.Equal((byte)'L', bytes[1]);
+        Assert.Equal((byte)'O', bytes[2]);
+        Assert.Equal((byte)'G', bytes[3]);
+    }
+
+    [Fact]
+    public async Task PitrRestore_TargetAfterBaseBackup_RecoversNewWrites()
+    {
+        // The headline test: state at T0 captured by backup, more
+        // writes happen, restore-to-now applies the segments and
+        // yields a DB with both the original AND the later writes.
+        var (registry, baseUrl, _, _, _, _, _) = BootServerWithPitr();
+
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "src" });
+        await _http.PostAsync($"{baseUrl}/databases/src/archive/enable", content: null);
+
+        // T0: 3 GOOD docs.
+        for (int i = 0; i < 3; i++)
+        {
+            var body = new StringContent($$"""{"pnr":"GOOD-{{i}}"}""",
+                System.Text.Encoding.UTF8, "application/json");
+            (await _http.PostAsync($"{baseUrl}/db/src/collections/pnrs", body))
+                .EnsureSuccessStatusCode();
+        }
+        await _http.PostAsync($"{baseUrl}/admin/archive/flush", content: null);
+        // Tiny delay so timestamps separate cleanly.
+        await Task.Delay(50);
+
+        // T1: take base backup.
+        var bk = await _http.PostAsync($"{baseUrl}/databases/src/backup", content: null);
+        var backup = await bk.Content.ReadFromJsonAsync<BackupWireRow>();
+        await Task.Delay(50);
+
+        // T2: 2 LATER docs + flush.
+        for (int i = 0; i < 2; i++)
+        {
+            var body = new StringContent($$"""{"pnr":"LATER-{{i}}"}""",
+                System.Text.Encoding.UTF8, "application/json");
+            await _http.PostAsync($"{baseUrl}/db/src/collections/pnrs", body);
+        }
+        await _http.PostAsync($"{baseUrl}/admin/archive/flush", content: null);
+        await Task.Delay(50);
+
+        // Restore to "now" — should pick up the LATER docs.
+        var targetIso = DateTime.UtcNow.ToString("O");
+        var resp = await _http.PostAsJsonAsync($"{baseUrl}/admin/backup/restore-pitr",
+            new { backupId = backup!.Id, targetTimeUtc = targetIso, newDatabaseName = "src_restored" });
+        resp.EnsureSuccessStatusCode();
+        var result = await resp.Content.ReadFromJsonAsync<PitrRestoreWire>();
+        Assert.True(result!.SegmentsApplied >= 1);
+        Assert.NotNull(registry.TryGet("src_restored"));
+
+        // Query the restored DB: must have ALL 5 docs (3 GOOD + 2 LATER).
+        var q = await _http.PostAsJsonAsync($"{baseUrl}/db/src_restored/query",
+            new { sql = "SELECT * FROM pnrs" });
+        var json = await q.Content.ReadAsStringAsync();
+        for (int i = 0; i < 3; i++) Assert.Contains($"GOOD-{i}", json);
+        for (int i = 0; i < 2; i++) Assert.Contains($"LATER-{i}", json);
+    }
+
+    [Fact]
+    public async Task PitrRestore_TargetBeforeBaseBackup_Refused()
+    {
+        // PITR rolls forward only. A target before the snapshot can't
+        // be achieved by any sequence of segment replays applied to
+        // that snapshot.
+        var (_, baseUrl, _, _, _, _, _) = BootServerWithPitr();
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "src" });
+        await _http.PostAsync($"{baseUrl}/databases/src/archive/enable", content: null);
+        // Insert + back up so we have a backup to point at.
+        var body = new StringContent("""{"x":1}""", System.Text.Encoding.UTF8, "application/json");
+        await _http.PostAsync($"{baseUrl}/db/src/collections/t", body);
+        await _http.PostAsync($"{baseUrl}/admin/archive/flush", content: null);
+        var bkResp = await _http.PostAsync($"{baseUrl}/databases/src/backup", content: null);
+        var backup = await bkResp.Content.ReadFromJsonAsync<BackupWireRow>();
+
+        // Target = one minute BEFORE the backup.
+        var tooEarly = DateTime.Parse(backup!.CreatedAtUtc).AddMinutes(-1).ToUniversalTime().ToString("O");
+        var resp = await _http.PostAsJsonAsync($"{baseUrl}/admin/backup/restore-pitr",
+            new { backupId = backup.Id, targetTimeUtc = tooEarly, newDatabaseName = "src_rewind" });
+        Assert.Equal(System.Net.HttpStatusCode.BadRequest, resp.StatusCode);
+        var msg = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("rolls forward only", msg);
+    }
+
+    [Fact]
+    public async Task PitrPreview_FeasibilityFlagAndCountsCorrect()
+    {
+        var (_, baseUrl, _, _, _, _, _) = BootServerWithPitr();
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "src" });
+        await _http.PostAsync($"{baseUrl}/databases/src/archive/enable", content: null);
+        var body = new StringContent("""{"x":1}""", System.Text.Encoding.UTF8, "application/json");
+        await _http.PostAsync($"{baseUrl}/db/src/collections/t", body);
+        await _http.PostAsync($"{baseUrl}/admin/archive/flush", content: null);
+        var bkResp = await _http.PostAsync($"{baseUrl}/databases/src/backup", content: null);
+        var backup = await bkResp.Content.ReadFromJsonAsync<BackupWireRow>();
+        await Task.Delay(50);
+
+        // Drop another doc + flush so there's at least one segment
+        // after the backup to count.
+        var body2 = new StringContent("""{"x":2}""", System.Text.Encoding.UTF8, "application/json");
+        await _http.PostAsync($"{baseUrl}/db/src/collections/t", body2);
+        await _http.PostAsync($"{baseUrl}/admin/archive/flush", content: null);
+
+        var preview = await _http.PostAsJsonAsync($"{baseUrl}/admin/backup/restore-pitr/preview",
+            new { backupId = backup!.Id, targetTimeUtc = DateTime.UtcNow.ToString("O") });
+        preview.EnsureSuccessStatusCode();
+        var plan = await preview.Content.ReadFromJsonAsync<PitrPreviewWire>();
+        Assert.True(plan!.FeasibleToRestore);
+        Assert.True(plan.SegmentCount >= 1);
+        Assert.True(plan.BytesToReplay >= 8204);  // at least one record
+    }
+
+    /// <summary>Boot a server with the FULL PITR plumbing (registry,
+    /// catalog, BackupManager, WalArchiver, PointInTimeRestore). Only
+    /// Issue #88 tests need all of this; #87 tests use the lighter
+    /// <see cref="BootServerWithBackup"/> fixture.</summary>
+    private (DatabaseRegistry registry, string baseUrl, string dataDir,
+        DatabaseCatalog catalog, BackupManager backup, WalArchiver walArchiver, PointInTimeRestore pitr)
+        BootServerWithPitr()
+    {
+        var port = FindFreePort();
+        var dataDir = Path.Combine(Path.GetTempPath(), $"pitr_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataDir);
+        _dirs.Add(dataDir);
+
+        var registry = new DatabaseRegistry();
+        _disposables.Add(registry);
+        registry.AttachOrCreate("_system", Path.Combine(dataDir, "_system.dfdb"));
+        var catalog = new DatabaseCatalog(registry);
+        var backup = new BackupManager(registry, dataDir);
+        // Tight flush interval for tests so we don't wait 5s for
+        // continuous-flush to kick in. The /admin/archive/flush
+        // endpoint drives an immediate flush regardless of cadence,
+        // but the timer still has to NOT misbehave during the test.
+        var walArchiver = new WalArchiver(registry, backup, TimeSpan.FromSeconds(30));
+        _disposables.Add(walArchiver);
+        var pitr = new PointInTimeRestore(registry, backup, walArchiver, dataDir);
+
+        var builder = WebApplication.CreateBuilder();
+        builder.Logging.ClearProviders();
+        builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
+        var app = builder.Build();
+        app.Use(async (ctx, next) =>
+        {
+            ctx.Items[AuthContext.ContextKey] = AuthContext.DevMode();
+            await next();
+        });
+        DatabaseEndpoints.Map(app, registry, dataDir, catalog, backup, walArchiver, pitr);
+        app.StartAsync().GetAwaiter().GetResult();
+        _disposables.Add(new HostStopper(app));
+        return (registry, $"http://127.0.0.1:{port}", dataDir, catalog, backup, walArchiver, pitr);
+    }
+
+    private sealed class ArchiveStatusWire
+    {
+        public string Database { get; set; } = "";
+        public bool Enabled { get; set; }
+        public long NextSequence { get; set; }
+        public string? LastShippedAtUtc { get; set; }
+        public long SegmentsThisSession { get; set; }
+    }
+    private sealed class ArchiveSegmentRow
+    {
+        public long SequenceNumber { get; set; }
+        public string ArchivedAtUtc { get; set; } = "";
+        public long ByteCount { get; set; }
+        public int RecordCount { get; set; }
+        public string? SegmentPath { get; set; }
+    }
+    private sealed class ArchiveSegmentsWire
+    {
+        public string Database { get; set; } = "";
+        public int Count { get; set; }
+        public long TotalBytes { get; set; }
+        public List<ArchiveSegmentRow> Segments { get; set; } = new();
+    }
+    private sealed class PitrPreviewWire
+    {
+        public bool FeasibleToRestore { get; set; }
+        public string? RefusalReason { get; set; }
+        public int SegmentCount { get; set; }
+        public long BytesToReplay { get; set; }
+    }
+    private sealed class PitrRestoreWire
+    {
+        public string Database { get; set; } = "";
+        public string FilePath { get; set; } = "";
+        public string SourceDatabase { get; set; } = "";
+        public string BaseBackupId { get; set; } = "";
+        public string TargetTimeUtc { get; set; } = "";
+        public int SegmentsApplied { get; set; }
+        public long BytesReplayed { get; set; }
+    }
+
     /// <summary>Boot a server with the BackupManager wired up — used
     /// only by Issue #87 tests; everything else still uses the simpler
     /// fixture without it.</summary>

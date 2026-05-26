@@ -21,6 +21,16 @@ import {
   saveBackupConfig,
   type BackupRow,
   type BackupConfigResponse,
+  getArchiveStatus,
+  listArchiveSegments,
+  enableArchiving,
+  disableArchiving,
+  flushArchive,
+  previewPitr,
+  executePitr,
+  type ArchiveStatusResponse,
+  type WalSegmentRow,
+  type PitrPreviewResponse,
 } from '@/lib/api';
 
 export default function BackupsPage() {
@@ -48,6 +58,21 @@ export default function BackupsPage() {
   const [draftRetention, setDraftRetention] = useState(10);
   const [savingSettings, setSavingSettings] = useState(false);
 
+  // Issue #88 — archive status per DB + PITR wizard state.
+  const [archiveStatus, setArchiveStatus] = useState<Record<string, ArchiveStatusResponse>>({});
+  const [archiveBusy, setArchiveBusy] = useState<string | null>(null);
+
+  // PITR wizard state. Opens when the user clicks "Restore to point-
+  // in-time" on a backup row. Walks them through picking a target
+  // time, previewing what would be replayed, and committing.
+  const [pitrSrc, setPitrSrc] = useState<BackupRow | null>(null);
+  const [pitrTargetTime, setPitrTargetTime] = useState('');
+  const [pitrNewName, setPitrNewName] = useState('');
+  const [pitrSegments, setPitrSegments] = useState<WalSegmentRow[]>([]);
+  const [pitrPreview, setPitrPreview] = useState<PitrPreviewResponse | null>(null);
+  const [pitrPreviewing, setPitrPreviewing] = useState(false);
+  const [pitrRestoring, setPitrRestoring] = useState(false);
+
   async function refresh() {
     setLoading(true);
     setError(null);
@@ -57,11 +82,21 @@ export default function BackupsPage() {
         listAllBackups(),
         getBackupConfig(),
       ]);
-      setDatabases(dbs.databases.filter(d => !d.name.startsWith('_')));
+      const userDbs = dbs.databases.filter(d => !d.name.startsWith('_'));
+      setDatabases(userDbs);
       setBackups(bks.backups);
       setConfig(cfg);
       setDraftBackupDir(cfg.backupDirConfigured ?? '');
       setDraftRetention(cfg.retentionCount);
+      // Issue #88 — fetch archive status for every user-tenant DB in
+      // the background so the per-row badges + the PITR wizard can
+      // tell which DBs have continuous archiving enabled. Per-DB,
+      // independent so a slow one doesn't block the rest.
+      userDbs.forEach(d => {
+        getArchiveStatus(d.name)
+          .then(s => setArchiveStatus(curr => ({ ...curr, [d.name]: s })))
+          .catch(() => { /* leave the row badge-less on failure */ });
+      });
     } catch (e: any) {
       setError(e.message || String(e));
     } finally {
@@ -159,6 +194,93 @@ export default function BackupsPage() {
     }
   }
 
+  async function toggleArchive(db: DatabaseEntry) {
+    const isOn = archiveStatus[db.name]?.enabled;
+    setArchiveBusy(db.name);
+    try {
+      if (isOn) await disableArchiving(db.name);
+      else await enableArchiving(db.name);
+      await refresh();
+      showBanner('ok', isOn
+        ? `Continuous archiving disabled for ${db.name}.`
+        : `Continuous archiving enabled for ${db.name}. Page writes are now shipped on each flush — PITR available.`);
+    } catch (e: any) {
+      showBanner('err', `Archive toggle failed: ${e.message || e}`);
+    } finally {
+      setArchiveBusy(null);
+    }
+  }
+
+  async function flushNow() {
+    try {
+      await flushArchive();
+      await refresh();
+      showBanner('ok', 'Forced flush — pending pages shipped as a new segment for every enabled DB.');
+    } catch (e: any) {
+      showBanner('err', `Flush failed: ${e.message || e}`);
+    }
+  }
+
+  async function openPitrWizard(bk: BackupRow) {
+    setPitrSrc(bk);
+    setPitrPreview(null);
+    // Default the target to "now" — but as a LOCAL-time string so
+    // the datetime-local input shows the operator's wall-clock time,
+    // not UTC. Subtracting the timezone offset before .toISOString()
+    // makes the string parse identically as local time when the
+    // input later round-trips it back to a UTC ISO string for the API.
+    const now = new Date();
+    const localOffsetMs = now.getTimezoneOffset() * 60000;
+    const localNowIso = new Date(now.getTime() - localOffsetMs).toISOString().slice(0, 19);
+    setPitrTargetTime(localNowIso);
+    const stamp = localNowIso.replace(/[-:]/g, '').replace('T', '_');
+    setPitrNewName(`${bk.database}_pitr_${stamp.slice(0, 13)}`);
+    // Fetch the segment list for the source DB so the timeline can
+    // render. Best-effort — the wizard still works without it,
+    // we just lose the visualisation.
+    try {
+      const segs = await listArchiveSegments(bk.database);
+      setPitrSegments(segs.segments);
+    } catch {
+      setPitrSegments([]);
+    }
+  }
+
+  async function previewPitrNow() {
+    if (!pitrSrc || !pitrTargetTime) return;
+    setPitrPreviewing(true);
+    try {
+      // Browser local datetime input — convert to ISO with Z so the
+      // backend's UTC normalisation is unambiguous.
+      const targetIso = new Date(pitrTargetTime).toISOString();
+      const preview = await previewPitr(pitrSrc.id, targetIso);
+      setPitrPreview(preview);
+    } catch (e: any) {
+      showBanner('err', `Preview failed: ${e.message || e}`);
+    } finally {
+      setPitrPreviewing(false);
+    }
+  }
+
+  async function confirmPitr() {
+    if (!pitrSrc || !pitrTargetTime || !pitrNewName.trim()) return;
+    setPitrRestoring(true);
+    try {
+      const targetIso = new Date(pitrTargetTime).toISOString();
+      const result = await executePitr(pitrSrc.id, targetIso, pitrNewName.trim());
+      await refresh();
+      setPitrSrc(null);
+      showBanner('ok',
+        `Restored ${pitrSrc.database} to ${pitrTargetTime} → ${result.database} ` +
+        `(${result.segmentsApplied} segment${result.segmentsApplied === 1 ? '' : 's'} replayed). ` +
+        `Visit Studio to query it.`);
+    } catch (e: any) {
+      showBanner('err', `PITR failed: ${e.message || e}`);
+    } finally {
+      setPitrRestoring(false);
+    }
+  }
+
   if (!active) {
     return (
       <>
@@ -206,10 +328,8 @@ export default function BackupsPage() {
             Snapshots every attached DB (excluding <code>_system</code>) under your backup directory. Safe to run at any time — uses a consistent on-disk checkpoint, no writes are blocked beyond the snapshot duration.
           </div>
         </div>
-        <button
-          onClick={() => setSettingsOpen(s => !s)}
-          style={ghostBtn()}
-        >⚙ Settings</button>
+        <button onClick={flushNow} style={ghostBtn()} title="Force every archive-enabled DB to flush dirty pages now (so the next PITR target can include the latest writes)">↻ Flush archive</button>
+        <button onClick={() => setSettingsOpen(s => !s)} style={ghostBtn()}>⚙ Settings</button>
         <button
           onClick={onBackupAll}
           disabled={backingUpAll}
@@ -285,11 +405,34 @@ export default function BackupsPage() {
             const rows = backupsByDb[db.name] ?? [];
             const isBackingUp = backingUp === db.name;
             const last = rows[0];
+            const archive = archiveStatus[db.name];
+            const archiveOn = archive?.enabled ?? false;
+            const isArchiveBusy = archiveBusy === db.name;
             return (
               <div key={db.name} className="card">
                 <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                   <div style={{ flex: 1 }}>
-                    <div style={{ fontWeight: 600, fontSize: 16 }}>{db.name}</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <span style={{ fontWeight: 600, fontSize: 16 }}>{db.name}</span>
+                      {/* Issue #88 — PITR badge. Green when continuous
+                          archive is on, gray when off. Hover for status. */}
+                      {archive && (
+                        <span
+                          title={archiveOn
+                            ? `Continuous archive ON. ${archive.segmentsThisSession} segment${archive.segmentsThisSession === 1 ? '' : 's'} this session, last shipped ${archive.lastShippedAtUtc ? new Date(archive.lastShippedAtUtc).toLocaleTimeString() : 'never'}.`
+                            : 'Continuous archive OFF — PITR not available, only snapshot-level restores.'}
+                          style={{
+                            background: archiveOn ? 'rgba(40,160,80,0.12)' : 'rgba(100,100,100,0.08)',
+                            color: archiveOn ? 'rgb(20,120,60)' : 'var(--gray-500)',
+                            fontSize: 10, fontWeight: 700, fontFamily: 'var(--mono)',
+                            letterSpacing: '0.05em', textTransform: 'uppercase',
+                            padding: '2px 8px',
+                          }}
+                        >
+                          {archiveOn ? `● PITR ON · seq ${archive.nextSequence}` : '○ PITR off'}
+                        </span>
+                      )}
+                    </div>
                     <div style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--gray-500)', marginTop: 2 }}>
                       {db.filePath}
                     </div>
@@ -304,6 +447,16 @@ export default function BackupsPage() {
                       )}
                     </div>
                   </div>
+                  <button
+                    onClick={() => toggleArchive(db)}
+                    disabled={isArchiveBusy}
+                    style={ghostBtn()}
+                    title={archiveOn
+                      ? 'Stop shipping WAL segments on flush. Existing segments stay on disk.'
+                      : 'Ship every page write to the backup directory on each flush. Required for point-in-time restore.'}
+                  >
+                    {isArchiveBusy ? '…' : archiveOn ? 'Disable PITR' : 'Enable PITR'}
+                  </button>
                   <button
                     onClick={() => onBackupOne(db)}
                     disabled={isBackingUp || backingUpAll}
@@ -335,6 +488,13 @@ export default function BackupsPage() {
                             <td style={tdStyle()}><code style={{ fontFamily: 'var(--mono)', fontSize: 11 }}>{r.kind}</code></td>
                             <td style={{ ...tdStyle(), textAlign: 'right' }}>
                               <button onClick={() => openRestore(r)} style={ghostBtn(2)}>Restore</button>
+                              {archiveOn && (
+                                <button
+                                  onClick={() => openPitrWizard(r)}
+                                  style={ghostBtn(2)}
+                                  title="Restore to any moment in time between this backup and the latest archived segment"
+                                >⏱ Restore to point-in-time</button>
+                              )}
                               <button onClick={() => onDelete(r)} style={dangerBtn(2)}>Delete</button>
                             </td>
                           </tr>
@@ -401,8 +561,149 @@ export default function BackupsPage() {
       )}
 
       <div style={{ color: 'var(--gray-500)', fontSize: 12, marginTop: 32, lineHeight: 1.6 }}>
-        💡 Today: hot snapshots via the engine's <code style={{ fontFamily: 'var(--mono)' }}>Snapshot()</code> primitive (writes briefly blocked during the fsync + copy; safe to run on a live system). Coming next: WAL archiving + true point-in-time recovery (restore to a specific timestamp), scheduled backups, offsite shipping (S3 / Azure Blob), per-shard coordination for cluster-wide consistent snapshots.
+        💡 Hot snapshots use the engine's <code style={{ fontFamily: 'var(--mono)' }}>Snapshot()</code> primitive (consistent on-disk checkpoint, no writes blocked beyond the fsync). When PITR is enabled, every page write is archived as a WAL segment on each flush (~5s cadence). Restore-to-point-in-time replays segments forward from a base backup to any moment up to the latest flush. Coming next: scheduled backups (the <code style={{ fontFamily: 'var(--mono)' }}>scheduleCron</code> config field is reserved), offsite shipping (S3 / Azure Blob), cluster-wide coordinated PITR across shards.
       </div>
+
+      {/* Issue #88 — PITR wizard. Timeline visualisation + datetime
+          picker + preview. Operator picks a target time between
+          backup.createdAt and the latest segment's archivedAt; we
+          show how many segments + bytes would replay before they
+          commit. Restore always creates a NEW DB (never clobbers). */}
+      {pitrSrc && (() => {
+        const baseTime = new Date(pitrSrc.createdAtUtc).getTime();
+        const latestSeg = pitrSegments.length > 0
+          ? new Date(pitrSegments[pitrSegments.length - 1].archivedAtUtc).getTime()
+          : baseTime;
+        const totalSpan = Math.max(latestSeg - baseTime, 1);
+        const targetMs = pitrTargetTime ? new Date(pitrTargetTime).getTime() : baseTime;
+        const targetPct = Math.max(0, Math.min(100, ((targetMs - baseTime) / totalSpan) * 100));
+        return (
+          <div
+            onClick={() => !pitrRestoring && setPitrSrc(null)}
+            style={{
+              position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.5)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 60,
+            }}
+          >
+            <div onClick={e => e.stopPropagation()} style={{
+              background: 'white', padding: 24, maxWidth: 820, width: '94vw',
+              maxHeight: '90vh', overflow: 'auto',
+              border: '1px solid var(--gray-200)',
+            }}>
+              <h2 style={{ margin: 0, fontSize: 20, marginBottom: 4 }}>⏱ Restore to point-in-time</h2>
+              <div style={{ fontSize: 13, color: 'var(--gray-700)', marginBottom: 14, lineHeight: 1.5 }}>
+                Roll forward from a base backup to <strong>any moment</strong> between when it was taken and the most recent archived flush. Restore goes to a <strong>new database name</strong> — the source is never touched.
+              </div>
+
+              {/* Timeline visualisation */}
+              <div style={{ marginBottom: 18 }}>
+                <div style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--gray-500)', marginBottom: 6, display: 'flex', justifyContent: 'space-between' }}>
+                  <span>● base backup · {new Date(pitrSrc.createdAtUtc).toLocaleString()}</span>
+                  <span>{pitrSegments.length} segment{pitrSegments.length === 1 ? '' : 's'} on the timeline</span>
+                  <span>latest segment · {latestSeg > baseTime ? new Date(latestSeg).toLocaleString() : '—'}</span>
+                </div>
+                <div style={{
+                  position: 'relative', height: 40, background: 'var(--gray-100)',
+                  border: '1px solid var(--gray-200)',
+                }}>
+                  {/* Segment markers */}
+                  {pitrSegments.map(s => {
+                    const t = new Date(s.archivedAtUtc).getTime();
+                    const pct = Math.max(0, Math.min(100, ((t - baseTime) / totalSpan) * 100));
+                    return (
+                      <div
+                        key={s.sequenceNumber}
+                        title={`seq ${s.sequenceNumber} · ${new Date(s.archivedAtUtc).toLocaleString()} · ${(s.byteCount / 1024).toFixed(1)} KB · ${s.recordCount} records`}
+                        style={{
+                          position: 'absolute', left: `${pct}%`, top: 4, bottom: 4,
+                          width: 2, background: 'var(--gray-500)',
+                        }}
+                      />
+                    );
+                  })}
+                  {/* Target time indicator */}
+                  <div style={{
+                    position: 'absolute', left: `${targetPct}%`, top: -4, bottom: -4,
+                    width: 3, background: 'var(--red)', transform: 'translateX(-1.5px)',
+                  }} />
+                  <div style={{
+                    position: 'absolute', left: `${targetPct}%`, top: -22,
+                    transform: 'translateX(-50%)', fontSize: 11, fontFamily: 'var(--mono)',
+                    color: 'var(--red)', fontWeight: 600, whiteSpace: 'nowrap',
+                  }}>
+                    target ▼
+                  </div>
+                </div>
+              </div>
+
+              {/* Target picker + new name */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, marginBottom: 14 }}>
+                <div>
+                  <label style={labelStyle()}>Recover to (your local time)</label>
+                  <input
+                    type="datetime-local"
+                    step="1"
+                    value={pitrTargetTime}
+                    onChange={e => { setPitrTargetTime(e.target.value); setPitrPreview(null); }}
+                    style={inputStyle()}
+                  />
+                  <div style={{ fontSize: 11, color: 'var(--gray-500)', marginTop: 4 }}>
+                    earliest: {new Date(pitrSrc.createdAtUtc).toLocaleString()}
+                  </div>
+                </div>
+                <div>
+                  <label style={labelStyle()}>Restore as new database name</label>
+                  <input
+                    type="text"
+                    value={pitrNewName}
+                    onChange={e => setPitrNewName(e.target.value)}
+                    style={inputStyle()}
+                  />
+                </div>
+              </div>
+
+              <div style={{ display: 'flex', gap: 8, marginBottom: 14 }}>
+                <button onClick={previewPitrNow} disabled={pitrPreviewing || !pitrTargetTime} style={ghostBtn()}>
+                  {pitrPreviewing ? 'Previewing…' : '⌕ Preview what would replay'}
+                </button>
+              </div>
+
+              {pitrPreview && (
+                <div style={{
+                  padding: 12, marginBottom: 14,
+                  background: pitrPreview.feasibleToRestore ? 'rgba(40,160,80,0.08)' : 'rgba(217,4,41,0.08)',
+                  color: pitrPreview.feasibleToRestore ? 'rgb(20,120,60)' : 'var(--red)',
+                  fontFamily: 'var(--mono)', fontSize: 12,
+                }}>
+                  {pitrPreview.feasibleToRestore ? (
+                    <>
+                      ✓ Feasible · {pitrPreview.segmentCount} segment{pitrPreview.segmentCount === 1 ? '' : 's'} · {(pitrPreview.bytesToReplay / 1024).toFixed(1)} KB of page writes will replay
+                      {pitrPreview.sequenceGaps.length > 0 && (
+                        <div style={{ color: 'var(--red)', marginTop: 6 }}>
+                          ⚠ {pitrPreview.sequenceGaps.length} sequence gap{pitrPreview.sequenceGaps.length === 1 ? '' : 's'} detected — some segments are missing. Restore will proceed but those page writes won't be applied. Acceptable when later writes overwrite the missing pages.
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <>✗ Cannot restore: {pitrPreview.refusalReason}</>
+                  )}
+                </div>
+              )}
+
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                <button onClick={() => setPitrSrc(null)} disabled={pitrRestoring} style={ghostBtn()}>Cancel</button>
+                <button
+                  onClick={confirmPitr}
+                  disabled={pitrRestoring || !pitrTargetTime || !pitrNewName.trim() || (pitrPreview ? !pitrPreview.feasibleToRestore : false)}
+                  style={primaryBtn(pitrRestoring || !pitrTargetTime || !pitrNewName.trim() || (pitrPreview ? !pitrPreview.feasibleToRestore : false))}
+                >
+                  {pitrRestoring ? 'Restoring…' : '⏱ Commit point-in-time restore'}
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </>
   );
 }
