@@ -32,7 +32,7 @@ public static class DatabaseEndpoints
     /// is where a path-less <c>POST /databases</c> drops the new <c>.dfdb</c>
     /// (defaults to <c>{dataDir}/{name}.dfdb</c>).
     /// </summary>
-    public static void Map(IEndpointRouteBuilder app, DatabaseRegistry registry, string defaultDataDir, DatabaseCatalog? catalog = null)
+    public static void Map(IEndpointRouteBuilder app, DatabaseRegistry registry, string defaultDataDir, DatabaseCatalog? catalog = null, BackupManager? backupManager = null)
     {
         // List every attached database. Stable shape across phases.
         // Admin-scoped: enumerating tenants would leak names to a
@@ -190,6 +190,138 @@ public static class DatabaseEndpoints
             });
         });
 
+        // ----------------------------------------------------------------
+        // Issue #87 — backup + recovery. Per-DB snapshots, all-at-once
+        // backups, list/restore/delete, plus settings (backup dir +
+        // retention count) persisted to _system.backup_config.
+        // ----------------------------------------------------------------
+
+        app.MapGet("/admin/backup/config", (HttpContext ctx) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (backupManager is null)
+                return Results.NotFound(new { error = "Backup manager not configured." });
+            var cfg = backupManager.GetConfig();
+            return Results.Ok(new
+            {
+                backupDir = backupManager.EffectiveBackupDir,
+                backupDirConfigured = cfg?.BackupDir,
+                retentionCount = backupManager.EffectiveRetentionCount,
+                scheduleCron = cfg?.ScheduleCron,
+            });
+        });
+
+        app.MapPut("/admin/backup/config", (HttpContext ctx, BackupConfigBody body) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (backupManager is null)
+                return Results.NotFound(new { error = "Backup manager not configured." });
+            try
+            {
+                backupManager.SaveConfig(new BackupConfig
+                {
+                    BackupDir = string.IsNullOrWhiteSpace(body.BackupDir) ? null : body.BackupDir,
+                    RetentionCount = body.RetentionCount ?? 10,
+                    ScheduleCron = string.IsNullOrWhiteSpace(body.ScheduleCron) ? null : body.ScheduleCron,
+                });
+                return Results.Ok(new { saved = true });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        app.MapPost("/databases/{name}/backup", (HttpContext ctx, string name) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (backupManager is null)
+                return Results.NotFound(new { error = "Backup manager not configured." });
+            try
+            {
+                var record = backupManager.BackupOne(name);
+                return Results.Created($"/admin/backups/{record.Id}", BackupToWire(record));
+            }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        app.MapPost("/admin/backup/all", (HttpContext ctx) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (backupManager is null)
+                return Results.NotFound(new { error = "Backup manager not configured." });
+            var result = backupManager.BackupAll();
+            return Results.Ok(new
+            {
+                count = result.Backups.Count,
+                errors = result.Errors,
+                backups = result.Backups.Select(BackupToWire).ToList(),
+            });
+        });
+
+        app.MapGet("/admin/backups", (HttpContext ctx) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (backupManager is null)
+                return Results.NotFound(new { error = "Backup manager not configured." });
+            var rows = backupManager.ListBackups();
+            return Results.Ok(new { count = rows.Count, backups = rows.Select(BackupToWire).ToList() });
+        });
+
+        app.MapGet("/databases/{name}/backups", (HttpContext ctx, string name) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (backupManager is null)
+                return Results.NotFound(new { error = "Backup manager not configured." });
+            var rows = backupManager.ListBackups(name);
+            return Results.Ok(new { database = name, count = rows.Count, backups = rows.Select(BackupToWire).ToList() });
+        });
+
+        app.MapDelete("/admin/backups/{backupId}", (HttpContext ctx, string backupId) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (backupManager is null)
+                return Results.NotFound(new { error = "Backup manager not configured." });
+            var removed = backupManager.DeleteBackup(backupId);
+            return removed
+                ? Results.Ok(new { deleted = backupId })
+                : Results.NotFound(new { error = $"Backup '{backupId}' not found." });
+        });
+
+        app.MapPost("/admin/backup/restore", (HttpContext ctx, RestoreBody body) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (backupManager is null)
+                return Results.NotFound(new { error = "Backup manager not configured." });
+            if (string.IsNullOrWhiteSpace(body.BackupId))
+                return Results.BadRequest(new { error = "Missing 'backupId'." });
+            if (string.IsNullOrWhiteSpace(body.NewDatabaseName))
+                return Results.BadRequest(new { error = "Missing 'newDatabaseName'." });
+            try
+            {
+                var path = backupManager.RestoreToNewDatabase(body.BackupId, body.NewDatabaseName);
+                // Persist the new attach so it survives the next restart.
+                catalog?.RecordAttach(body.NewDatabaseName, path);
+                return Results.Ok(new
+                {
+                    database = body.NewDatabaseName,
+                    filePath = path,
+                    restoredFrom = body.BackupId,
+                });
+            }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            catch (InvalidOperationException ex) { return Results.Conflict(new { error = ex.Message }); }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        static object BackupToWire(BackupRecord r) => new
+        {
+            id = r.Id,
+            database = r.Database,
+            path = r.Path,
+            sizeBytes = r.SizeBytes,
+            createdAtUtc = r.CreatedAtUtc.ToString("O"),
+            kind = r.Kind,
+        };
+
         // Create-or-attach (Studio "+ Add Database").
         //   { "name": "acme" }                            -> {dataDir}/acme.dfdb, create-or-attach
         //   { "name": "acme", "path": "/abs/p.dfdb" }     -> use the supplied path, create-or-attach
@@ -299,19 +431,27 @@ public static class DatabaseEndpoints
             // Heuristic recommendation. The bad-state we most want to
             // surface to the operator is "catalog empty but file has
             // way more bytes than an empty DB ever would" — that's the
-            // classic Issue #85 scenario (catalog page corrupted, data
-            // pages intact, rebuild can recover it).
-            const long EmptyDbApproxBytes = 32 * 1024; // 2 pages of overhead
+            // classic Issue #85/#86 scenario (catalog page corrupted,
+            // data pages intact, rebuild can recover it).
+            //
+            // Threshold: an empty DB on disk is exactly 16 KB (page 0
+            // header + page 1 empty catalog). Any byte beyond that is
+            // at least one additional page — meaning there's SOMETHING
+            // in the file the catalog isn't pointing at. Stricter than
+            // the original 32 KB threshold because a single data page
+            // (8 KB) brings the file to 24 KB, which is genuinely
+            // suspicious in a "no collections" engine.
+            const long EmptyDbStrictBytes = 16 * 1024;
             string recommendation;
             string? recommendationDetail;
-            if (collectionNames.Count == 0 && dataInfo.Length > EmptyDbApproxBytes)
+            if (collectionNames.Count == 0 && dataInfo.Length > EmptyDbStrictBytes)
             {
                 recommendation = "rebuild-catalog";
                 recommendationDetail =
                     $"Catalog reports 0 collections but the data file is {dataInfo.Length:N0} bytes " +
-                    "(an empty database is ~32 KB). Document pages are probably intact but the " +
-                    "catalog page that names them is empty or zeroed. POST /databases/" + name +
-                    "/rebuild-catalog scans the data pages and reconstructs the catalog.";
+                    "(an empty database is exactly 16,384 bytes). At least one extra page is sitting " +
+                    "in the file the catalog doesn't point at — the catalog page that names them is " +
+                    "probably zeroed. Use the Rebuild catalog flow to scan data pages and reconstruct it.";
             }
             else if (recoveryInfo.Exists && recoveryInfo.Length > 0)
             {
@@ -735,3 +875,8 @@ public record PromoteBody(int Port);
 /// the Studio "+ Add" UX works without a file existing yet.
 /// </summary>
 public record CreateDatabaseRequest(string Name, string? Path = null, bool? CreateIfMissing = null);
+
+// Issue #87 — backup config + restore payloads. Kept narrow on purpose;
+// schedule + offsite shipping fields will land in follow-up iterations.
+public record BackupConfigBody(string? BackupDir = null, int? RetentionCount = null, string? ScheduleCron = null);
+public record RestoreBody(string BackupId, string NewDatabaseName);

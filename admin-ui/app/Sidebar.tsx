@@ -99,6 +99,7 @@ export function Sidebar() {
         <Link href="/databases">⊟ Databases</Link>
         <Link href="/topology">⌬ Topology</Link>
         <Link href="/admin">⚙ Admin</Link>
+        <Link href="/admin/backups">💾 Backups</Link>
         <Link href="/admin/keys">🔑 API Keys</Link>
         <Link href="/connections">⇋ Connections</Link>
       </nav>
@@ -107,7 +108,7 @@ export function Sidebar() {
         marginTop: 'auto', fontSize: 11, color: '#666',
         fontFamily: 'var(--mono)', letterSpacing: '0.05em', paddingTop: 40
       }}>
-        v1.2.1 · MIT
+        v1.3.0 · MIT
       </div>
     </aside>
   );

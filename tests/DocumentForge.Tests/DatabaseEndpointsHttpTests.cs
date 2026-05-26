@@ -495,6 +495,206 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
         // — that's fine, the endpoint only globs *.dfdb.
     }
 
+    // Issue #87 — backup + restore. Single-DB happy path proves the
+    // whole wiring (BackupManager, endpoint, system-DB audit row,
+    // restore-to-new-name semantics, recovered data integrity).
+    [Fact]
+    public async Task BackupRestore_HappyPath_RecoversAllDocuments()
+    {
+        // Spin up a service with a real BackupManager + DatabaseCatalog
+        // so the system DB writes that back the audit row + the post-
+        // restore catalog record both work.
+        var (registry, baseUrl, dataDir, _, _) = BootServerWithBackup();
+
+        // Set up a tenant DB with a known doc set.
+        var attach = await _http.PostAsJsonAsync($"{baseUrl}/databases",
+            new { name = "tenant_x" });
+        attach.EnsureSuccessStatusCode();
+        for (int i = 0; i < 6; i++)
+        {
+            var body = new StringContent($$"""{"pnr":"X{{i}}"}""",
+                System.Text.Encoding.UTF8, "application/json");
+            (await _http.PostAsync($"{baseUrl}/db/tenant_x/collections/pnrs", body))
+                .EnsureSuccessStatusCode();
+        }
+
+        // Take a backup.
+        var bkResp = await _http.PostAsync($"{baseUrl}/databases/tenant_x/backup", content: null);
+        Assert.Equal(System.Net.HttpStatusCode.Created, bkResp.StatusCode);
+        var backup = await bkResp.Content.ReadFromJsonAsync<BackupWireRow>();
+        Assert.NotNull(backup);
+        Assert.Equal("tenant_x", backup!.Database);
+        Assert.True(File.Exists(backup.Path));
+        Assert.True(backup.SizeBytes > 0);
+
+        // Audit row visible in the list.
+        var list = await _http.GetFromJsonAsync<BackupListWire>($"{baseUrl}/admin/backups");
+        Assert.Equal(1, list!.Count);
+        Assert.Equal(backup.Id, list.Backups[0].Id);
+
+        // Restore as a NEW DB name.
+        var restoreResp = await _http.PostAsJsonAsync($"{baseUrl}/admin/backup/restore",
+            new { backupId = backup.Id, newDatabaseName = "tenant_x_restored" });
+        restoreResp.EnsureSuccessStatusCode();
+        var restored = await restoreResp.Content.ReadFromJsonAsync<RestoreWire>();
+        Assert.Equal("tenant_x_restored", restored!.Database);
+        Assert.NotNull(registry.TryGet("tenant_x_restored"));
+
+        // The restored DB has every doc the source had.
+        var q = await _http.PostAsJsonAsync($"{baseUrl}/db/tenant_x_restored/query",
+            new { sql = "SELECT * FROM pnrs" });
+        q.EnsureSuccessStatusCode();
+        var body2 = await q.Content.ReadAsStringAsync();
+        for (int i = 0; i < 6; i++) Assert.Contains($"\"X{i}\"", body2);
+    }
+
+    [Fact]
+    public async Task BackupRestore_RestoreToExistingName_Refused()
+    {
+        // Restore must never clobber an already-attached DB. The whole
+        // point of "restore as a new name" is that the source survives
+        // even if you fat-finger the target.
+        var (_, baseUrl, _, _, _) = BootServerWithBackup();
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "alpha" });
+        var body = new StringContent("""{"x":1}""", System.Text.Encoding.UTF8, "application/json");
+        await _http.PostAsync($"{baseUrl}/db/alpha/collections/things", body);
+        var bkResp = await _http.PostAsync($"{baseUrl}/databases/alpha/backup", content: null);
+        var backup = await bkResp.Content.ReadFromJsonAsync<BackupWireRow>();
+
+        // Try to restore using the source name — refuse with 409.
+        var resp = await _http.PostAsJsonAsync($"{baseUrl}/admin/backup/restore",
+            new { backupId = backup!.Id, newDatabaseName = "alpha" });
+        Assert.Equal(System.Net.HttpStatusCode.Conflict, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task BackupConfig_Roundtrip_Persists()
+    {
+        var (_, baseUrl, dataDir, _, _) = BootServerWithBackup();
+
+        var custom = Path.Combine(dataDir, "_backups_custom");
+        var put = await _http.PutAsJsonAsync($"{baseUrl}/admin/backup/config",
+            new { backupDir = custom, retentionCount = 25 });
+        put.EnsureSuccessStatusCode();
+
+        var read = await _http.GetFromJsonAsync<BackupConfigWire>(
+            $"{baseUrl}/admin/backup/config");
+        Assert.NotNull(read);
+        Assert.Equal(custom, read!.BackupDirConfigured);
+        Assert.Equal(custom, read.BackupDir);
+        Assert.Equal(25, read.RetentionCount);
+    }
+
+    [Fact]
+    public async Task BackupRetention_PrunesOlderBeyondLimit()
+    {
+        // With retention = 3, the 4th backup of a single DB should
+        // evict the oldest. The retention sweep runs inline at the
+        // end of each BackupOne call.
+        var (_, baseUrl, _, _, _) = BootServerWithBackup();
+        await _http.PutAsJsonAsync($"{baseUrl}/admin/backup/config",
+            new { retentionCount = 3 });
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "victim" });
+        // Need real content so each snapshot is a distinct file.
+        var body = new StringContent("""{"v":1}""", System.Text.Encoding.UTF8, "application/json");
+        await _http.PostAsync($"{baseUrl}/db/victim/collections/x", body);
+
+        var ids = new List<string>();
+        for (int i = 0; i < 4; i++)
+        {
+            // Small delay so timestamps don't collide in the filename.
+            await Task.Delay(5);
+            var r = await _http.PostAsync($"{baseUrl}/databases/victim/backup", content: null);
+            var rec = await r.Content.ReadFromJsonAsync<BackupWireRow>();
+            ids.Add(rec!.Id);
+        }
+
+        var list = await _http.GetFromJsonAsync<BackupListWire>(
+            $"{baseUrl}/databases/victim/backups");
+        Assert.Equal(3, list!.Count);
+        // The oldest (ids[0]) should have been pruned.
+        Assert.DoesNotContain(list.Backups, b => b.Id == ids[0]);
+    }
+
+    [Fact]
+    public async Task BackupAll_HandlesMultipleAttachedTenants()
+    {
+        var (_, baseUrl, _, _, _) = BootServerWithBackup();
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "ten_a" });
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "ten_b" });
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "ten_c" });
+
+        var resp = await _http.PostAsync($"{baseUrl}/admin/backup/all", content: null);
+        resp.EnsureSuccessStatusCode();
+        var summary = await resp.Content.ReadFromJsonAsync<BackupAllWire>();
+        Assert.Equal(3, summary!.Count);
+        Assert.Empty(summary.Errors);
+    }
+
+    /// <summary>Boot a server with the BackupManager wired up — used
+    /// only by Issue #87 tests; everything else still uses the simpler
+    /// fixture without it.</summary>
+    private (DatabaseRegistry registry, string baseUrl, string dataDir, DatabaseCatalog catalog, BackupManager backup)
+        BootServerWithBackup()
+    {
+        var port = FindFreePort();
+        var dataDir = Path.Combine(Path.GetTempPath(), $"bk_{Guid.NewGuid():N}");
+        Directory.CreateDirectory(dataDir);
+        _dirs.Add(dataDir);
+
+        var registry = new DatabaseRegistry();
+        _disposables.Add(registry);
+        registry.AttachOrCreate("_system", Path.Combine(dataDir, "_system.dfdb"));
+        var catalog = new DatabaseCatalog(registry);
+        var backup = new BackupManager(registry, dataDir);
+
+        var builder = WebApplication.CreateBuilder();
+        builder.Logging.ClearProviders();
+        builder.WebHost.UseUrls($"http://127.0.0.1:{port}");
+        var app = builder.Build();
+        app.Use(async (ctx, next) =>
+        {
+            ctx.Items[AuthContext.ContextKey] = AuthContext.DevMode();
+            await next();
+        });
+        DatabaseEndpoints.Map(app, registry, dataDir, catalog, backup);
+        app.StartAsync().GetAwaiter().GetResult();
+        _disposables.Add(new HostStopper(app));
+        return (registry, $"http://127.0.0.1:{port}", dataDir, catalog, backup);
+    }
+
+    private sealed class BackupWireRow
+    {
+        public string Id { get; set; } = "";
+        public string Database { get; set; } = "";
+        public string Path { get; set; } = "";
+        public long SizeBytes { get; set; }
+        public string CreatedAtUtc { get; set; } = "";
+        public string Kind { get; set; } = "";
+    }
+    private sealed class BackupListWire
+    {
+        public int Count { get; set; }
+        public List<BackupWireRow> Backups { get; set; } = new();
+    }
+    private sealed class BackupAllWire
+    {
+        public int Count { get; set; }
+        public List<string> Errors { get; set; } = new();
+    }
+    private sealed class BackupConfigWire
+    {
+        public string BackupDir { get; set; } = "";
+        public string? BackupDirConfigured { get; set; }
+        public int RetentionCount { get; set; }
+    }
+    private sealed class RestoreWire
+    {
+        public string Database { get; set; } = "";
+        public string FilePath { get; set; } = "";
+        public string RestoredFrom { get; set; } = "";
+    }
+
     // Issue #86 — rebuild-catalog. Plan + execute against a real DB
     // whose catalog page has been zeroed out (simulating the bbqdubai
     // scenario). The rebuilder discovers the data chain and reconstructs

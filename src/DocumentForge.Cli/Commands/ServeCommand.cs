@@ -82,6 +82,12 @@ public static class ServeCommand
         // every Attach/Detach/Drop call.
         var dbCatalog = new DatabaseCatalog(registry);
         var bootstrap = dbCatalog.Bootstrap(config.DataDir);
+
+        // Issue #87 — backup + recovery. Reads/writes settings to
+        // _system.backup_config and audit rows to _system.backups.
+        // Default backup dir is {data-dir}/backups; operators can
+        // override via Studio's Backups settings panel.
+        var backupManager = new BackupManager(registry, config.DataDir);
         if (bootstrap.Errors.Count > 0)
         {
             foreach (var err in bootstrap.Errors)
@@ -257,7 +263,7 @@ public static class ServeCommand
         // data-plane routes still resolve to registry.GetDefault() so
         // single-DB clients see no change. The catalog argument (Issue
         // #82) means attach/detach state survives restarts.
-        DatabaseEndpoints.Map(app, registry, config.DataDir, dbCatalog);
+        DatabaseEndpoints.Map(app, registry, config.DataDir, dbCatalog, backupManager);
 
         // Issue #66 Phase 5: service orchestration. Lets Studio (or a CLI)
         // spawn sibling dfdb serve processes from one running service —
@@ -943,7 +949,7 @@ public static class ServeCommand
             {
                 status = healthy ? "ok" : "degraded",
                 node = config.NodeName,
-                version = "1.2.1",
+                version = "1.3.0",
                 readOnly = db.IsReadOnly,
                 uptimeSeconds = Math.Round((DateTime.UtcNow - _startedAt).TotalSeconds, 1),
                 health = healthy ? null : new

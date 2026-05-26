@@ -441,6 +441,79 @@ export async function executeRebuildCatalog(path: string, opts?: CallOptions): P
   return handle(r);
 }
 
+// Issue #87 — backups. Per-DB snapshot, list, restore-to-new-name,
+// retention config. Designed for "non-SQL dev" workflows: every action
+// is a one-click affair, and "restore" always creates a fresh DB so the
+// source is never clobbered.
+export interface BackupRow {
+  id: string;
+  database: string;
+  path: string;
+  sizeBytes: number;
+  createdAtUtc: string;
+  kind: 'manual' | 'scheduled' | string;
+}
+export interface BackupListResponse {
+  count: number;
+  backups: BackupRow[];
+  database?: string;
+}
+export interface BackupConfigResponse {
+  backupDir: string;             // effective (may be the default)
+  backupDirConfigured: string | null;  // null when defaulting
+  retentionCount: number;
+  scheduleCron: string | null;
+}
+export async function listAllBackups(opts?: CallOptions): Promise<BackupListResponse> {
+  const r = await fetch(urlFor('/admin/backups', opts), { headers: authHeaders(opts) });
+  return handle(r);
+}
+export async function listBackupsForDb(dbName: string, opts?: CallOptions): Promise<BackupListResponse> {
+  const r = await fetch(urlFor(`/databases/${encodeURIComponent(dbName)}/backups`, opts), { headers: authHeaders(opts) });
+  return handle(r);
+}
+export async function backupDatabase(dbName: string, opts?: CallOptions): Promise<BackupRow> {
+  const r = await fetch(urlFor(`/databases/${encodeURIComponent(dbName)}/backup`, opts), {
+    method: 'POST',
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+export async function backupAllDatabases(opts?: CallOptions): Promise<{ count: number; errors: string[]; backups: BackupRow[] }> {
+  const r = await fetch(urlFor('/admin/backup/all', opts), {
+    method: 'POST',
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+export async function deleteBackup(backupId: string, opts?: CallOptions): Promise<void> {
+  const r = await fetch(urlFor(`/admin/backups/${encodeURIComponent(backupId)}`, opts), {
+    method: 'DELETE',
+    headers: authHeaders(opts),
+  });
+  return handle(r);
+}
+export async function restoreBackup(backupId: string, newDatabaseName: string, opts?: CallOptions): Promise<{ database: string; filePath: string; restoredFrom: string }> {
+  const r = await fetch(urlFor('/admin/backup/restore', opts), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
+    body: JSON.stringify({ backupId, newDatabaseName }),
+  });
+  return handle(r);
+}
+export async function getBackupConfig(opts?: CallOptions): Promise<BackupConfigResponse> {
+  const r = await fetch(urlFor('/admin/backup/config', opts), { headers: authHeaders(opts) });
+  return handle(r);
+}
+export async function saveBackupConfig(cfg: { backupDir?: string | null; retentionCount?: number; scheduleCron?: string | null }, opts?: CallOptions): Promise<void> {
+  const r = await fetch(urlFor('/admin/backup/config', opts), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', ...authHeaders(opts) },
+    body: JSON.stringify(cfg),
+  });
+  return handle(r);
+}
+
 // ---------- Per-DB replication (Issue #66 Phase 2.5) ----------
 // Phase 2.5 scoped endpoints under /db/{name}/replication/*. Each attached
 // DB has its own role; Studio's topology page uses these to render and
