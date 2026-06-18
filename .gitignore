@@ -50,3 +50,6 @@ tsconfig.tsbuildinfo
 # Local DocumentForge runtime data (not source)
 data/
 data.bak/
+
+## ScaleBench data (large .dfdb files + run logs) - never commit
+scalebench-data/
