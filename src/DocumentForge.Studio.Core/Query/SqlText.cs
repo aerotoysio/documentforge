@@ -13,6 +13,12 @@ public static partial class SqlText
     [GeneratedRegex(@"\bLIMIT\b", RegexOptions.IgnoreCase)]
     private static partial Regex LimitRegex();
 
+    [GeneratedRegex(@"\bJOIN\b", RegexOptions.IgnoreCase)]
+    private static partial Regex JoinRegex();
+
+    [GeneratedRegex(@"^\s*SELECT\b.*?\bFROM\s+([A-Za-z_][A-Za-z0-9_]*)", RegexOptions.IgnoreCase | RegexOptions.Singleline)]
+    private static partial Regex SelectFromRegex();
+
     public static bool IsSelect(string sql) => !string.IsNullOrWhiteSpace(sql) && SelectRegex().IsMatch(sql);
 
     public static bool HasLimit(string sql) => LimitRegex().IsMatch(sql);
@@ -48,6 +54,20 @@ public static partial class SqlText
     }
 
     public static string BuildDropIndex(string indexName) => $"DROP INDEX {indexName}";
+
+    /// <summary>True when a SELECT targets exactly one collection (no JOIN), so
+    /// its rows can be written back by <c>_id</c>. This is a necessary condition
+    /// for an editable grid; the caller still checks that rows actually carry
+    /// <c>_id</c>/<c>_etag</c> (aggregates/projections won't).</summary>
+    public static bool TrySelectSingleCollection(string sql, out string collection)
+    {
+        collection = "";
+        if (!IsSelect(sql) || JoinRegex().IsMatch(sql)) return false;
+        var match = SelectFromRegex().Match(sql);
+        if (!match.Success) return false;
+        collection = match.Groups[1].Value;
+        return true;
+    }
 
     /// <summary>A reasonable default index name from a collection + its paths,
     /// e.g. idx_orders_status_createdAt. Callers can override.</summary>

@@ -87,6 +87,24 @@ public static class ResultTable
         return sb.ToString();
     }
 
+    /// <summary>The grid display text for one field of a document (same rendering
+    /// the grid uses), or null if the field is absent. Used to revert a cell.</summary>
+    public static string? RenderField(string json, string field)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(json);
+            return doc.RootElement.ValueKind == JsonValueKind.Object
+                   && doc.RootElement.TryGetProperty(field, out var el)
+                ? RenderCell(el)
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
     private static readonly JsonSerializerOptions IndentedJson = new() { WriteIndented = true };
 
     private static void EnsureValueColumn(DataTable table, HashSet<string> columns)

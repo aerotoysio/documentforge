@@ -59,6 +59,59 @@ public sealed class SqlTextTests
         Assert.Equal("idx_flights_flightNumber",
             SqlText.SuggestIndexName("flights", ["flightNumber"]));
     }
+
+    [Theory]
+    [InlineData("SELECT * FROM orders", true, "orders")]
+    [InlineData("select * from flights where seatsRemaining > 0", true, "flights")]
+    [InlineData("SELECT * FROM orders o JOIN flights f ON o.x = f.y", false, "")]
+    [InlineData("SELECT COUNT(*) FROM orders", true, "orders")]
+    [InlineData("INSERT INTO orders VALUES {}", false, "")]
+    public void TrySelectSingleCollection(string sql, bool expected, string collection)
+    {
+        Assert.Equal(expected, SqlText.TrySelectSingleCollection(sql, out var c));
+        Assert.Equal(collection, c);
+    }
+}
+
+public sealed class DocumentEditTests
+{
+    [Fact]
+    public void ApplyCellEdit_Preserves_Field_Types()
+    {
+        var json = """{"pnr":"ABC","seats":3,"active":true,"_etag":"e1"}""";
+
+        Assert.Contains("\"pnr\":\"XYZ\"", DocumentEdit.ApplyCellEdit(json, "pnr", "XYZ"));
+        // number field stays a number (unquoted)
+        Assert.Contains("\"seats\":5", DocumentEdit.ApplyCellEdit(json, "seats", "5"));
+        // bool field stays a bool
+        Assert.Contains("\"active\":false", DocumentEdit.ApplyCellEdit(json, "active", "false"));
+    }
+
+    [Fact]
+    public void ApplyCellEdit_Reparses_Object_And_Array_Cells()
+    {
+        var json = """{"passenger":{"first":"Jane"},"tags":[1,2]}""";
+        Assert.Contains("\"first\":\"Ann\"",
+            DocumentEdit.ApplyCellEdit(json, "passenger", """{"first":"Ann"}"""));
+        Assert.Contains("\"tags\":[3,4]",
+            DocumentEdit.ApplyCellEdit(json, "tags", "[3,4]"));
+    }
+
+    [Fact]
+    public void ApplyCellEdit_Rejects_Bad_Json_For_Object_Field()
+    {
+        var json = """{"passenger":{"first":"Jane"}}""";
+        Assert.Throws<FormatException>(() => DocumentEdit.ApplyCellEdit(json, "passenger", "not json"));
+    }
+
+    [Fact]
+    public void ReadField_Extracts_Id_And_Etag()
+    {
+        var json = """{"_id":"abc123","_etag":"e9","name":"x"}""";
+        Assert.Equal("abc123", DocumentEdit.ReadField(json, "_id"));
+        Assert.Equal("e9", DocumentEdit.ReadField(json, "_etag"));
+        Assert.Null(DocumentEdit.ReadField(json, "missing"));
+    }
 }
 
 public sealed class ResultTableTests
