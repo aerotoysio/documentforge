@@ -23,6 +23,15 @@ public interface IDfConnection : IAsyncDisposable
     Task<DatabaseStats> GetStatsAsync(string database, CancellationToken ct = default);
     Task<ServerHealth> GetHealthAsync(CancellationToken ct = default);
 
+    /// <summary>Replaces a document by its internal <c>_id</c>, guarded by its
+    /// <c>_etag</c> (optimistic concurrency). Returns the new ETag. Throws
+    /// <see cref="EtagConflictException"/> if the document changed since it was
+    /// read, or <see cref="KeyNotFoundException"/> if it no longer exists.</summary>
+    Task<string> UpdateDocumentAsync(string database, string collection, string id, string json, string expectedEtag, CancellationToken ct = default);
+
+    /// <summary>Deletes a document by its internal <c>_id</c>.</summary>
+    Task DeleteDocumentAsync(string database, string collection, string id, CancellationToken ct = default);
+
     /// <summary>Requires <see cref="ConnectionCapabilities.CreateDatabase"/>.</summary>
     Task<DatabaseInfo> CreateDatabaseAsync(string name, CancellationToken ct = default);
 

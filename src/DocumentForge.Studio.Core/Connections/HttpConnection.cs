@@ -1,6 +1,7 @@
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using DocumentForge.Studio.Core.Models;
@@ -140,6 +141,46 @@ public sealed class HttpConnection : IDfConnection
             Detail: dto.Health?.LastFailure);
     }
 
+    public async Task<string> UpdateDocumentAsync(string database, string collection, string id, string json, string expectedEtag, CancellationToken ct = default)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Put,
+            $"db/{Uri.EscapeDataString(database)}/collections/{Uri.EscapeDataString(collection)}/{Uri.EscapeDataString(id)}")
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json"),
+        };
+        request.Headers.TryAddWithoutValidation("If-Match", expectedEtag);
+
+        using var response = await _http.SendAsync(request, ct).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+
+        if (response.StatusCode == HttpStatusCode.PreconditionFailed)
+        {
+            var (expected, actual) = ExtractEtagConflict(body);
+            throw new EtagConflictException(expected, actual, ExtractError(body, response.StatusCode));
+        }
+        if (response.StatusCode == HttpStatusCode.NotFound)
+            throw new KeyNotFoundException($"Document '{id}' not found in '{collection}'.");
+        if (!response.IsSuccessStatusCode)
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+
+        using var doc = JsonDocument.Parse(body);
+        return doc.RootElement.TryGetProperty("etag", out var etag) ? etag.GetString() ?? "" : "";
+    }
+
+    public async Task DeleteDocumentAsync(string database, string collection, string id, CancellationToken ct = default)
+    {
+        using var response = await _http.DeleteAsync(
+            $"db/{Uri.EscapeDataString(database)}/collections/{Uri.EscapeDataString(collection)}/{Uri.EscapeDataString(id)}", ct)
+            .ConfigureAwait(false);
+        if (response.StatusCode == HttpStatusCode.NotFound)
+            throw new KeyNotFoundException($"Document '{id}' not found in '{collection}'.");
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        }
+    }
+
     public async Task<DatabaseInfo> CreateDatabaseAsync(string name, CancellationToken ct = default)
     {
         using var response = await _http.PostAsJsonAsync(
@@ -170,6 +211,24 @@ public sealed class HttpConnection : IDfConnection
             throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
         return JsonSerializer.Deserialize<T>(body, Json)
                ?? throw new DfHttpException(response.StatusCode, "Empty response from server.");
+    }
+
+    /// <summary>Pulls the expected/actual ETags out of a 412 body
+    /// (<c>{ "expected": …, "actual": … }</c>), tolerating their absence.</summary>
+    private static (string? Expected, string? Actual) ExtractEtagConflict(string body)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            var root = doc.RootElement;
+            var expected = root.TryGetProperty("expected", out var e) ? e.GetString() : null;
+            var actual = root.TryGetProperty("actual", out var a) ? a.GetString() : null;
+            return (expected, actual);
+        }
+        catch (JsonException)
+        {
+            return (null, null);
+        }
     }
 
     private static string ExtractError(string body, HttpStatusCode status)

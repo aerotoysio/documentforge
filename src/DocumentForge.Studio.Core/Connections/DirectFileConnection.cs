@@ -101,6 +101,34 @@ public sealed class DirectFileConnection : IDfConnection
             Detail: db.LastHealthFailure?.Message));
     }
 
+    public Task<string> UpdateDocumentAsync(string database, string collection, string id, string json, string expectedEtag, CancellationToken ct = default) =>
+        Task.Run(() =>
+        {
+            var db = EnsureConnected();
+            var docId = new DocumentId(Guid.Parse(id));
+            try
+            {
+                var newEtag = db.ReplaceIfEtag(collection, docId, json, expectedEtag);
+                if (newEtag is null) throw new KeyNotFoundException($"Document '{id}' not found in '{collection}'.");
+                return newEtag;
+            }
+            catch (EtagMismatchException ex)
+            {
+                throw new EtagConflictException(ex.ExpectedEtag, ex.ActualEtag, ex.Message);
+            }
+        }, ct);
+
+    public Task DeleteDocumentAsync(string database, string collection, string id, CancellationToken ct = default) =>
+        Task.Run(() =>
+        {
+            var db = EnsureConnected();
+            var coll = db.GetCollection(collection)
+                       ?? throw new KeyNotFoundException($"Collection '{collection}' not found.");
+            var docId = new DocumentId(Guid.Parse(id));
+            var doc = coll.FindById(docId) ?? throw new KeyNotFoundException($"Document '{id}' not found.");
+            if (coll.Delete(docId)) db.NotifyDocDeleted(collection, docId, doc);
+        }, ct);
+
     public Task<DatabaseInfo> CreateDatabaseAsync(string name, CancellationToken ct = default) =>
         throw new NotSupportedException("A direct-file connection is a single database. Use File > New Database to create a new file.");
 

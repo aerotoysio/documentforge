@@ -1035,6 +1035,87 @@ public static class DatabaseEndpoints
                 }),
             });
         });
+
+        // Scoped document read by internal _id. Returns the document JSON and
+        // sets an ETag header, so a client (e.g. Studio's editable grid) can
+        // refetch the current version after a 412 conflict.
+        app.MapGet("/db/{name}/collections/{collection}/{id}", (HttpContext ctx, string name, string collection, string id) =>
+        {
+            if (ScopeCheck.RequireDbRead(ctx, name) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            if (!Guid.TryParse(id, out var guid))
+                return Results.BadRequest(new { error = "Expected DocumentForge's internal _id (a GUID)." });
+            var coll = db.GetCollection(collection);
+            var doc = coll?.FindById(new DocumentId(guid));
+            if (doc is null) return Results.NotFound();
+            return Results.Content(doc.ToJson(), "application/json");
+        });
+
+        // Scoped replace by internal _id, mirroring the flat PUT /collections/{name}/{id}
+        // including optimistic concurrency: an `If-Match: <etag>` header routes
+        // through ReplaceIfEtag and a mismatch returns 412 with the current ETag.
+        // Without the header it's last-write-wins.
+        app.MapPut("/db/{name}/collections/{collection}/{id}", async (HttpContext ctx, string name, string collection, string id, HttpRequest request) =>
+        {
+            if (ScopeCheck.RequireDbWrite(ctx, name) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            if (!Guid.TryParse(id, out var guid))
+                return Results.BadRequest(new { error = "Expected DocumentForge's internal _id (a GUID)." });
+
+            using var reader = new StreamReader(request.Body);
+            var json = await reader.ReadToEndAsync();
+            if (string.IsNullOrWhiteSpace(json)) return Results.BadRequest(new { error = "Empty body." });
+
+            var docId = new DocumentId(guid);
+            var ifMatch = NormaliseIfMatch(request.Headers["If-Match"].ToString());
+            try
+            {
+                if (!string.IsNullOrEmpty(ifMatch))
+                {
+                    string? newEtag;
+                    try { newEtag = db.ReplaceIfEtag(collection, docId, json, ifMatch); }
+                    catch (EtagMismatchException ex)
+                    {
+                        return Results.Json(new { error = ex.Message, expected = ex.ExpectedEtag, actual = ex.ActualEtag },
+                            statusCode: StatusCodes.Status412PreconditionFailed);
+                    }
+                    if (newEtag is null) return Results.NotFound();
+                    return Results.Ok(new { database = name, success = true, id = docId.ToString(), collection, etag = newEtag });
+                }
+
+                if (!db.Replace(collection, docId, json)) return Results.NotFound();
+                return Results.Ok(new { database = name, success = true, id = docId.ToString(), collection });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        // Scoped delete by internal _id.
+        app.MapDelete("/db/{name}/collections/{collection}/{id}", (HttpContext ctx, string name, string collection, string id) =>
+        {
+            if (ScopeCheck.RequireDbWrite(ctx, name) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            if (!Guid.TryParse(id, out var guid))
+                return Results.BadRequest(new { error = "Expected DocumentForge's internal _id (a GUID)." });
+            var coll = db.GetCollection(collection);
+            if (coll is null) return Results.NotFound();
+            var docId = new DocumentId(guid);
+            var doc = coll.FindById(docId);
+            if (doc is null) return Results.NotFound();
+            if (coll.Delete(docId)) db.NotifyDocDeleted(collection, docId, doc);
+            return Results.Ok(new { database = name, success = true, id = docId.ToString(), collection });
+        });
+    }
+
+    private static string NormaliseIfMatch(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return string.Empty;
+        var s = raw.Trim();
+        if (s.StartsWith("W/", StringComparison.Ordinal)) s = s[2..];
+        if (s.Length >= 2 && s[0] == '"' && s[^1] == '"') s = s[1..^1];
+        return s;
     }
 
     // Issue #73 — names beginning with an underscore are reserved for
