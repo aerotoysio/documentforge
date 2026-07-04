@@ -87,6 +87,7 @@ The skeleton everything else hangs off.
 - Collection browser tab: paged document list, filter bar (field = value builder → SQL), open document.
 - Document editor: JSON editor with validation; save uses ETag If-Match (HTTP) / ReplaceIfEtag (direct); 412 conflict dialog (theirs/mine diff-lite).
 - Insert document (template from a sampled doc), delete (single + by-field), bulk import from `.json`/`.ndjson` file (atomic toggle), bulk export of a collection/query result.
+- **Editable results grid** (Andrew's request, 2026-07-04): edit a cell in the query/browse grid → writes back via ETag-safe `ReplaceIfEtag`/`PUT If-Match`; only editable when the result carries `_id` (single-collection SELECT). Non-editable (joins/aggregates) stay read-only with a hint. Doubles as the inline-edit path for the collection browser.
 - Index manager: list with entry counts, create (path, composite, unique), drop, rebuild one/all.
 - Collection ops: create (implicit via first insert — surfaced honestly), drop, compact (with bytes-reclaimed result).
 
