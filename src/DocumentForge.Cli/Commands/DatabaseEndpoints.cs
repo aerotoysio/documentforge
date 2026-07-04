@@ -984,6 +984,57 @@ public static class DatabaseEndpoints
             }
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
+
+        // Scoped index list — the flat GET /indexes/{collection} only sees
+        // the default DB, which left Studio's Explorer blind for every other
+        // attached database. Shape mirrors the flat route.
+        app.MapGet("/db/{name}/indexes/{collection}", (HttpContext ctx, string name, string collection) =>
+        {
+            if (ScopeCheck.RequireDbRead(ctx, name) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null)
+                return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            var indexes = db.GetIndexes(collection);
+            return Results.Ok(new
+            {
+                database = name,
+                collection,
+                indexes = indexes.Select(i => new { name = i.Name, path = i.JsonPath, unique = i.IsUnique }),
+            });
+        });
+
+        // Scoped statistics — same gap as indexes. Unlike the flat /stats
+        // this reports the raw byte size alongside the rounded MB figure so
+        // programmatic callers don't have to un-round.
+        app.MapGet("/db/{name}/stats", (HttpContext ctx, string name) =>
+        {
+            if (ScopeCheck.RequireDbRead(ctx, name) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null)
+                return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            db.Flush();
+            var stats = db.GetStatistics();
+            return Results.Ok(new
+            {
+                database = name,
+                filePath = stats.FilePath,
+                fileSizeBytes = stats.FileSize,
+                fileSizeMb = Math.Round(stats.FileSize / 1024.0 / 1024.0, 2),
+                pageCount = stats.PageCount,
+                cachedPages = stats.CachedPages,
+                dirtyPages = stats.DirtyPages,
+                collections = stats.Collections.Select(c => new
+                {
+                    name = c.Name,
+                    documentCount = c.DocumentCount,
+                    indexCount = c.IndexCount,
+                    indexes = c.Indexes.Select(i => new
+                    {
+                        name = i.Name, path = i.JsonPath, entries = i.EntryCount, unique = i.IsUnique,
+                    }),
+                }),
+            });
+        });
     }
 
     // Issue #73 — names beginning with an underscore are reserved for

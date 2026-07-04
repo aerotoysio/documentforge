@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>DocumentForgeStudio</AssemblyName>
+    <RootNamespace>DocumentForge.Studio</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CommunityToolkit.Mvvm" Version="8.*" />
+    <PackageReference Include="AvalonEdit" Version="6.*" />
+    <PackageReference Include="Dirkster.AvalonDock" Version="4.*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DocumentForge.Studio.Core\DocumentForge.Studio.Core.csproj" />
+  </ItemGroup>
+
+</Project>
