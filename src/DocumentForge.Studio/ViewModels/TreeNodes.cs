@@ -122,7 +122,7 @@ public sealed partial class ServerNodeViewModel : TreeNodeViewModel
     private Task DisconnectAsync() => _main.DisconnectAsync(this);
 
     [RelayCommand]
-    private void NewQuery() => _main.ComingSoon("The query workbench arrives in Phase 2.");
+    private Task NewQuery() => _main.OpenQueryOnServerAsync(this);
 }
 
 public sealed partial class DatabaseNodeViewModel : TreeNodeViewModel
@@ -157,6 +157,9 @@ public sealed partial class DatabaseNodeViewModel : TreeNodeViewModel
     }
 
     [RelayCommand]
+    private void NewQuery() => _main.OpenQuery(Server.Connection, Info.Name);
+
+    [RelayCommand]
     private Task PropertiesAsync() => _main.ShowDatabasePropertiesAsync(this);
 
     [RelayCommand]
@@ -186,8 +189,14 @@ public sealed partial class CollectionNodeViewModel : TreeNodeViewModel
         return [new FolderNodeViewModel($"Indexes ({nodes.Count})", nodes)];
     }
 
+    // Until the Phase 3 document browser lands, "open" a collection by dropping
+    // a SELECT into a query tab — immediately useful and a natural default.
     [RelayCommand]
-    private void BrowseDocuments() => _main.ComingSoon("The collection browser arrives in Phase 3.");
+    private void OpenCollection() =>
+        _main.OpenQuery(Database.Server.Connection, Database.Info.Name, $"SELECT * FROM {Name} LIMIT 100");
+
+    [RelayCommand]
+    private void NewQuery() => _main.OpenQuery(Database.Server.Connection, Database.Info.Name);
 }
 
 public sealed class IndexNodeViewModel : TreeNodeViewModel

@@ -32,8 +32,12 @@ public sealed class StudioWorkspace
         Converters = { new JsonStringEnumConverter() },
     };
 
+    private const int MaxHistoryPerConnection = 100;
+
     private readonly string _settingsPath;
     private readonly string _connectionsPath;
+    private readonly string _historyPath;
+    private readonly Dictionary<string, List<string>> _history;
 
     public StudioWorkspace(string? rootDirectory = null)
     {
@@ -44,10 +48,12 @@ public sealed class StudioWorkspace
 
         _settingsPath = Path.Combine(RootDirectory, "settings.json");
         _connectionsPath = Path.Combine(RootDirectory, "connections.json");
+        _historyPath = Path.Combine(RootDirectory, "queryhistory.json");
 
         Settings = Load<StudioSettings>(_settingsPath) ?? new StudioSettings();
         Connections = Load<List<ConnectionDescriptor>>(_connectionsPath) ?? new List<ConnectionDescriptor>();
         Secrets = new SecretStore(RootDirectory);
+        _history = Load<Dictionary<string, List<string>>>(_historyPath) ?? new();
     }
 
     public string RootDirectory { get; }
@@ -80,6 +86,26 @@ public sealed class StudioWorkspace
             Secrets.Delete(secretId);
         Connections.Remove(descriptor);
         SaveConnections();
+    }
+
+    /// <summary>Most-recent-first list of SQL previously run on a connection,
+    /// for the workbench history dropdown.</summary>
+    public IReadOnlyList<string> GetQueryHistory(string connectionId) =>
+        _history.TryGetValue(connectionId, out var list) ? list : Array.Empty<string>();
+
+    /// <summary>Records a successfully-run query. Deduplicates (moves an exact
+    /// repeat to the top) and caps the per-connection list.</summary>
+    public void AddQueryHistory(string connectionId, string sql)
+    {
+        sql = sql.Trim();
+        if (sql.Length == 0) return;
+        if (!_history.TryGetValue(connectionId, out var list))
+            _history[connectionId] = list = new List<string>();
+        list.RemoveAll(s => string.Equals(s, sql, StringComparison.Ordinal));
+        list.Insert(0, sql);
+        if (list.Count > MaxHistoryPerConnection)
+            list.RemoveRange(MaxHistoryPerConnection, list.Count - MaxHistoryPerConnection);
+        AtomicFile.Write(_historyPath, JsonSerializer.Serialize(_history, Json));
     }
 
     /// <summary>Builds a live (not yet opened) connection for a descriptor,

@@ -1,0 +1,92 @@
+using System.Data;
+using DocumentForge.Studio.Core.Query;
+
+namespace DocumentForge.Studio.Core.Tests;
+
+public sealed class SqlTextTests
+{
+    [Theory]
+    [InlineData("SELECT * FROM orders", true)]
+    [InlineData("  select 1", true)]
+    [InlineData("INSERT INTO x VALUES {}", false)]
+    [InlineData("", false)]
+    public void IsSelect_Detects_Selects(string sql, bool expected) =>
+        Assert.Equal(expected, SqlText.IsSelect(sql));
+
+    [Fact]
+    public void EnsureLimit_Appends_To_Unbounded_Select()
+    {
+        Assert.Equal("SELECT * FROM orders LIMIT 1000", SqlText.EnsureLimit("SELECT * FROM orders", 1000));
+        Assert.Equal("SELECT * FROM orders LIMIT 1000", SqlText.EnsureLimit("SELECT * FROM orders;", 1000));
+        Assert.Equal("SELECT * FROM orders LIMIT 1000", SqlText.EnsureLimit("SELECT * FROM orders  \n ", 1000));
+    }
+
+    [Fact]
+    public void EnsureLimit_Leaves_Existing_Limit_And_NonSelects()
+    {
+        Assert.Equal("SELECT * FROM orders LIMIT 5", SqlText.EnsureLimit("SELECT * FROM orders LIMIT 5", 1000));
+        Assert.Equal("DELETE FROM orders", SqlText.EnsureLimit("DELETE FROM orders", 1000));
+    }
+
+    [Fact]
+    public void EnsureLimit_Disabled_When_Limit_NonPositive() =>
+        Assert.Equal("SELECT * FROM orders", SqlText.EnsureLimit("SELECT * FROM orders", 0));
+
+    [Theory]
+    [InlineData("SELECT * FROM x", "SELECT")]
+    [InlineData("  update x set a=1", "UPDATE")]
+    [InlineData("", "")]
+    public void LeadingKeyword_Extracts_Verb(string sql, string expected) =>
+        Assert.Equal(expected, SqlText.LeadingKeyword(sql));
+}
+
+public sealed class ResultTableTests
+{
+    [Fact]
+    public void Build_Unions_Columns_In_First_Seen_Order()
+    {
+        var docs = new[]
+        {
+            """{"pnr":"ABC","status":"CONFIRMED"}""",
+            """{"pnr":"XYZ","seats":3}""",
+        };
+
+        var table = ResultTable.Build(docs);
+
+        Assert.Equal(new[] { "pnr", "status", "seats" }, table.Columns.Cast<DataColumn>().Select(c => c.ColumnName));
+        Assert.Equal(2, table.Rows.Count);
+        Assert.Equal("ABC", table.Rows[0]["pnr"]);
+        Assert.Equal(DBNull.Value, table.Rows[0]["seats"]); // missing key → empty cell
+        Assert.Equal("3", table.Rows[1]["seats"]);
+    }
+
+    [Fact]
+    public void Build_Renders_Nested_Objects_As_Compact_Json()
+    {
+        var table = ResultTable.Build([ """{"passenger":{"firstName":"Jane"},"tags":[1,2]}""" ]);
+
+        Assert.Equal("""{"firstName":"Jane"}""", table.Rows[0]["passenger"]);
+        Assert.Equal("[1,2]", table.Rows[0]["tags"]);
+    }
+
+    [Fact]
+    public void Build_Handles_Non_Object_And_Malformed_Docs()
+    {
+        var table = ResultTable.Build([ "42", "not json" ]);
+        Assert.Single(table.Columns);
+        Assert.Equal("value", table.Columns[0].ColumnName);
+        Assert.Equal("42", table.Rows[0]["value"]);
+        Assert.Equal("not json", table.Rows[1]["value"]);
+    }
+
+    [Fact]
+    public void PrettyJson_Indents_And_Notes_Truncation()
+    {
+        var docs = Enumerable.Range(0, 5).Select(i => $$"""{"n":{{i}}}""").ToList();
+
+        var pretty = ResultTable.PrettyJson(docs, cap: 2);
+
+        Assert.Contains("\"n\": 0", pretty);
+        Assert.Contains("3 more document(s) not shown", pretty);
+    }
+}
