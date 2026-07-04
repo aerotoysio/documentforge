@@ -53,6 +53,8 @@
                     <ContextMenu>
                         <MenuItem Header="Open (SELECT * … LIMIT 100)" Command="{Binding OpenCollectionCommand}"/>
                         <MenuItem Header="New Query" Command="{Binding NewQueryCommand}"/>
+                        <Separator/>
+                        <MenuItem Header="New Index…" Command="{Binding NewIndexCommand}"/>
                         <MenuItem Header="Refresh" Command="{Binding RefreshCommand}"/>
                     </ContextMenu>
                 </StackPanel.ContextMenu>
@@ -70,6 +72,11 @@
 
         <HierarchicalDataTemplate DataType="{x:Type vm:IndexNodeViewModel}" ItemsSource="{Binding Children}">
             <StackPanel Orientation="Horizontal">
+                <StackPanel.ContextMenu>
+                    <ContextMenu>
+                        <MenuItem Header="Drop Index…" Command="{Binding DropCommand}"/>
+                    </ContextMenu>
+                </StackPanel.ContextMenu>
                 <TextBlock Text="{Binding Glyph}" Margin="0,0,6,0"/>
                 <TextBlock Text="{Binding Name}"/>
             </StackPanel>

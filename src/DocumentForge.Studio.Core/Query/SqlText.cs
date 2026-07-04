@@ -36,4 +36,30 @@ public static partial class SqlText
         var trimmed = sql.TrimEnd().TrimEnd(';').TrimEnd();
         return $"{trimmed} LIMIT {limit}";
     }
+
+    /// <summary>Builds a CREATE INDEX statement. Multiple paths produce a
+    /// composite index. Runs identically over HTTP (/db/{name}/query) and a
+    /// direct-file connection, so index DDL needs no transport-specific code.</summary>
+    public static string BuildCreateIndex(string collection, string indexName, IEnumerable<string> paths, bool unique)
+    {
+        var pathList = string.Join(", ", paths.Select(p => p.Trim()).Where(p => p.Length > 0));
+        var uniqueKeyword = unique ? "UNIQUE " : "";
+        return $"CREATE {uniqueKeyword}INDEX {indexName} ON {collection}({pathList})";
+    }
+
+    public static string BuildDropIndex(string indexName) => $"DROP INDEX {indexName}";
+
+    /// <summary>A reasonable default index name from a collection + its paths,
+    /// e.g. idx_orders_status_createdAt. Callers can override.</summary>
+    public static string SuggestIndexName(string collection, IEnumerable<string> paths)
+    {
+        var suffix = string.Join("_", paths
+            .Select(p => p.Trim())
+            .Where(p => p.Length > 0)
+            .Select(Sanitize));
+        return $"idx_{Sanitize(collection)}_{suffix}".TrimEnd('_');
+    }
+
+    private static string Sanitize(string s) =>
+        new(s.Select(c => char.IsLetterOrDigit(c) ? c : '_').ToArray());
 }

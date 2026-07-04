@@ -29,6 +29,12 @@ public sealed class DialogService : IDialogService
         return dialog.ShowDialog() == true ? dialog.Result : null;
     }
 
+    public NewIndexRequest? ShowNewIndexDialog(string collection)
+    {
+        var dialog = new NewIndexDialog(collection) { Owner = _owner };
+        return dialog.ShowDialog() == true ? dialog.Result : null;
+    }
+
     public DropChoice ConfirmDropDatabase(string databaseName)
     {
         var result = MessageBox.Show(

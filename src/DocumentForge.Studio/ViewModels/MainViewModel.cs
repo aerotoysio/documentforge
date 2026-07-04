@@ -3,6 +3,7 @@ using System.IO;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using DocumentForge.Studio.Core.Connections;
+using DocumentForge.Studio.Core.Query;
 using DocumentForge.Studio.Services;
 using DocumentForge.Studio.Core.Settings;
 
@@ -168,6 +169,55 @@ public sealed partial class MainViewModel : ObservableObject
         catch (Exception ex)
         {
             _dialogs.ShowError("Properties failed", ex.Message);
+        }
+    }
+
+    /// <summary>Prompts for and creates an index on a collection, then refreshes
+    /// the collection node so the new index appears in the tree. Index DDL runs
+    /// as SQL, so it works identically over HTTP and direct-file connections.</summary>
+    public async Task CreateIndexAsync(CollectionNodeViewModel collection)
+    {
+        var request = _dialogs.ShowNewIndexDialog(collection.Name);
+        if (request is null) return;
+
+        var sql = SqlText.BuildCreateIndex(request.Collection, request.Name, request.Paths, request.Unique);
+        try
+        {
+            var result = await collection.Database.Server.Connection.ExecuteAsync(collection.Database.Info.Name, sql);
+            if (!result.Success)
+            {
+                _dialogs.ShowError("Create index failed", result.Message ?? "Unknown error.");
+                return;
+            }
+            await collection.RefreshAsync();
+            StatusText = $"Index '{request.Name}' created on {request.Collection}";
+        }
+        catch (Exception ex)
+        {
+            _dialogs.ShowError("Create index failed", ex.Message);
+        }
+    }
+
+    public async Task DropIndexAsync(IndexNodeViewModel index, CollectionNodeViewModel owner)
+    {
+        if (!_dialogs.Confirm("Drop index", $"Drop index '{index.Info.Name}' on {owner.Name}?"))
+            return;
+
+        try
+        {
+            var result = await owner.Database.Server.Connection.ExecuteAsync(
+                owner.Database.Info.Name, SqlText.BuildDropIndex(index.Info.Name));
+            if (!result.Success)
+            {
+                _dialogs.ShowError("Drop index failed", result.Message ?? "Unknown error.");
+                return;
+            }
+            await owner.RefreshAsync();
+            StatusText = $"Index '{index.Info.Name}' dropped";
+        }
+        catch (Exception ex)
+        {
+            _dialogs.ShowError("Drop index failed", ex.Message);
         }
     }
 

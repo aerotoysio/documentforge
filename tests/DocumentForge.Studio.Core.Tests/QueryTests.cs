@@ -38,6 +38,27 @@ public sealed class SqlTextTests
     [InlineData("", "")]
     public void LeadingKeyword_Extracts_Verb(string sql, string expected) =>
         Assert.Equal(expected, SqlText.LeadingKeyword(sql));
+
+    [Fact]
+    public void BuildCreateIndex_Single_Composite_And_Unique()
+    {
+        Assert.Equal("CREATE INDEX idx_pnr ON orders(pnr)",
+            SqlText.BuildCreateIndex("orders", "idx_pnr", ["pnr"], unique: false));
+        Assert.Equal("CREATE UNIQUE INDEX idx_pnr ON orders(pnr)",
+            SqlText.BuildCreateIndex("orders", "idx_pnr", ["pnr"], unique: true));
+        Assert.Equal("CREATE INDEX idx_sc ON orders(status, createdAt)",
+            SqlText.BuildCreateIndex("orders", "idx_sc", ["status", " createdAt "], unique: false));
+    }
+
+    [Fact]
+    public void BuildDropIndex_And_SuggestName()
+    {
+        Assert.Equal("DROP INDEX idx_pnr", SqlText.BuildDropIndex("idx_pnr"));
+        Assert.Equal("idx_orders_status_createdAt",
+            SqlText.SuggestIndexName("orders", ["status", "createdAt"]));
+        Assert.Equal("idx_flights_flightNumber",
+            SqlText.SuggestIndexName("flights", ["flightNumber"]));
+    }
 }
 
 public sealed class ResultTableTests

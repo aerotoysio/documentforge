@@ -9,6 +9,8 @@ public sealed record ConnectRequest(ConnectionDescriptor Descriptor, string? Api
 /// the default data directory.</summary>
 public sealed record NewDatabaseRequest(string Name, ServerNodeViewModel? Server);
 
+public sealed record NewIndexRequest(string Collection, string Name, IReadOnlyList<string> Paths, bool Unique);
+
 public enum DropChoice { Cancel, Detach, Drop }
 
 /// <summary>Keeps WPF dialog plumbing out of the view models so they stay
@@ -17,6 +19,7 @@ public interface IDialogService
 {
     ConnectRequest? ShowConnectDialog();
     NewDatabaseRequest? ShowNewDatabaseDialog(IReadOnlyList<ServerNodeViewModel> servers, string defaultDataDir);
+    NewIndexRequest? ShowNewIndexDialog(string collection);
     DropChoice ConfirmDropDatabase(string databaseName);
     bool Confirm(string title, string message);
     void ShowError(string title, string message);
