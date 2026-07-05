@@ -13,6 +13,27 @@ public sealed record ShardHealth(bool Reachable, bool Healthy, string Status, st
 /// <c>dfdb health</c>.</summary>
 public static class ClusterHealth
 {
+    /// <summary>Best-effort: the collection names on a shard's default database,
+    /// so the cluster editor can suggest them. Empty on any failure.</summary>
+    public static async Task<IReadOnlyList<string>> TryGetCollectionsAsync(string endpoint, TimeSpan timeout, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(endpoint)) return Array.Empty<string>();
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(timeout);
+        try
+        {
+            var descriptor = new ConnectionDescriptor { Name = endpoint, Kind = ConnectionKind.Http, Url = endpoint };
+            await using var connection = new HttpConnection(descriptor, apiKey: null);
+            var dbs = await connection.GetDatabasesAsync(cts.Token);
+            var target = dbs.FirstOrDefault(d => d.IsDefault) ?? dbs.FirstOrDefault();
+            return target is null ? Array.Empty<string>() : await connection.GetCollectionNamesAsync(target.Name, cts.Token);
+        }
+        catch
+        {
+            return Array.Empty<string>();
+        }
+    }
+
     public static async Task<ShardHealth> PingAsync(string endpoint, TimeSpan timeout, CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(endpoint)) return ShardHealth.Down("no endpoint");
