@@ -128,6 +128,9 @@ public sealed partial class ServerNodeViewModel : TreeNodeViewModel
 
     [RelayCommand]
     private void Topology() => _main.OpenTopology(this);
+
+    [RelayCommand]
+    private void ApiKeys() => _main.OpenApiKeys(this);
 }
 
 public sealed partial class DatabaseNodeViewModel : TreeNodeViewModel

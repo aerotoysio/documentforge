@@ -470,6 +470,19 @@ public sealed partial class MainViewModel : ObservableObject
         StatusText = $"New query on {database}";
     }
 
+    /// <summary>Opens (or re-focuses) the API key manager for a server.</summary>
+    public void OpenApiKeys(ServerNodeViewModel server)
+    {
+        var contentId = $"keys:{server.Connection.Descriptor.Id}";
+        var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
+        if (existing is not null) { ActiveDocument = existing; return; }
+
+        var document = new ApiKeysDocumentViewModel(server.Connection);
+        Documents.Add(document);
+        ActiveDocument = document;
+        StatusText = $"API Keys — {server.Connection.Descriptor.Name}";
+    }
+
     /// <summary>Opens (or re-focuses) the replication topology graph for a server.</summary>
     public void OpenTopology(ServerNodeViewModel server)
     {

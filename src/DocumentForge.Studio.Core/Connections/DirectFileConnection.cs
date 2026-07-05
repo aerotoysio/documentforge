@@ -170,6 +170,12 @@ public sealed class DirectFileConnection : IDfConnection
             return new CompactionInfo(result.PagesCompacted, result.BytesReclaimed, sw.Elapsed.TotalMilliseconds);
         }, ct);
 
+    private const string ServerOnly = "This is only available through a DocumentForge service, not a direct-file connection.";
+
+    public Task<IReadOnlyList<ApiKeyInfo>> GetApiKeysAsync(CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task<CreatedApiKey> CreateApiKeyAsync(string? description, IReadOnlyList<string> scopes, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task RevokeApiKeyAsync(string id, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+
     private static Task ReplicationNotSupported() =>
         throw new NotSupportedException("Replication is only available through a DocumentForge service, not a direct-file connection.");
 

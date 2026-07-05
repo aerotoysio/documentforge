@@ -20,6 +20,12 @@ public sealed record DatabaseStats(
 
 public sealed record ServerHealth(bool Healthy, string Status, string? Version, string? Detail);
 
+public sealed record ApiKeyInfo(string Id, IReadOnlyList<string> Scopes, string? Description, string? CreatedAt);
+
+/// <summary>A freshly-minted key. <see cref="Secret"/> is shown once and never
+/// retrievable again.</summary>
+public sealed record CreatedApiKey(string Id, string Secret, IReadOnlyList<string> Scopes, string? Description);
+
 public sealed record CompactionInfo(long PagesCompacted, long BytesReclaimed, double TimeMs);
 
 /// <summary>Per-database health + diagnostics. Recommendation is one of

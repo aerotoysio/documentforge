@@ -229,6 +229,55 @@ public sealed class HttpConnection : IDfConnection
             root.TryGetProperty("timeMs", out var t) ? t.GetDouble() : 0);
     }
 
+    public async Task<IReadOnlyList<ApiKeyInfo>> GetApiKeysAsync(CancellationToken ct = default)
+    {
+        var body = await GetRawAsync("admin/keys", ct).ConfigureAwait(false);
+        using var doc = JsonDocument.Parse(body);
+        var result = new List<ApiKeyInfo>();
+        if (doc.RootElement.TryGetProperty("keys", out var keys) && keys.ValueKind == JsonValueKind.Array)
+            foreach (var k in keys.EnumerateArray())
+                result.Add(new ApiKeyInfo(
+                    k.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "",
+                    ReadStringArray(k, "scopes"),
+                    k.TryGetProperty("description", out var d) && d.ValueKind == JsonValueKind.String ? d.GetString() : null,
+                    k.TryGetProperty("createdAt", out var c) && c.ValueKind == JsonValueKind.String ? c.GetString() : null));
+        return result;
+    }
+
+    public async Task<CreatedApiKey> CreateApiKeyAsync(string? description, IReadOnlyList<string> scopes, CancellationToken ct = default)
+    {
+        using var response = await _http.PostAsJsonAsync("admin/keys", new { scopes, description }, Json, ct).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        return new CreatedApiKey(
+            root.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "",
+            root.TryGetProperty("secret", out var s) ? s.GetString() ?? "" : "",
+            ReadStringArray(root, "scopes"),
+            root.TryGetProperty("description", out var d) && d.ValueKind == JsonValueKind.String ? d.GetString() : null);
+    }
+
+    public async Task RevokeApiKeyAsync(string id, CancellationToken ct = default)
+    {
+        using var response = await _http.DeleteAsync($"admin/keys/{Uri.EscapeDataString(id)}", ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        }
+    }
+
+    private static IReadOnlyList<string> ReadStringArray(JsonElement obj, string prop)
+    {
+        var list = new List<string>();
+        if (obj.TryGetProperty(prop, out var arr) && arr.ValueKind == JsonValueKind.Array)
+            foreach (var el in arr.EnumerateArray())
+                if (el.ValueKind == JsonValueKind.String) list.Add(el.GetString()!);
+        return list;
+    }
+
     public async Task<ReplicationStatus> GetReplicationStatusAsync(string database, CancellationToken ct = default)
     {
         var body = await GetRawAsync($"db/{Uri.EscapeDataString(database)}/replication/status", ct).ConfigureAwait(false);

@@ -46,6 +46,12 @@ public interface IDfConnection : IAsyncDisposable
     /// <summary>Defragments a collection, reclaiming space from deleted documents.</summary>
     Task<CompactionInfo> CompactCollectionAsync(string database, string collection, CancellationToken ct = default);
 
+    // --- API keys (server connections only; requires ServerAdmin) ---
+
+    Task<IReadOnlyList<ApiKeyInfo>> GetApiKeysAsync(CancellationToken ct = default);
+    Task<CreatedApiKey> CreateApiKeyAsync(string? description, IReadOnlyList<string> scopes, CancellationToken ct = default);
+    Task RevokeApiKeyAsync(string id, CancellationToken ct = default);
+
     // --- Replication (server connections only; requires ServerAdmin) ---
 
     Task<ReplicationStatus> GetReplicationStatusAsync(string database, CancellationToken ct = default);
