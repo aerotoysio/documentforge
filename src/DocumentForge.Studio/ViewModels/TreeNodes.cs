@@ -203,6 +203,12 @@ public sealed partial class CollectionNodeViewModel : TreeNodeViewModel
 
     [RelayCommand]
     private Task NewIndex() => _main.CreateIndexAsync(this);
+
+    [RelayCommand]
+    private Task Compact() => _main.CompactCollectionAsync(this);
+
+    [RelayCommand]
+    private Task DropCollection() => _main.DropCollectionAsync(this);
 }
 
 public sealed partial class IndexNodeViewModel : TreeNodeViewModel

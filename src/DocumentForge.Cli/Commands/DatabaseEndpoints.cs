@@ -1107,6 +1107,45 @@ public static class DatabaseEndpoints
             if (coll.Delete(docId)) db.NotifyDocDeleted(collection, docId, doc);
             return Results.Ok(new { database = name, success = true, id = docId.ToString(), collection });
         });
+
+        // Scoped drop-collection. Destructive, so it requires the same
+        // X-Confirm: true header guard as the flat route.
+        app.MapDelete("/db/{name}/collections/{collection}", (HttpContext ctx, string name, string collection, HttpRequest request) =>
+        {
+            if (ScopeCheck.RequireDbWrite(ctx, name) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            if (request.Headers["X-Confirm"].ToString() != "true")
+                return Results.BadRequest(new { error = "Destructive op. Include header 'X-Confirm: true' to proceed." });
+            return db.DropCollection(collection)
+                ? Results.Ok(new { database = name, success = true, dropped = collection })
+                : Results.NotFound();
+        });
+
+        // Scoped compaction — defragment a collection and reclaim space from
+        // deleted documents. Mirrors the flat /admin/compact/{collection}.
+        app.MapPost("/db/{name}/admin/compact/{collection}", (HttpContext ctx, string name, string collection) =>
+        {
+            if (ScopeCheck.RequireDbWrite(ctx, name) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            try
+            {
+                var sw = System.Diagnostics.Stopwatch.StartNew();
+                var result = db.Compact(collection);
+                sw.Stop();
+                return Results.Ok(new
+                {
+                    database = name,
+                    success = true,
+                    collection,
+                    pagesCompacted = result.PagesCompacted,
+                    bytesReclaimed = result.BytesReclaimed,
+                    timeMs = sw.Elapsed.TotalMilliseconds,
+                });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
     }
 
     private static string NormaliseIfMatch(string raw)

@@ -20,6 +20,8 @@ public sealed record DatabaseStats(
 
 public sealed record ServerHealth(bool Healthy, string Status, string? Version, string? Detail);
 
+public sealed record CompactionInfo(long PagesCompacted, long BytesReclaimed, double TimeMs);
+
 /// <summary>Transport-neutral query result. Documents are raw JSON strings so
 /// the UI can render them without another round-trip through a BSON type.</summary>
 public sealed record StudioQueryResult(

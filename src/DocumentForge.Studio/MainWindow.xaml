@@ -56,6 +56,9 @@
                         <Separator/>
                         <MenuItem Header="Insert Document…" Command="{Binding InsertDocumentCommand}"/>
                         <MenuItem Header="New Index…" Command="{Binding NewIndexCommand}"/>
+                        <Separator/>
+                        <MenuItem Header="Compact" Command="{Binding CompactCommand}"/>
+                        <MenuItem Header="Drop Collection…" Command="{Binding DropCollectionCommand}"/>
                         <MenuItem Header="Refresh" Command="{Binding RefreshCommand}"/>
                     </ContextMenu>
                 </StackPanel.ContextMenu>

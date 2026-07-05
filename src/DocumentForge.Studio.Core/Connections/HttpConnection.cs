@@ -196,6 +196,37 @@ public sealed class HttpConnection : IDfConnection
         return doc.RootElement.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "";
     }
 
+    public async Task<bool> DropCollectionAsync(string database, string collection, CancellationToken ct = default)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Delete,
+            $"db/{Uri.EscapeDataString(database)}/collections/{Uri.EscapeDataString(collection)}");
+        request.Headers.TryAddWithoutValidation("X-Confirm", "true");
+        using var response = await _http.SendAsync(request, ct).ConfigureAwait(false);
+        if (response.StatusCode == HttpStatusCode.NotFound) return false;
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        }
+        return true;
+    }
+
+    public async Task<CompactionInfo> CompactCollectionAsync(string database, string collection, CancellationToken ct = default)
+    {
+        using var response = await _http.PostAsync(
+            $"db/{Uri.EscapeDataString(database)}/admin/compact/{Uri.EscapeDataString(collection)}", content: null, ct)
+            .ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        return new CompactionInfo(
+            root.TryGetProperty("pagesCompacted", out var p) ? p.GetInt64() : 0,
+            root.TryGetProperty("bytesReclaimed", out var b) ? b.GetInt64() : 0,
+            root.TryGetProperty("timeMs", out var t) ? t.GetDouble() : 0);
+    }
+
     public async Task<DatabaseInfo> CreateDatabaseAsync(string name, CancellationToken ct = default)
     {
         using var response = await _http.PostAsJsonAsync(

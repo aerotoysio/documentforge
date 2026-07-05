@@ -231,6 +231,39 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
+    public async Task DropCollectionAsync(CollectionNodeViewModel collection)
+    {
+        if (!_dialogs.Confirm("Drop collection",
+                $"Drop collection '{collection.Name}' and all its documents and indexes?\n\nThis cannot be undone."))
+            return;
+        try
+        {
+            var dropped = await collection.Database.Server.Connection.DropCollectionAsync(
+                collection.Database.Info.Name, collection.Name);
+            await collection.Database.RefreshAsync();
+            StatusText = dropped ? $"Collection '{collection.Name}' dropped" : $"Collection '{collection.Name}' not found";
+        }
+        catch (Exception ex)
+        {
+            _dialogs.ShowError("Drop collection failed", ex.Message);
+        }
+    }
+
+    public async Task CompactCollectionAsync(CollectionNodeViewModel collection)
+    {
+        try
+        {
+            var result = await collection.Database.Server.Connection.CompactCollectionAsync(
+                collection.Database.Info.Name, collection.Name);
+            StatusText = $"Compacted '{collection.Name}': {result.BytesReclaimed:N0} bytes reclaimed " +
+                         $"({result.PagesCompacted:N0} pages, {result.TimeMs:F0} ms)";
+        }
+        catch (Exception ex)
+        {
+            _dialogs.ShowError("Compact failed", ex.Message);
+        }
+    }
+
     public async Task DropIndexAsync(IndexNodeViewModel index, CollectionNodeViewModel owner)
     {
         if (!_dialogs.Confirm("Drop index", $"Drop index '{index.Info.Name}' on {owner.Name}?"))

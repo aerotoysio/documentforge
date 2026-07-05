@@ -36,6 +36,12 @@ public interface IDfConnection : IAsyncDisposable
     /// assigned internal <c>_id</c>. The collection is created if it doesn't exist.</summary>
     Task<string> InsertDocumentAsync(string database, string collection, string json, CancellationToken ct = default);
 
+    /// <summary>Drops a collection and its indexes. Returns false if it didn't exist.</summary>
+    Task<bool> DropCollectionAsync(string database, string collection, CancellationToken ct = default);
+
+    /// <summary>Defragments a collection, reclaiming space from deleted documents.</summary>
+    Task<CompactionInfo> CompactCollectionAsync(string database, string collection, CancellationToken ct = default);
+
     /// <summary>Requires <see cref="ConnectionCapabilities.CreateDatabase"/>.</summary>
     Task<DatabaseInfo> CreateDatabaseAsync(string name, CancellationToken ct = default);
 

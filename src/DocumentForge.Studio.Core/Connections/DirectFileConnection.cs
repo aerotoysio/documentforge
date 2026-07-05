@@ -132,6 +132,18 @@ public sealed class DirectFileConnection : IDfConnection
     public Task<string> InsertDocumentAsync(string database, string collection, string json, CancellationToken ct = default) =>
         Task.Run(() => EnsureConnected().Insert(collection, json).ToString(), ct);
 
+    public Task<bool> DropCollectionAsync(string database, string collection, CancellationToken ct = default) =>
+        Task.Run(() => EnsureConnected().DropCollection(collection), ct);
+
+    public Task<CompactionInfo> CompactCollectionAsync(string database, string collection, CancellationToken ct = default) =>
+        Task.Run(() =>
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var result = EnsureConnected().Compact(collection);
+            sw.Stop();
+            return new CompactionInfo(result.PagesCompacted, result.BytesReclaimed, sw.Elapsed.TotalMilliseconds);
+        }, ct);
+
     public Task<DatabaseInfo> CreateDatabaseAsync(string name, CancellationToken ct = default) =>
         throw new NotSupportedException("A direct-file connection is a single database. Use File > New Database to create a new file.");
 
