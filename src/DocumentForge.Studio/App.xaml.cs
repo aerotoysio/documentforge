@@ -40,15 +40,32 @@ public partial class App : Application
     }
 
     // First run: give the user a ready-made connection to the local service the
-    // installer bundles, so the Object Explorer isn't empty on first launch.
+    // installer bundles, so the Object Explorer isn't empty on first launch. The
+    // port matches what the installer configured (port.txt), defaulting to the
+    // DocumentForge standard port 4300.
     private static void SeedFirstRunConnection(StudioWorkspace workspace)
     {
         if (workspace.Connections.Count > 0) return;
+        var port = ReadInstalledPort();
         workspace.UpsertConnection(new ConnectionDescriptor
         {
-            Name = "Local DocumentForge (localhost:5001)",
+            Name = $"Local DocumentForge (localhost:{port})",
             Kind = ConnectionKind.Http,
-            Url = "http://localhost:5001",
+            Url = $"http://localhost:{port}",
         });
+    }
+
+    /// <summary>The port the installer configured for the local service, read
+    /// from port.txt next to the exe. Defaults to 4300 (DocumentForge standard).</summary>
+    private static int ReadInstalledPort()
+    {
+        try
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "port.txt");
+            if (File.Exists(path) && int.TryParse(File.ReadAllText(path).Trim(), out var p) && p is > 0 and <= 65535)
+                return p;
+        }
+        catch { /* fall back to default */ }
+        return 4300;
     }
 }

@@ -11,6 +11,7 @@
 #define Publisher "DocumentForge"
 #define ExeName "DocumentForgeStudio.exe"
 #define DataDir "C:\data\documentForge"
+#define DefaultPort "4300"
 
 [Setup]
 ; Stable AppId so upgrades replace in place rather than installing side-by-side.
@@ -57,7 +58,7 @@ Name: "{#DataDir}"; Components: service; Flags: uninsneveruninstall
 Name: "{group}\DocumentForge Studio"; Filename: "{app}\{#ExeName}"; Components: studio
 Name: "{userdesktop}\DocumentForge Studio"; Filename: "{app}\{#ExeName}"; Components: studio; Tasks: desktopicon
 Name: "{group}\Start DocumentForge Service"; Filename: "{app}\service\dfdb.exe"; \
-    Parameters: "serve --port 5001 --data-dir ""{#DataDir}"""; Components: service
+    Parameters: "serve --port {code:GetPort} --data-dir ""{#DataDir}"""; Components: service
 Name: "{group}\Uninstall DocumentForge Studio"; Filename: "{uninstallexe}"
 
 [Tasks]
@@ -72,5 +73,51 @@ Root: HKCU; Subkey: "Software\Classes\DocumentForge.Database\shell\open\command"
 
 [Run]
 Filename: "{app}\{#ExeName}"; Description: "Launch DocumentForge Studio"; Components: studio; Flags: nowait postinstall skipifsilent
-Filename: "{app}\service\dfdb.exe"; Parameters: "serve --port 5001 --data-dir ""{#DataDir}"""; \
-    Description: "Start the DocumentForge service now (port 5001)"; Components: service; Flags: nowait postinstall skipifsilent unchecked
+Filename: "{app}\service\dfdb.exe"; Parameters: "serve --port {code:GetPort} --data-dir ""{#DataDir}"""; \
+    Description: "Start the DocumentForge service now"; Components: service; Flags: nowait postinstall skipifsilent unchecked
+
+[Code]
+var
+  PortPage: TInputQueryWizardPage;
+
+procedure InitializeWizard;
+begin
+  PortPage := CreateInputQueryPage(wpSelectComponents,
+    'DocumentForge port',
+    'Which TCP port should the DocumentForge service use?',
+    'The service and Studio''s default connection use this port. ' +
+    '4300 is the DocumentForge standard; change it only if 4300 is already in use.');
+  PortPage.Add('Port:', False);
+  PortPage.Values[0] := '{#DefaultPort}';
+end;
+
+function GetPort(Param: String): String;
+begin
+  Result := Trim(PortPage.Values[0]);
+  if Result = '' then
+    Result := '{#DefaultPort}';
+end;
+
+function NextButtonClick(CurPageID: Integer): Boolean;
+var
+  Port: Integer;
+begin
+  Result := True;
+  if CurPageID = PortPage.ID then
+  begin
+    Port := StrToIntDef(Trim(PortPage.Values[0]), -1);
+    if (Port < 1) or (Port > 65535) then
+    begin
+      MsgBox('Please enter a valid port number (1-65535).', mbError, MB_OK);
+      Result := False;
+    end;
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  // Record the chosen port next to the app so Studio's first-run connection
+  // and the service shortcut agree.
+  if CurStep = ssPostInstall then
+    SaveStringToFile(ExpandConstant('{app}\port.txt'), GetPort(''), False);
+end;
