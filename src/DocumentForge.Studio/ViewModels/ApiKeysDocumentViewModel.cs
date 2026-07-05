@@ -9,6 +9,13 @@ namespace DocumentForge.Studio.ViewModels;
 
 public sealed record ApiKeyRow(string Id, string Scopes, string? Description, string? CreatedAt);
 
+/// <summary>A friendly scope option. <see cref="Kind"/> is "*", "db:*",
+/// "db-rw" or "db-read"; the last two combine with a chosen database.</summary>
+public sealed record ScopeChoice(string Label, string Kind, bool NeedsDb)
+{
+    public override string ToString() => Label;
+}
+
 /// <summary>Manage a server's scoped API keys (a document tab): list, create
 /// (secret shown once), revoke.</summary>
 public sealed partial class ApiKeysDocumentViewModel : DocumentViewModel
@@ -22,6 +29,7 @@ public sealed partial class ApiKeysDocumentViewModel : DocumentViewModel
         _onSecure = onSecure;
         Title = $"API Keys — {connection.Descriptor.Name}";
         ContentId = $"keys:{connection.Descriptor.Id}";
+        _selectedScope = ScopeChoices[0];
     }
 
     /// <summary>True when this connection has no API key — i.e. the server is
@@ -36,7 +44,25 @@ public sealed partial class ApiKeysDocumentViewModel : DocumentViewModel
     [ObservableProperty] private bool _isBusy;
     [ObservableProperty] private string _statusMessage = "";
     [ObservableProperty] private string _newDescription = "";
-    [ObservableProperty] private string _newScopes = "";
+
+    // Guided scope selection instead of a raw scope string.
+    public IReadOnlyList<ScopeChoice> ScopeChoices { get; } = new[]
+    {
+        new ScopeChoice("Full admin — all access", "*", NeedsDb: false),
+        new ScopeChoice("One database — read & write", "db-rw", NeedsDb: true),
+        new ScopeChoice("One database — read only", "db-read", NeedsDb: true),
+        new ScopeChoice("All databases — read & write", "db:*", NeedsDb: false),
+    };
+
+    [ObservableProperty] private ScopeChoice _selectedScope;
+    [ObservableProperty] private string? _selectedDatabase;
+
+    public ObservableCollection<string> Databases { get; } = new();
+
+    /// <summary>Whether the current scope choice needs a database picked.</summary>
+    public bool NeedsDatabase => SelectedScope?.NeedsDb == true;
+
+    partial void OnSelectedScopeChanged(ScopeChoice value) => OnPropertyChanged(nameof(NeedsDatabase));
 
     // The one-time secret, shown after a successful create until dismissed.
     [ObservableProperty] private string _createdSecret = "";
@@ -51,6 +77,17 @@ public sealed partial class ApiKeysDocumentViewModel : DocumentViewModel
             Keys.Clear();
             foreach (var k in keys)
                 Keys.Add(new ApiKeyRow(k.Id, string.Join(", ", k.Scopes), k.Description, k.CreatedAt));
+
+            // Populate the database picker for db-scoped keys.
+            try
+            {
+                var dbs = await _connection.GetDatabasesAsync();
+                Databases.Clear();
+                foreach (var d in dbs) Databases.Add(d.Name);
+                SelectedDatabase ??= Databases.FirstOrDefault();
+            }
+            catch { /* keep any existing list */ }
+
             StatusMessage = $"{Keys.Count} key(s).";
         }
         catch (Exception ex)
@@ -66,21 +103,28 @@ public sealed partial class ApiKeysDocumentViewModel : DocumentViewModel
     [RelayCommand]
     private async Task CreateAsync()
     {
-        var scopes = NewScopes.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
-        if (scopes.Length == 0)
+        var choice = SelectedScope ?? ScopeChoices[0];
+        string scope;
+        if (choice.Kind == "*") scope = "*";
+        else if (choice.Kind == "db:*") scope = "db:*";
+        else
         {
-            StatusMessage = "Enter at least one scope (e.g. admin, or db:orders, or db:orders:read).";
-            return;
+            if (string.IsNullOrWhiteSpace(SelectedDatabase))
+            {
+                StatusMessage = "Pick a database for this scope.";
+                return;
+            }
+            scope = choice.Kind == "db-read" ? $"db:{SelectedDatabase}:read" : $"db:{SelectedDatabase}";
         }
+
         IsBusy = true;
         try
         {
             var created = await _connection.CreateApiKeyAsync(
-                string.IsNullOrWhiteSpace(NewDescription) ? null : NewDescription.Trim(), scopes);
+                string.IsNullOrWhiteSpace(NewDescription) ? null : NewDescription.Trim(), new[] { scope });
             CreatedSecret = created.Secret;
             NewDescription = "";
-            NewScopes = "";
-            StatusMessage = $"Created key {created.Id}. Copy the secret now — it can't be retrieved again.";
+            StatusMessage = $"Created key {created.Id} (scope {scope}). Copy the secret now — it can't be retrieved again.";
             await RefreshAsync();
         }
         catch (Exception ex)
