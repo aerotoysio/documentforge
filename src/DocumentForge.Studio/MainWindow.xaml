@@ -54,6 +54,7 @@
                         <MenuItem Header="Open (SELECT * … LIMIT 100)" Command="{Binding OpenCollectionCommand}"/>
                         <MenuItem Header="New Query" Command="{Binding NewQueryCommand}"/>
                         <Separator/>
+                        <MenuItem Header="Insert Document…" Command="{Binding InsertDocumentCommand}"/>
                         <MenuItem Header="New Index…" Command="{Binding NewIndexCommand}"/>
                         <MenuItem Header="Refresh" Command="{Binding RefreshCommand}"/>
                     </ContextMenu>

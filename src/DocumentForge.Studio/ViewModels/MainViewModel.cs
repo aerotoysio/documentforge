@@ -198,6 +198,39 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
+    /// <summary>Inserts a new document into a collection. Seeds the editor with a
+    /// template derived from an existing document (minus _id/_etag) so the user
+    /// starts from the collection's real shape.</summary>
+    public async Task InsertDocumentAsync(CollectionNodeViewModel collection)
+    {
+        var connection = collection.Database.Server.Connection;
+        var database = collection.Database.Info.Name;
+
+        string template;
+        try
+        {
+            var sample = await connection.ExecuteAsync(database, $"SELECT * FROM {collection.Name} LIMIT 1");
+            template = JsonDocumentTools.TemplateFromSample(sample.Documents.FirstOrDefault());
+        }
+        catch
+        {
+            template = JsonDocumentTools.TemplateFromSample(null);
+        }
+
+        var json = _dialogs.ShowInsertDocumentDialog(collection.Name, template);
+        if (json is null) return;
+
+        try
+        {
+            var id = await connection.InsertDocumentAsync(database, collection.Name, json);
+            StatusText = $"Inserted document {id} into {collection.Name}";
+        }
+        catch (Exception ex)
+        {
+            _dialogs.ShowError("Insert failed", ex.Message);
+        }
+    }
+
     public async Task DropIndexAsync(IndexNodeViewModel index, CollectionNodeViewModel owner)
     {
         if (!_dialogs.Confirm("Drop index", $"Drop index '{index.Info.Name}' on {owner.Name}?"))

@@ -20,6 +20,8 @@ public interface IDialogService
     ConnectRequest? ShowConnectDialog();
     NewDatabaseRequest? ShowNewDatabaseDialog(IReadOnlyList<ServerNodeViewModel> servers, string defaultDataDir);
     NewIndexRequest? ShowNewIndexDialog(string collection);
+    /// <summary>Returns the validated JSON to insert, or null if cancelled.</summary>
+    string? ShowInsertDocumentDialog(string collection, string template);
     DropChoice ConfirmDropDatabase(string databaseName);
     bool Confirm(string title, string message);
     void ShowError(string title, string message);

@@ -114,6 +114,45 @@ public sealed class DocumentEditTests
     }
 }
 
+public sealed class JsonDocumentToolsTests
+{
+    [Fact]
+    public void IsJsonObject_Accepts_Objects_Rejects_Others()
+    {
+        Assert.True(JsonDocumentTools.IsJsonObject("""{"a":1}""", out _));
+        Assert.False(JsonDocumentTools.IsJsonObject("[1,2]", out var arrErr));
+        Assert.NotNull(arrErr);
+        Assert.False(JsonDocumentTools.IsJsonObject("{bad", out var badErr));
+        Assert.NotNull(badErr);
+    }
+
+    [Fact]
+    public void TryPrettyPrint_Formats_Valid_And_Reports_Invalid()
+    {
+        Assert.True(JsonDocumentTools.TryPrettyPrint("""{"a":1}""", out var pretty, out _));
+        Assert.Contains("\n", pretty);
+        Assert.False(JsonDocumentTools.TryPrettyPrint("{bad", out _, out var err));
+        Assert.NotNull(err);
+    }
+
+    [Fact]
+    public void TemplateFromSample_Strips_Id_And_Etag()
+    {
+        var template = JsonDocumentTools.TemplateFromSample("""{"_id":"x","_etag":"y","pnr":"ABC","seats":3}""");
+        Assert.DoesNotContain("_id", template);
+        Assert.DoesNotContain("_etag", template);
+        Assert.Contains("pnr", template);
+        Assert.Contains("seats", template);
+    }
+
+    [Fact]
+    public void TemplateFromSample_Falls_Back_To_Empty_Object()
+    {
+        Assert.Contains("{", JsonDocumentTools.TemplateFromSample(null));
+        Assert.Contains("{", JsonDocumentTools.TemplateFromSample("not json"));
+    }
+}
+
 public sealed class ResultTableTests
 {
     [Fact]

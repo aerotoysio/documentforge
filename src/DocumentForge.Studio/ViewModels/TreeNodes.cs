@@ -199,6 +199,9 @@ public sealed partial class CollectionNodeViewModel : TreeNodeViewModel
     private void NewQuery() => _main.OpenQuery(Database.Server.Connection, Database.Info.Name);
 
     [RelayCommand]
+    private Task InsertDocument() => _main.InsertDocumentAsync(this);
+
+    [RelayCommand]
     private Task NewIndex() => _main.CreateIndexAsync(this);
 }
 

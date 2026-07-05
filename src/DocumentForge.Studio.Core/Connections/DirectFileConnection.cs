@@ -129,6 +129,9 @@ public sealed class DirectFileConnection : IDfConnection
             if (coll.Delete(docId)) db.NotifyDocDeleted(collection, docId, doc);
         }, ct);
 
+    public Task<string> InsertDocumentAsync(string database, string collection, string json, CancellationToken ct = default) =>
+        Task.Run(() => EnsureConnected().Insert(collection, json).ToString(), ct);
+
     public Task<DatabaseInfo> CreateDatabaseAsync(string name, CancellationToken ct = default) =>
         throw new NotSupportedException("A direct-file connection is a single database. Use File > New Database to create a new file.");
 

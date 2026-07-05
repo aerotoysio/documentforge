@@ -181,6 +181,21 @@ public sealed class HttpConnection : IDfConnection
         }
     }
 
+    public async Task<string> InsertDocumentAsync(string database, string collection, string json, CancellationToken ct = default)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post,
+            $"db/{Uri.EscapeDataString(database)}/collections/{Uri.EscapeDataString(collection)}")
+        {
+            Content = new StringContent(json, Encoding.UTF8, "application/json"),
+        };
+        using var response = await _http.SendAsync(request, ct).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        using var doc = JsonDocument.Parse(body);
+        return doc.RootElement.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "";
+    }
+
     public async Task<DatabaseInfo> CreateDatabaseAsync(string name, CancellationToken ct = default)
     {
         using var response = await _http.PostAsJsonAsync(

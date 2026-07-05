@@ -32,6 +32,10 @@ public interface IDfConnection : IAsyncDisposable
     /// <summary>Deletes a document by its internal <c>_id</c>.</summary>
     Task DeleteDocumentAsync(string database, string collection, string id, CancellationToken ct = default);
 
+    /// <summary>Inserts a new document (raw JSON) into a collection, returning its
+    /// assigned internal <c>_id</c>. The collection is created if it doesn't exist.</summary>
+    Task<string> InsertDocumentAsync(string database, string collection, string json, CancellationToken ct = default);
+
     /// <summary>Requires <see cref="ConnectionCapabilities.CreateDatabase"/>.</summary>
     Task<DatabaseInfo> CreateDatabaseAsync(string name, CancellationToken ct = default);
 
