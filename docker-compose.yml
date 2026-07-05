@@ -5,18 +5,18 @@
 # if you'd rather pull our published image.
 #
 # Manage the engine with DocumentForge Studio (the Windows desktop app) — point
-# it at http://localhost:5000. Studio replaces the old Next.js admin UI.
+# it at http://localhost:4300. Studio replaces the old Next.js admin UI.
 #
 # Quickstart:
 #   cp .env.example .env          # then set DFDB_API_KEY (required)
 #   docker compose up -d
-#   curl http://localhost:5000/health   (engine API)
+#   curl http://localhost:4300/health   (engine API)
 #
 # Production tweaks worth knowing about:
 #   - DFDB_API_KEY in .env is REQUIRED — the engine refuses to start with
 #     no key configured (deny-by-default, issue #101)
 #   - Set DFDB_REPLICATION_SECRET if you'll add follower nodes
-#   - Bind ports to 127.0.0.1 (default) — only flip to "0.0.0.0:5000:5000"
+#   - Bind ports to 127.0.0.1 (default) — only flip to "0.0.0.0:4300:4300"
 #     if you understand your network
 #   - The engine writes documents into the `dfdb-data` volume — don't delete
 #     unless you mean it
@@ -32,12 +32,12 @@ services:
     env_file:
       - .env
     ports:
-      - "127.0.0.1:5000:5000"        # engine HTTP API
+      - "127.0.0.1:4300:4300"        # engine HTTP API
       # - "127.0.0.1:5500:5500"      # uncomment if running as a replication leader
     volumes:
       - dfdb-data:/data
     healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:5000/health || exit 1"]
+      test: ["CMD-SHELL", "curl -fsS http://localhost:4300/health || exit 1"]
       interval: 30s
       timeout: 3s
       start_period: 10s

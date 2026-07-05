@@ -7,17 +7,17 @@
 #
 # Run locally:
 #   docker build -t dfdb .
-#   docker run --rm -p 5000:5000 -v dfdb-data:/data dfdb
+#   docker run --rm -p 4300:4300 -v dfdb-data:/data dfdb
 #
 # With an API key + replication secret (production):
-#   docker run --rm -p 5000:5000 \
+#   docker run --rm -p 4300:4300 \
 #     -e DFDB_API_KEY=sk_prod_... \
 #     -e DFDB_REPLICATION_SECRET=repl_... \
 #     -v dfdb-data:/data \
 #     dfdb
 #
 # As a replication leader:
-#   docker run --rm -p 5000:5000 -p 5500:5500 \
+#   docker run --rm -p 4300:4300 -p 5500:5500 \
 #     -v dfdb-data:/data \
 #     dfdb serve --bind-all \
 #       --replication-role leader --replication-port 5500
@@ -93,9 +93,9 @@ ENV DFDB_IMAGE=${DFDB_IMAGE}
 # Defaults; every one of these can be overridden at `docker run` time.
 ENV DFDB_NODE_NAME=dfdb-1 \
     DFDB_DATA_DIR=/data \
-    DFDB_PORT=5000
+    DFDB_PORT=4300
 
-EXPOSE 5000 5500
+EXPOSE 4300 5500
 
 # Render sets $PORT; the entrypoint maps PORT -> DFDB_PORT and forwards args.
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
@@ -104,4 +104,4 @@ ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 CMD ["serve", "--bind-all"]
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -fsS "http://localhost:${DFDB_PORT:-5000}/health" || exit 1
+    CMD curl -fsS "http://localhost:${DFDB_PORT:-4300}/health" || exit 1

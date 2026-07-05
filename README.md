@@ -6,7 +6,7 @@ replication, sharding — in ~6,000 lines with zero external dependencies.**
 **One binary does it all:**
 
 ```bash
-dfdb serve    --port 5000 --api-key <key>         # run a node (auth is required;
+dfdb serve    --port 4300 --api-key <key>         # run a node (auth is required;
                                                   #  --insecure-dev-mode for local-only tinkering)
 dfdb repl     ./data/data.dfdb                    # interactive SQL
 dfdb query    ./data/data.dfdb "SELECT * FROM o"  # one-shot query
@@ -15,6 +15,8 @@ dfdb cluster  init cluster.json                   # cluster config
 dfdb health   cluster.json                        # ping every shard
 dfdb rebalance old.json new.json                  # safely reshape
 ```
+
+> **Standard port:** DocumentForge listens on **`4300`** by default (the way SQL Server uses 1433, Postgres 5432, Mongo 27017). Override any time with `--port`. It sits below the Linux ephemeral range and avoids the crowded `:5000` (Flask, ASP.NET dev, macOS AirPlay).
 
 Or embed as a library:
 
@@ -81,7 +83,7 @@ Produces `dist/win-x64/dfdb.exe` (and friends) — drop on any server:
 # Serve a node — an API key is required (deny-by-default).
 # For throwaway local tinkering you can pass --insecure-dev-mode instead
 # (loopback only; every request is admin until a key is added).
-./dfdb serve --port 5000 --data-dir ./data --api-key "$(openssl rand -hex 24)"
+./dfdb serve --port 4300 --data-dir ./data --api-key "$(openssl rand -hex 24)"
 
 # Seed + query
 ./dfdb seed  ./data/data.dfdb 10000

@@ -11,12 +11,21 @@ namespace DocumentForge.Cli;
 ///   3. Env vars (DFDB_PORT, DFDB_DATA_DIR, DFDB_NODE_NAME, DFDB_API_KEY, DFDB_REPLICATION_SECRET,
 ///                DFDB_INSECURE_DEV_MODE, DFDB_REPLICATION_ROLE, DFDB_REPLICATION_PORT,
 ///                DFDB_LEADER_HOST, DFDB_LEADER_PORT, DFDB_AUTO_FAILOVER_SECONDS)
-///   4. Defaults (single-node localhost:5000 with CWD/data, no replication)
+///   4. Defaults (single-node localhost:4300 with CWD/data, no replication)
+///
+/// Issue #110 — 4300 is DocumentForge's standard, documented default port
+/// (the way 1433 is SQL Server, 5432 Postgres, 27017 Mongo). It sits below the
+/// Linux ephemeral range and doesn't collide with common dev servers on :5000
+/// (Flask, ASP.NET dev, macOS AirPlay). Always overridable via --port.
 /// </summary>
 public sealed class NodeConfig
 {
     public string NodeName { get; set; } = "node-1";
-    public int Port { get; set; } = 5000;
+
+    /// <summary>Standard DocumentForge service port (issue #110). Override with --port.</summary>
+    public const int DefaultPort = 4300;
+
+    public int Port { get; set; } = DefaultPort;
     public string DataDir { get; set; } = Path.Combine(Directory.GetCurrentDirectory(), "data");
     public bool BindAllInterfaces { get; set; } = false;
 
@@ -122,7 +131,7 @@ public sealed class NodeConfig
         var envKey  = Environment.GetEnvironmentVariable("DFDB_API_KEY");
         var envRep  = Environment.GetEnvironmentVariable("DFDB_REPLICATION_SECRET");
         if (c.NodeName == "node-1" && !string.IsNullOrEmpty(envName)) c.NodeName = envName;
-        if (c.Port == 5000 && int.TryParse(envPort, out var p)) c.Port = p;
+        if (c.Port == DefaultPort && int.TryParse(envPort, out var p)) c.Port = p;
         if (c.DataDir.EndsWith("data") && !string.IsNullOrEmpty(envDir)) c.DataDir = envDir;
         if (!string.IsNullOrEmpty(envKey))
         {
@@ -196,7 +205,7 @@ public sealed class NodeConfig
 public sealed class NetworkConfig
 {
     /// <summary>
-    /// HTTP base URL this node is reachable at, e.g. <c>http://10.0.0.5:5000</c>
+    /// HTTP base URL this node is reachable at, e.g. <c>http://10.0.0.5:4300</c>
     /// or <c>https://dfdb.example.com</c>. Trailing slash is normalized away.
     /// Sent on the replication handshake so peers + the admin-UI can
     /// auto-discover the topology without guessing port/scheme.

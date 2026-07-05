@@ -257,7 +257,7 @@ static int PrintHelp()
     dfctl inspect airline.dfdb
     dfctl query airline.dfdb "SELECT * FROM orders WHERE pnr = 'ABC123'"
     dfctl cluster init cluster.json
-    dfctl cluster add-shard cluster.json dubai dubai.internal:5000
+    dfctl cluster add-shard cluster.json dubai dubai.internal:4300
     dfctl cluster add-collection cluster.json orders hash pnr
     dfctl cluster add-collection cluster.json airports replicated
     dfctl health cluster.json

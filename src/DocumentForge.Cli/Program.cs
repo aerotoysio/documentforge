@@ -105,8 +105,8 @@ public class Program
         Console.WriteLine("    dfdb cluster init cluster.json");
         Console.WriteLine("    dfdb health  cluster.json");
         Console.WriteLine();
-        Console.WriteLine("    # Leader:");
-        Console.WriteLine("    dfdb serve --port 5000 --data-dir ./data/leader \\");
+        Console.WriteLine("    # Leader (4300 is the standard default port; --port shown for clarity):");
+        Console.WriteLine("    dfdb serve --port 4300 --data-dir ./data/leader \\");
         Console.WriteLine("               --replication-role leader --replication-port 5500");
         Console.WriteLine();
         Console.WriteLine("    # Follower with auto-failover:");

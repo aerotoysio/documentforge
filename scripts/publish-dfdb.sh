@@ -35,5 +35,5 @@ done
 
 echo ""
 echo "All done. Drop the binary on any machine and run it:"
-echo "  dfdb serve --port 5000 --data-dir ./data"
+echo "  dfdb serve --port 4300 --data-dir ./data"
 echo ""
