@@ -969,6 +969,12 @@ public sealed class QueryExecutor
                 var val = ConvertToSearchValueFor(clause.Value, clause.ValueType, oldDoc);
                 SetNestedValue(newDoc, clause.Path, val);
             }
+            // Issue #103: refresh the optimistic-concurrency token on every SQL
+            // UPDATE. Pre-fix, UPDATE left _etag untouched, so a client holding
+            // a stale ETag could still pass a later If-Match and clobber the
+            // SQL-modified state. Re-stamping keeps SQL writes consistent with
+            // the Insert/Replace path.
+            newDoc.StampFreshEtag();
             if (collection.Update(id, newDoc))
             {
                 _indexManager.OnDocumentUpdated(stmt.Collection, id, oldDoc, newDoc);

@@ -614,6 +614,16 @@ public static class ServeCommand
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
 
+        // Issue #103 — atomic conditional update / compare-and-set. Applies the
+        // operations only if every condition holds, all under one write lock,
+        // so racing callers can't both win (e.g. "decrement seats if >= 1").
+        // 200 on success, 409 when a condition fails, 404 not found.
+        app.MapPost("/collections/{name}/{id}/conditional", (string name, string id, HttpRequest request) =>
+        {
+            if (!IsValidCollectionName(name)) return Task.FromResult(InvalidCollectionNameResult());
+            return ConditionalUpdateHandler.Handle(db, name, id, request);
+        });
+
         // Replace by business key. Finds the first document where {field} = {value}
         // and replaces its content with the request body. Field name and value are
         // sanitised the same way as the GET/DELETE by-field routes.

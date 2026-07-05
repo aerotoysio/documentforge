@@ -1102,6 +1102,16 @@ public static class DatabaseEndpoints
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
 
+        // Issue #103 — scoped atomic conditional update / compare-and-set.
+        app.MapPost("/db/{name}/collections/{collection}/{id}/conditional",
+            (HttpContext ctx, string name, string collection, string id, HttpRequest request) =>
+        {
+            if (ScopeCheck.RequireDbWrite(ctx, name) is { } deny) return Task.FromResult(deny);
+            var db = registry.TryGet(name);
+            if (db is null) return Task.FromResult(Results.NotFound(new { error = $"Database '{name}' is not attached." }));
+            return ConditionalUpdateHandler.Handle(db, collection, id, request);
+        });
+
         // Scoped delete by internal _id.
         app.MapDelete("/db/{name}/collections/{collection}/{id}", (HttpContext ctx, string name, string collection, string id) =>
         {

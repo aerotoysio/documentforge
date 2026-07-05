@@ -78,6 +78,12 @@ public sealed class BsonDocument : IEnumerable<KeyValuePair<string, BsonValue>>
         return FromJsonElement(jsonDoc.RootElement);
     }
 
+    /// <summary>Convert a single JSON value into a <see cref="BsonValue"/> —
+    /// same rules as document parsing. Used by the conditional-update HTTP
+    /// endpoint (issue #103) to turn condition/operation operands into typed
+    /// values.</summary>
+    public static BsonValue ValueFromJson(JsonElement element) => ConvertJsonValue(element);
+
     internal static BsonDocument FromJsonElement(JsonElement element)
     {
         var doc = new BsonDocument();

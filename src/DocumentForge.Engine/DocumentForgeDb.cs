@@ -751,6 +751,151 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         ReplaceIfEtag(collectionName, id, BsonDocument.FromJson(json), expectedEtag);
 
     /// <summary>
+    /// Issue #103 — atomic conditional update / compare-and-set. Reads the
+    /// document, checks every <paramref name="conditions"/> predicate against
+    /// its current state, and only if ALL hold applies every
+    /// <paramref name="operations"/> mutation, re-stamps <c>_etag</c>, updates
+    /// indexes, and durably commits — the whole check-then-write inside ONE
+    /// write-lock window. Two agents racing to book the last seat can no longer
+    /// both succeed: the loser's <c>seats &gt;= 1</c> condition fails after the
+    /// winner's decrement. Returns a <see cref="ConditionalUpdateResult"/>
+    /// distinguishing success, not-found, and condition-failed (no throw for
+    /// the expected concurrency loss — the caller maps it to HTTP 409).
+    /// </summary>
+    public ConditionalUpdateResult TryConditionalUpdate(
+        string collectionName, DocumentId id,
+        IReadOnlyList<UpdateCondition> conditions,
+        IReadOnlyList<UpdateOperation> operations)
+    {
+        ThrowIfReadOnly();
+        EnsureHealthy();
+        _transactionManager.AcquireWriteLock();
+        try
+        {
+            return TrackHealth(() =>
+            {
+                var collection = _catalog.GetCollection(collectionName);
+                if (collection is null) return ConditionalUpdateResult.NotFound;
+                var oldDoc = collection.FindById(id);
+                if (oldDoc is null) return ConditionalUpdateResult.NotFound;
+
+                // Evaluate every condition against the CURRENT doc. First
+                // failure short-circuits — nothing is written.
+                foreach (var cond in conditions)
+                {
+                    if (!EvaluateCondition(oldDoc, cond))
+                        return ConditionalUpdateResult.Failed(DescribeCondition(cond));
+                }
+
+                var newDoc = ShallowClone(oldDoc);
+                foreach (var op in operations)
+                    ApplyOperation(newDoc, op);
+
+                newDoc["_id"] = oldDoc["_id"]; // preserve identity
+                newDoc.StampFreshEtag();       // every write refreshes the CAS token
+
+                _indexManager.OnDocumentUpdated(collectionName, id, oldDoc, newDoc);
+                if (!collection.Update(id, newDoc))
+                {
+                    try { _indexManager.OnDocumentUpdated(collectionName, id, newDoc, oldDoc); } catch { }
+                    return ConditionalUpdateResult.NotFound;
+                }
+
+                if (_logicalServer is not null)
+                {
+                    _logicalServer.BroadcastNewOp(LogicalOpType.Delete, collectionName, BsonSerializer.Serialize(oldDoc));
+                    _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, BsonSerializer.Serialize(newDoc));
+                }
+                CommitDurableLocked();
+                return ConditionalUpdateResult.Ok(newDoc.GetEtag(), newDoc);
+            });
+        }
+        finally
+        {
+            _transactionManager.ReleaseWriteLock();
+        }
+    }
+
+    private static BsonDocument ShallowClone(BsonDocument src)
+    {
+        // Copy the field list. BsonValues are replaced (never mutated in place)
+        // by ApplyOperation, so sharing references with the source is safe and
+        // preserves types like the ObjectId _id that a JSON round-trip loses.
+        var dst = new BsonDocument();
+        foreach (var kv in src) dst[kv.Key] = kv.Value;
+        return dst;
+    }
+
+    private static bool EvaluateCondition(BsonDocument doc, UpdateCondition cond)
+    {
+        switch (cond.Op)
+        {
+            case ConditionOp.Exists: return doc.ContainsKey(cond.Field);
+            case ConditionOp.NotExists: return !doc.ContainsKey(cond.Field);
+        }
+        // Comparisons. An absent field reads as Null, which BsonValue orders
+        // below every non-null value — so "seats >= 1" on a missing field
+        // correctly fails rather than decrementing a non-existent seat count.
+        var actual = doc[cond.Field];
+        var expected = cond.Value ?? BsonValue.Null;
+        int cmp = actual.CompareTo(expected);
+        return cond.Op switch
+        {
+            ConditionOp.Eq => cmp == 0,
+            ConditionOp.Ne => cmp != 0,
+            ConditionOp.Lt => cmp < 0,
+            ConditionOp.Lte => cmp <= 0,
+            ConditionOp.Gt => cmp > 0,
+            ConditionOp.Gte => cmp >= 0,
+            _ => false,
+        };
+    }
+
+    private static void ApplyOperation(BsonDocument doc, UpdateOperation op)
+    {
+        switch (op.Op)
+        {
+            case MutationOp.Set:
+                doc[op.Field] = op.Value ?? BsonValue.Null;
+                break;
+            case MutationOp.Inc:
+            case MutationOp.Dec:
+            {
+                var delta = op.Value ?? BsonValue.Null;
+                if (!delta.IsNumeric)
+                    throw new DocumentForgeException(
+                        $"Conditional update: {op.Op} on '{op.Field}' requires a numeric operand.");
+                var current = doc.ContainsKey(op.Field) ? doc[op.Field] : BsonValue.FromInt32(0);
+                if (!current.IsNumeric)
+                    throw new DocumentForgeException(
+                        $"Conditional update: cannot {op.Op} non-numeric field '{op.Field}'.");
+                bool integral = current.Type is BsonType.Int32 or BsonType.Int64
+                             && delta.Type is BsonType.Int32 or BsonType.Int64;
+                long isign = op.Op == MutationOp.Dec ? -1 : 1;
+                if (integral)
+                {
+                    long result = current.AsInt64 + isign * delta.AsInt64;
+                    // Keep the field's width stable across updates (an Int32
+                    // seat count stays Int32) unless the result overflows Int32.
+                    doc[op.Field] = current.Type == BsonType.Int32 && result is >= int.MinValue and <= int.MaxValue
+                        ? BsonValue.FromInt32((int)result)
+                        : BsonValue.FromInt64(result);
+                }
+                else
+                {
+                    doc[op.Field] = BsonValue.FromDouble(current.AsDouble + isign * delta.AsDouble);
+                }
+                break;
+            }
+        }
+    }
+
+    private static string DescribeCondition(UpdateCondition c) =>
+        c.Op is ConditionOp.Exists or ConditionOp.NotExists
+            ? $"{c.Field} {c.Op}"
+            : $"{c.Field} {c.Op} {c.Value}";
+
+    /// <summary>
     /// Convenience overload: parse JSON then replace.
     /// </summary>
     public bool Replace(string collectionName, DocumentId id, string json)
