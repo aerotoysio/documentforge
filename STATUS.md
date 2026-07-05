@@ -81,7 +81,6 @@ cd documentforge
 git checkout master
 dotnet build
 dotnet test                      # full suite green; one known-flaky LogicalReplication test
-cd admin-ui && npm install
 ```
 
 Run the stack locally:
@@ -90,14 +89,10 @@ Run the stack locally:
 # Terminal A — host service (Studio connects here)
 dotnet src/DocumentForge.Cli/bin/Release/net9.0/dfdb.dll serve --data-dir /tmp/dfdb_dev --port 5099
 
-# Terminal B — Studio (port 3000 is often taken locally; 3001 is the dev default here)
-cd admin-ui
-NEXT_PUBLIC_DFDB_URL=http://localhost:5099 npx next dev -p 3001
-
-# Browser
-http://localhost:3001/studio       # SQL editor + Explorer (all connections → DBs → collections)
-http://localhost:3001/topology     # unified cluster builder canvas
-http://localhost:3001/connections  # add connections + spawn services/routers
+# DocumentForge Studio (Windows desktop app) — the management UI
+dotnet run --project src/DocumentForge.Studio
+#   then add an HTTP connection to http://localhost:5099
+#   (SQL editor + Explorer, cluster builder, connections, backups, API keys)
 ```
 
 To spin up a router via the REST endpoint:

@@ -29,20 +29,11 @@ dfdb health scripts/sample-cluster/cluster.json
 
 You should see three green dots.
 
-## Point the admin UI at a node
+## Manage a node with DocumentForge Studio
 
-```bash
-cd admin-ui
-
-# Windows
-$env:NEXT_PUBLIC_DFDB_URL = "http://localhost:5001"
-npm run dev
-
-# macOS / Linux
-NEXT_PUBLIC_DFDB_URL=http://localhost:5001 npm run dev
-```
-
-Then browse to http://localhost:3000
+Open DocumentForge Studio (the Windows desktop app) and add an HTTP
+connection pointing at a shard, e.g. `http://localhost:5001`. From there you
+get the SQL editor, explorer, cluster builder, backups and API-key tools.
 
 ## Write through the cluster
 

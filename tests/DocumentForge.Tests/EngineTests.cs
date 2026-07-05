@@ -1958,7 +1958,7 @@ public class EngineTests : IDisposable
         Assert.True(del.Success);
         Assert.Equal(1, del.AffectedCount);
 
-        // Re-insert via the same code path admin-ui uses (db.Insert), with the
+        // Re-insert via the normal insert code path (db.Insert), with the
         // same email - must succeed.
         _db.Insert(coll, """{"email":"a@b.com","v":2}""");
         var rows = _db.Execute($"SELECT * FROM {coll} WHERE email = 'a@b.com'").Documents;
@@ -3694,7 +3694,7 @@ public class EngineTests : IDisposable
     //
     // Followers advertise their HTTP base URL during the replication
     // handshake so the leader can surface it on /replication/status. The
-    // admin-UI's "Discover network" button uses this to walk peers
+    // Studio "Discover network" feature uses this to walk peers
     // without guessing port/scheme.
 
     [Fact]
@@ -3765,7 +3765,7 @@ public class EngineTests : IDisposable
     {
         // A follower with ownHttpEndpoint=null (default — the legacy
         // behaviour) writes an empty endpoint suffix; the leader stores
-        // null and the admin-UI falls back to its port-guess.
+        // null and Studio falls back to its port-guess.
         int port = 5990 + System.Random.Shared.Next(10);
         var leaderPath = Path.Combine(Path.GetTempPath(), $"http_ep_legacy_l_{Guid.NewGuid():N}.dfdb");
         var followerPath = Path.Combine(Path.GetTempPath(), $"http_ep_legacy_f_{Guid.NewGuid():N}.dfdb");

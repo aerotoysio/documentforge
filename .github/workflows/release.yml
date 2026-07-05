@@ -1,20 +1,21 @@
 # Commit this to aerotoysio/documentforge as `.github/workflows/release.yml`.
 #
 # What it does:
-#  - On every push to master (or manual run), build BOTH images in parallel:
+#  - On every push to master (or manual run), build the engine image:
 #      - dfdb engine          (root Dockerfile)               -> ghcr.io/aerotoysio/documentforge:latest
-#      - admin UI (Next.js)   (admin-ui/Dockerfile)            -> ghcr.io/aerotoysio/documentforge-admin:latest
-#  - Each gets `latest` + `master-<sha>` tags so you can pin/rollback.
+#  - It gets `latest` + `master-<sha>` tags so you can pin/rollback.
 #  - Buildx caching via GitHub Actions cache makes incremental builds quick.
-#  - Watchtower on the host picks up either image's new digest and recreates
-#    just that container (volumes preserved).
+#  - Watchtower on the host picks up the image's new digest and recreates
+#    the container (volumes preserved).
+#
+# Management UI is now DocumentForge Studio (Windows desktop app), not a
+# container — the old Next.js admin UI image has been retired.
 #
 # Permissions: uses the auto-provisioned GITHUB_TOKEN. No PAT needed.
 #
-# After the first successful run, set both packages to "Public" in:
+# After the first successful run, set the package to "Public" in:
 #   https://github.com/orgs/aerotoysio/packages/container/documentforge/settings
-#   https://github.com/orgs/aerotoysio/packages/container/documentforge-admin/settings
-# (or give Watchtower a docker-login if you want them private.)
+# (or give Watchtower a docker-login if you want it private.)
 
 name: Build & publish dfdb images
 
@@ -46,15 +47,6 @@ jobs:
             context: .
             dockerfile: Dockerfile
             build_args: ""
-          - name: admin UI
-            image: ghcr.io/${{ github.repository_owner }}/documentforge-admin
-            context: ./admin-ui
-            dockerfile: admin-ui/Dockerfile
-            # NEXT_PUBLIC_* values are baked into the JS bundle at build time.
-            # Today we ship a single image targeting same-host browsers (localhost:5000).
-            # If you ever want a public-tunnel build, override this in a second matrix entry.
-            build_args: |
-              NEXT_PUBLIC_DFDB_URL=http://localhost:5000
 
     name: Build ${{ matrix.name }}
     steps:

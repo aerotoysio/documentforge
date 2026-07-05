@@ -16,9 +16,6 @@ coverage/
 .git/
 .gitignore
 
-# Admin UI - not shipped in the server image
-admin-ui/
-
 # Large local datasets
 scripts/sample-cluster/data/
 **/*.dfdb

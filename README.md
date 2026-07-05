@@ -137,8 +137,8 @@ samples/                     Demos showing how to use the library
   DocumentForge.Benchmark    250K / 10M document stress test
   DocumentForge.Ctl          `dfctl` management CLI (superseded by `dfdb`)
 
-admin-ui/                    Next.js 15 admin web UI (separate app)
-scripts/                     start-cluster, publish-dfdb, sample-cluster/
+src/DocumentForge.Studio/    DocumentForge Studio — Windows desktop admin app (WPF)
+scripts/                     start-cluster, publish-dfdb, build-studio-installer, sample-cluster/
 Dockerfile                   Multi-stage build → self-contained dfdb image
 render.yaml                  Render blueprint: one-click private deploy
 
