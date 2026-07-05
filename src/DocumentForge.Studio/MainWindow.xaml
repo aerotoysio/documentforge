@@ -36,6 +36,8 @@
                     <ContextMenu>
                         <MenuItem Header="New Query" Command="{Binding NewQueryCommand}"/>
                         <MenuItem Header="Refresh" Command="{Binding RefreshCommand}"/>
+                        <MenuItem Header="Replication…" Command="{Binding ReplicationCommand}"
+                                  Visibility="{Binding CanManageServer, Converter={StaticResource BoolToVis}}"/>
                         <MenuItem Header="Properties…" Command="{Binding PropertiesCommand}"/>
                         <Separator Visibility="{Binding CanDrop, Converter={StaticResource BoolToVis}}"/>
                         <MenuItem Header="Detach / Drop…" Command="{Binding DropCommand}"
@@ -100,6 +102,10 @@
         <!-- Document (tab) content templates -->
         <DataTemplate DataType="{x:Type vm:QueryDocumentViewModel}">
             <views:QueryDocumentView/>
+        </DataTemplate>
+
+        <DataTemplate DataType="{x:Type vm:ReplicationDocumentViewModel}">
+            <views:ReplicationView/>
         </DataTemplate>
 
         <DataTemplate DataType="{x:Type vm:WelcomeDocumentViewModel}">

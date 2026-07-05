@@ -1,0 +1,104 @@
+<UserControl x:Class="DocumentForge.Studio.Views.ReplicationView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="clr-namespace:DocumentForge.Studio.ViewModels"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             mc:Ignorable="d"
+             d:DataContext="{d:DesignInstance vm:ReplicationDocumentViewModel}">
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="16" MaxWidth="720" HorizontalAlignment="Left">
+
+            <!-- Header -->
+            <DockPanel>
+                <Button DockPanel.Dock="Right" Content="🔄 Refresh" Padding="10,4"
+                        Command="{Binding RefreshCommand}"/>
+                <StackPanel Orientation="Horizontal">
+                    <TextBlock Text="Replication" FontSize="20" FontWeight="Light"/>
+                    <Border Background="#EEF3FF" CornerRadius="3" Padding="8,2" Margin="12,0,0,0" VerticalAlignment="Center">
+                        <TextBlock Text="{Binding RoleText}" FontWeight="SemiBold" Foreground="#2A5DB0"/>
+                    </Border>
+                </StackPanel>
+            </DockPanel>
+            <TextBlock Text="{Binding Database}" Foreground="Gray" Margin="0,2,0,12"/>
+
+            <!-- Status summary -->
+            <Border Background="#F7F7F7" BorderBrush="#E0E0E0" BorderThickness="1" CornerRadius="4" Padding="12">
+                <TextBlock Text="{Binding Summary}" FontFamily="Consolas" FontSize="12" TextWrapping="Wrap"/>
+            </Border>
+
+            <!-- Followers -->
+            <TextBlock Text="Followers" FontWeight="SemiBold" Margin="0,16,0,4"/>
+            <DataGrid ItemsSource="{Binding Followers}" AutoGenerateColumns="False" IsReadOnly="True"
+                      HeadersVisibility="Column" GridLinesVisibility="Horizontal" MaxHeight="160"
+                      FontFamily="Consolas" FontSize="12">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="Endpoint" Binding="{Binding Endpoint}" Width="*"/>
+                    <DataGridTextColumn Header="HTTP" Binding="{Binding HttpEndpoint}" Width="*"/>
+                    <DataGridTextColumn Header="Lag (seq)" Binding="{Binding LagSeq}" Width="100"/>
+                </DataGrid.Columns>
+            </DataGrid>
+
+            <!-- Actions -->
+            <TextBlock Text="Actions" FontWeight="SemiBold" Margin="0,16,0,6"/>
+
+            <Grid Margin="0,0,0,8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="150"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="Start as leader" VerticalAlignment="Center"/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="port" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                    <TextBox Text="{Binding LeaderPort}" Width="70"/>
+                </StackPanel>
+                <Button Grid.Column="2" Content="Start Leader" Padding="10,3" MinWidth="120"
+                        Command="{Binding StartLeaderCommand}"/>
+            </Grid>
+
+            <Grid Margin="0,0,0,8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="150"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="Start as follower" VerticalAlignment="Center"/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="leader host" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                    <TextBox Text="{Binding FollowerHost}" Width="120" Margin="0,0,10,0"/>
+                    <TextBlock Text="port" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                    <TextBox Text="{Binding FollowerPort}" Width="70"/>
+                </StackPanel>
+                <Button Grid.Column="2" Content="Start Follower" Padding="10,3" MinWidth="120"
+                        Command="{Binding StartFollowerCommand}"/>
+            </Grid>
+
+            <Grid Margin="0,0,0,8">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="150"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" Text="Promote to leader" VerticalAlignment="Center"/>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
+                    <TextBlock Text="new leader port" VerticalAlignment="Center" Margin="0,0,4,0"/>
+                    <TextBox Text="{Binding PromotePort}" Width="70"/>
+                </StackPanel>
+                <Button Grid.Column="2" Content="Promote" Padding="10,3" MinWidth="120"
+                        Command="{Binding PromoteCommand}"/>
+            </Grid>
+
+            <TextBlock Foreground="Gray" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,0">
+                Note: read-only/read-write and auto-failover toggles are node-level in the current engine
+                and will appear here once per-database endpoints exist.
+            </TextBlock>
+
+            <!-- Status line -->
+            <Border Background="#F0F4FF" CornerRadius="3" Padding="8,5" Margin="0,12,0,0"
+                    Visibility="{Binding StatusMessage, Converter={StaticResource NonEmptyToVis}}">
+                <TextBlock Text="{Binding StatusMessage}" TextWrapping="Wrap" FontSize="12"/>
+            </Border>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

@@ -42,6 +42,13 @@ public interface IDfConnection : IAsyncDisposable
     /// <summary>Defragments a collection, reclaiming space from deleted documents.</summary>
     Task<CompactionInfo> CompactCollectionAsync(string database, string collection, CancellationToken ct = default);
 
+    // --- Replication (server connections only; requires ServerAdmin) ---
+
+    Task<ReplicationStatus> GetReplicationStatusAsync(string database, CancellationToken ct = default);
+    Task StartReplicationLeaderAsync(string database, int port, CancellationToken ct = default);
+    Task StartReplicationFollowerAsync(string database, string leaderHost, int leaderPort, CancellationToken ct = default);
+    Task PromoteReplicaAsync(string database, int port, CancellationToken ct = default);
+
     /// <summary>Requires <see cref="ConnectionCapabilities.CreateDatabase"/>.</summary>
     Task<DatabaseInfo> CreateDatabaseAsync(string name, CancellationToken ct = default);
 

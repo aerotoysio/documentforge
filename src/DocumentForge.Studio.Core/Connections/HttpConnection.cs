@@ -229,6 +229,82 @@ public sealed class HttpConnection : IDfConnection
             root.TryGetProperty("timeMs", out var t) ? t.GetDouble() : 0);
     }
 
+    public async Task<ReplicationStatus> GetReplicationStatusAsync(string database, CancellationToken ct = default)
+    {
+        var body = await GetRawAsync($"db/{Uri.EscapeDataString(database)}/replication/status", ct).ConfigureAwait(false);
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        var leader = root.GetProperty("leader");
+        var follower = root.TryGetProperty("follower", out var f) ? f : default;
+
+        var followers = new List<ReplicationFollowerInfo>();
+        if (leader.TryGetProperty("followers", out var fs) && fs.ValueKind == JsonValueKind.Array)
+            foreach (var el in fs.EnumerateArray())
+                followers.Add(new ReplicationFollowerInfo(
+                    el.TryGetProperty("endpoint", out var ep) ? ep.GetString() ?? "" : "",
+                    el.TryGetProperty("httpEndpoint", out var he) && he.ValueKind == JsonValueKind.String ? he.GetString() : null,
+                    el.TryGetProperty("worstCaseLagSeq", out var lag) ? (long)lag.GetUInt64() : 0));
+
+        string? followerLeader = null;
+        if (follower.ValueKind == JsonValueKind.Object
+            && follower.TryGetProperty("leader", out var fl) && fl.ValueKind == JsonValueKind.Object
+            && fl.TryGetProperty("endpoint", out var fle))
+            followerLeader = fle.GetString();
+
+        var hasFollower = follower.ValueKind == JsonValueKind.Object;
+        return new ReplicationStatus(
+            Role: root.TryGetProperty("role", out var r) ? r.GetString() ?? "none" : "none",
+            ReadOnly: root.TryGetProperty("readOnly", out var ro) && Truthy(ro),
+            CurrentSeq: leader.TryGetProperty("currentSeq", out var cs) ? Int(cs) : 0,
+            LeaderPort: leader.TryGetProperty("port", out var lp) && lp.ValueKind == JsonValueKind.Number ? lp.GetInt32() : 0,
+            FollowerCount: leader.TryGetProperty("followerCount", out var fc) && fc.ValueKind == JsonValueKind.Number ? fc.GetInt32() : followers.Count,
+            Followers: followers,
+            FollowerLastAppliedSeq: hasFollower && follower.TryGetProperty("lastAppliedSeq", out var las) ? Int(las) : 0,
+            OpsApplied: hasFollower && follower.TryGetProperty("opsApplied", out var oa) ? Int(oa) : 0,
+            GapsDetected: hasFollower && follower.TryGetProperty("gapsDetected", out var gd) && Truthy(gd),
+            AutoFailoverPromoted: hasFollower && follower.TryGetProperty("autoFailoverPromoted", out var afp) && Truthy(afp),
+            FollowerLeaderEndpoint: followerLeader);
+    }
+
+    // The replication endpoint mixes types across versions (e.g. gapsDetected as
+    // a bool or a count, port as a number or null) — read defensively.
+    private static long Int(JsonElement e) => e.ValueKind == JsonValueKind.Number ? (long)e.GetUInt64() : 0;
+
+    private static bool Truthy(JsonElement e) => e.ValueKind switch
+    {
+        JsonValueKind.True => true,
+        JsonValueKind.Number => e.TryGetInt64(out var n) && n != 0,
+        _ => false,
+    };
+
+    public Task StartReplicationLeaderAsync(string database, int port, CancellationToken ct = default) =>
+        PostReplicationAsync($"db/{Uri.EscapeDataString(database)}/replication/start-leader", new { port }, ct);
+
+    public Task StartReplicationFollowerAsync(string database, string leaderHost, int leaderPort, CancellationToken ct = default) =>
+        PostReplicationAsync($"db/{Uri.EscapeDataString(database)}/replication/start-follower", new { host = leaderHost, port = leaderPort }, ct);
+
+    public Task PromoteReplicaAsync(string database, int port, CancellationToken ct = default) =>
+        PostReplicationAsync($"db/{Uri.EscapeDataString(database)}/replication/promote", new { port }, ct);
+
+    private async Task PostReplicationAsync(string url, object payload, CancellationToken ct)
+    {
+        using var response = await _http.PostAsJsonAsync(url, payload, Json, ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        }
+    }
+
+    private async Task<string> GetRawAsync(string relativeUrl, CancellationToken ct)
+    {
+        using var response = await _http.GetAsync(relativeUrl, ct).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        return body;
+    }
+
     public async Task<DatabaseInfo> CreateDatabaseAsync(string name, CancellationToken ct = default)
     {
         using var response = await _http.PostAsJsonAsync(

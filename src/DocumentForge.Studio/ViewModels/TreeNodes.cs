@@ -147,6 +147,9 @@ public sealed partial class DatabaseNodeViewModel : TreeNodeViewModel
 
     public bool CanDrop => Server.Connection.Capabilities.HasFlag(ConnectionCapabilities.DropDatabase);
 
+    /// <summary>Server-only features (replication, admin) are hidden for direct-file connections.</summary>
+    public bool CanManageServer => Server.Connection.Capabilities.HasFlag(ConnectionCapabilities.ServerAdmin);
+
     protected override async Task<IReadOnlyList<TreeNodeViewModel>> LoadChildrenAsync()
     {
         var collections = await Server.Connection.GetCollectionNamesAsync(Info.Name);
@@ -158,6 +161,9 @@ public sealed partial class DatabaseNodeViewModel : TreeNodeViewModel
 
     [RelayCommand]
     private void NewQuery() => _main.OpenQuery(Server.Connection, Info.Name);
+
+    [RelayCommand]
+    private void Replication() => _main.OpenReplication(this);
 
     [RelayCommand]
     private Task PropertiesAsync() => _main.ShowDatabasePropertiesAsync(this);

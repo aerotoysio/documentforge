@@ -144,6 +144,15 @@ public sealed class DirectFileConnection : IDfConnection
             return new CompactionInfo(result.PagesCompacted, result.BytesReclaimed, sw.Elapsed.TotalMilliseconds);
         }, ct);
 
+    private static Task ReplicationNotSupported() =>
+        throw new NotSupportedException("Replication is only available through a DocumentForge service, not a direct-file connection.");
+
+    public Task<ReplicationStatus> GetReplicationStatusAsync(string database, CancellationToken ct = default) =>
+        throw new NotSupportedException("Replication is only available through a DocumentForge service, not a direct-file connection.");
+    public Task StartReplicationLeaderAsync(string database, int port, CancellationToken ct = default) => ReplicationNotSupported();
+    public Task StartReplicationFollowerAsync(string database, string leaderHost, int leaderPort, CancellationToken ct = default) => ReplicationNotSupported();
+    public Task PromoteReplicaAsync(string database, int port, CancellationToken ct = default) => ReplicationNotSupported();
+
     public Task<DatabaseInfo> CreateDatabaseAsync(string name, CancellationToken ct = default) =>
         throw new NotSupportedException("A direct-file connection is a single database. Use File > New Database to create a new file.");
 

@@ -363,6 +363,19 @@ public sealed partial class MainViewModel : ObservableObject
         StatusText = $"New query on {database}";
     }
 
+    /// <summary>Opens (or re-focuses) the replication panel for a database.</summary>
+    public void OpenReplication(DatabaseNodeViewModel database)
+    {
+        var contentId = $"repl:{database.Server.Connection.Descriptor.Id}:{database.Info.Name}";
+        var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
+        if (existing is not null) { ActiveDocument = existing; return; }
+
+        var document = new ReplicationDocumentViewModel(database.Server.Connection, database.Info.Name);
+        Documents.Add(document);
+        ActiveDocument = document;
+        StatusText = $"Replication — {database.Info.Name}";
+    }
+
     /// <summary>Opens a query tab against a server's default database (or its
     /// first, for a single-file connection).</summary>
     public async Task OpenQueryOnServerAsync(ServerNodeViewModel server)
