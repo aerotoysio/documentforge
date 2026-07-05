@@ -43,7 +43,9 @@ public sealed class HttpConnection : IDfConnection
         var baseUrl = descriptor.Url!.TrimEnd('/') + "/";
         _http = handler is null ? new HttpClient() : new HttpClient(handler);
         _http.BaseAddress = new Uri(baseUrl);
-        _http.Timeout = TimeSpan.FromSeconds(30);
+        // A generous ceiling; per-query timeouts are enforced by the caller's
+        // CancellationToken (the workbench "Timeout (s)" field), which fires first.
+        _http.Timeout = TimeSpan.FromMinutes(10);
         if (!string.IsNullOrEmpty(apiKey))
             _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
     }

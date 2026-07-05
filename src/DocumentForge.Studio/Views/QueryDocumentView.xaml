@@ -18,7 +18,8 @@
         <!-- Toolbar -->
         <ToolBarTray Grid.Row="0" IsLocked="True">
             <ToolBar>
-                <Button x:Name="RunButton" Click="OnRun" ToolTip="Execute (F5)" Padding="8,2">▶ Run</Button>
+                <Button x:Name="RunButton" Click="OnRun" Padding="8,2"
+                        ToolTip="Execute (F5). Runs the selected text if any, otherwise the whole editor.">▶ Run</Button>
                 <Button Command="{Binding CancelCommand}" ToolTip="Cancel" Padding="8,2">■ Cancel</Button>
                 <Separator/>
                 <TextBlock Text="Database:" VerticalAlignment="Center" Margin="4,0,4,0"/>
@@ -27,6 +28,10 @@
                 <CheckBox Content="Limit rows" IsChecked="{Binding LimitRows}" VerticalAlignment="Center"/>
                 <TextBox Text="{Binding RowLimit}" Width="56" Margin="4,0,0,0" VerticalAlignment="Center"
                          ToolTip="Auto-append LIMIT to unbounded SELECTs"/>
+                <Separator/>
+                <TextBlock Text="Timeout (s):" VerticalAlignment="Center" Margin="4,0,4,0"/>
+                <TextBox Text="{Binding TimeoutSeconds}" Width="44" VerticalAlignment="Center"
+                         ToolTip="Auto-cancel the query after N seconds (0 = no timeout)"/>
                 <Separator/>
                 <TextBlock Text="History:" VerticalAlignment="Center" Margin="4,0,4,0"/>
                 <ComboBox x:Name="HistoryCombo" Width="240" ItemsSource="{Binding History}"

@@ -48,7 +48,11 @@ public partial class QueryDocumentView : UserControl
 
     private async Task RunAsync()
     {
-        if (ViewModel is { } vm) await vm.ExecuteAsync(Editor.Text);
+        if (ViewModel is not { } vm) return;
+        // SSMS behaviour: run the selection if there is one, else the whole editor.
+        var selection = Editor.SelectedText;
+        var sql = string.IsNullOrWhiteSpace(selection) ? Editor.Text : selection;
+        await vm.ExecuteAsync(sql);
     }
 
     // Keep the engine's own _id / _etag columns read-only even when the grid

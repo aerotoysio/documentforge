@@ -24,6 +24,7 @@ public sealed partial class QueryDocumentViewModel : DocumentViewModel
         Title = $"Query — {database}";
         LimitRows = true;
         RowLimit = workspace.Settings.DefaultQueryLimit;
+        TimeoutSeconds = workspace.Settings.DefaultQueryTimeoutSeconds;
         ReloadHistory();
     }
 
@@ -40,6 +41,10 @@ public sealed partial class QueryDocumentViewModel : DocumentViewModel
 
     [ObservableProperty]
     private int _rowLimit;
+
+    /// <summary>Auto-cancel the query after this many seconds (0 = no timeout).</summary>
+    [ObservableProperty]
+    private int _timeoutSeconds;
 
     [ObservableProperty]
     private bool _isBusy;
@@ -105,6 +110,8 @@ public sealed partial class QueryDocumentViewModel : DocumentViewModel
         Messages = "Executing…";
         StatusSummary = "Executing…";
         _cts = new CancellationTokenSource();
+        if (TimeoutSeconds > 0) _cts.CancelAfter(TimeSpan.FromSeconds(TimeoutSeconds));
+        var started = Environment.TickCount64;
         try
         {
             var result = await _connection.ExecuteAsync(Database, effective, _cts.Token);
@@ -163,8 +170,12 @@ public sealed partial class QueryDocumentViewModel : DocumentViewModel
         }
         catch (OperationCanceledException)
         {
-            Messages = "Query canceled.";
-            StatusSummary = "Canceled";
+            var elapsedSec = (Environment.TickCount64 - started) / 1000.0;
+            var timedOut = TimeoutSeconds > 0 && elapsedSec >= TimeoutSeconds - 0.5;
+            Messages = timedOut
+                ? $"Query canceled after the {TimeoutSeconds}s timeout. Increase \"Timeout (s)\" or add a tighter WHERE/LIMIT."
+                : "Query canceled.";
+            StatusSummary = timedOut ? $"Timed out ({TimeoutSeconds}s)" : "Canceled";
             SelectedResultTab = 2;
         }
         catch (Exception ex)
