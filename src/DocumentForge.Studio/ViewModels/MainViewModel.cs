@@ -503,10 +503,63 @@ public sealed partial class MainViewModel : ObservableObject
         var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
         if (existing is not null) { ActiveDocument = existing; return; }
 
-        var document = new ApiKeysDocumentViewModel(server.Connection);
+        var document = new ApiKeysDocumentViewModel(server.Connection, () => SecureServerAsync(server));
         Documents.Add(document);
         ActiveDocument = document;
         StatusText = $"API Keys — {server.Connection.Descriptor.Name}";
+    }
+
+    /// <summary>Secures an open (dev-mode) server: mints an admin key, switches
+    /// THIS connection to use it, and reconnects — so you don't lock yourself
+    /// out (creating the first key ends dev-mode immediately).</summary>
+    public async Task SecureServerAsync(ServerNodeViewModel server)
+    {
+        var descriptor = server.Connection.Descriptor;
+        if (descriptor.ApiKeySecretId is not null)
+        {
+            _dialogs.ShowInfo("Already secured", "This connection already uses an API key.");
+            return;
+        }
+        if (!_dialogs.Confirm("Secure server",
+                "This creates an admin API key on the server and switches this connection to use it. " +
+                "The server will then require a key for every request.\n\nContinue?"))
+            return;
+
+        Core.Models.CreatedApiKey created;
+        // "*" is the admin scope in DocumentForge (see AuthContext.FromScopes).
+        try { created = await server.Connection.CreateApiKeyAsync("Studio admin key", new[] { "*" }); }
+        catch (Exception ex) { _dialogs.ShowError("Secure failed", ex.Message); return; }
+
+        // Persist the key onto the connection and reconnect with it.
+        var isSaved = _workspace.Connections.Any(c => c.Id == descriptor.Id);
+        descriptor.ApiKeySecretId = _workspace.Secrets.Set(descriptor.ApiKeySecretId, created.Secret);
+        if (isSaved) _workspace.SaveConnections();
+
+        // Close the API Keys tab bound to the now-stale connection.
+        if (Documents.FirstOrDefault(d => d.ContentId == $"keys:{descriptor.Id}") is { } keysDoc)
+            Documents.Remove(keysDoc);
+
+        await DisconnectAsync(server);
+        var connection = ConnectionFactory.Create(descriptor, created.Secret);
+        try
+        {
+            await connection.ConnectAsync();
+            var node = new ServerNodeViewModel(this, connection);
+            Servers.Add(node);
+            node.IsExpanded = true;
+            StatusText = $"Secured {descriptor.Name} and reconnected with the admin key.";
+            _dialogs.ShowInfo("Server secured",
+                "The server now requires an API key. This connection was updated to use the new admin key" +
+                (isSaved ? " and saved." : ".") +
+                "\n\nAdmin key (copy it now for other clients — it can't be shown again):\n\n" + created.Secret);
+        }
+        catch (Exception ex)
+        {
+            await connection.DisposeAsync();
+            _dialogs.ShowError("Reconnect failed",
+                $"The server was secured, but reconnecting with the new key failed: {ex.Message}\n\n" +
+                "Use Connect to reconnect with this key:\n" + created.Secret);
+        }
     }
 
     /// <summary>Opens (or re-focuses) the replication topology graph for a server.</summary>

@@ -7,8 +7,23 @@
              mc:Ignorable="d"
              d:DataContext="{d:DesignInstance vm:ApiKeysDocumentViewModel}">
     <DockPanel Margin="14">
-        <TextBlock DockPanel.Dock="Top" Text="API Keys" FontSize="18" FontWeight="Light"/>
+        <TextBlock DockPanel.Dock="Top" Text="API Keys &amp; security" FontSize="18" FontWeight="Light"/>
         <TextBlock DockPanel.Dock="Bottom" Text="{Binding StatusMessage}" Margin="0,8,0,0" TextWrapping="Wrap"/>
+
+        <!-- Security state banner (shown when this connection has no key = open server) -->
+        <Border DockPanel.Dock="Top" Background="#FDECEA" BorderBrush="#C0392B" BorderThickness="1"
+                CornerRadius="5" Padding="12,8" Margin="0,10,0,0"
+                Visibility="{Binding IsUnsecured, Converter={StaticResource BoolToVis}}">
+            <DockPanel>
+                <Button DockPanel.Dock="Right" Content="🔒 Secure this server" Padding="12,4" Margin="10,0,0,0"
+                        VerticalAlignment="Center" Command="{Binding SecureCommand}"/>
+                <StackPanel VerticalAlignment="Center">
+                    <TextBlock Text="⚠ This server is not secured" FontWeight="SemiBold" Foreground="#C0392B"/>
+                    <TextBlock TextWrapping="Wrap" FontSize="11" Foreground="#7A2018" Margin="0,2,0,0"
+                               Text="No API key is set, so anyone who can reach it can read and write all data. Click 'Secure this server' to mint an admin key, apply it to this connection, and reconnect (no lock-out)."/>
+                </StackPanel>
+            </DockPanel>
+        </Border>
 
         <!-- One-time secret banner -->
         <Border DockPanel.Dock="Top" Background="#E6F7EC" BorderBrush="#2E8B57" BorderThickness="1"
@@ -30,9 +45,9 @@
             <StackPanel>
                 <TextBlock Text="Create a key" FontWeight="SemiBold"/>
                 <TextBlock Foreground="Gray" FontSize="11" Margin="0,2,0,2" TextWrapping="Wrap"
-                           Text="Scopes (comma-separated): admin (full access), db:&lt;name&gt; (read+write one DB), db:&lt;name&gt;:read (read-only)."/>
+                           Text="Scopes (comma-separated): * (full admin), db:&lt;name&gt; (read+write one DB), db:&lt;name&gt;:read (read-only), db:* (all DBs)."/>
                 <TextBlock Foreground="#B00" FontSize="11" Margin="0,0,0,6" TextWrapping="Wrap"
-                           Text="⚠ On a dev-mode server (no auth yet), creating the FIRST key immediately locks the server down. Include an 'admin' scope (or reconnect with the new key) or you'll lose admin access."/>
+                           Text="⚠ On a dev-mode server (no auth yet), creating the FIRST key immediately locks the server down. Include the * (admin) scope (or reconnect with the new key) or you'll lose admin access. Tip: use 'Secure this server' above."/>
                 <DockPanel>
                     <Button DockPanel.Dock="Right" Content="Create key" Padding="12,3" Margin="8,0,0,0"
                             Command="{Binding CreateCommand}"/>
