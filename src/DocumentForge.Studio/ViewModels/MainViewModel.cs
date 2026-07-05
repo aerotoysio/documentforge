@@ -93,6 +93,19 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
+    /// <summary>Opens a direct-file connection to a .dfdb path (used by the
+    /// file association / "Open with"). Not saved — it's an ad-hoc open.</summary>
+    public async Task OpenFileConnectionAsync(string filePath)
+    {
+        var descriptor = new ConnectionDescriptor
+        {
+            Name = System.IO.Path.GetFileNameWithoutExtension(filePath),
+            Kind = ConnectionKind.File,
+            FilePath = filePath,
+        };
+        await OpenConnectionAsync(descriptor, apiKey: null, save: false);
+    }
+
     public async Task DisconnectAsync(ServerNodeViewModel server)
     {
         Servers.Remove(server);
