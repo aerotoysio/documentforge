@@ -921,6 +921,43 @@ public static class ServeCommand
             return Results.Ok(new { success = true, deleted });
         });
 
+        // Issue #106 — opt-in per-collection schema / constraints. PUT a schema
+        // to enforce required fields, field types, and CHECK conditions on
+        // every subsequent write; DELETE to go back to schemaless.
+        app.MapPut("/collections/{name}/schema", async (string name, HttpRequest request) =>
+        {
+            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
+            using var reader = new StreamReader(request.Body);
+            var body = await reader.ReadToEndAsync();
+            if (string.IsNullOrWhiteSpace(body)) return Results.BadRequest(new { error = "Empty body." });
+            try
+            {
+                using var json = JsonDocument.Parse(body);
+                var schema = SchemaHandler.Parse(name, json.RootElement);
+                db.ConfigureSchema(schema);
+                return Results.Ok(new { success = true, schema = SchemaHandler.ToWire(schema) });
+            }
+            catch (SchemaHandler.SchemaParseException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            catch (JsonException ex) { return Results.BadRequest(new { error = $"Invalid JSON: {ex.Message}" }); }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        app.MapDelete("/collections/{name}/schema", (string name) =>
+        {
+            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
+            return db.RemoveSchema(name)
+                ? Results.Ok(new { success = true, collection = name, removed = true })
+                : Results.NotFound(new { error = $"No schema configured on '{name}'." });
+        });
+
+        app.MapGet("/collections/{name}/schema", (string name) =>
+        {
+            var schema = db.GetSchema(name);
+            return schema is null
+                ? Results.NotFound(new { error = $"No schema configured on '{name}'." })
+                : Results.Ok(SchemaHandler.ToWire(schema));
+        });
+
         // Atomic multi-document transaction. Body is a JSON array of ops:
         //   { "op": "insert",        "collection": "users", "doc": {...} }
         //   { "op": "replace",       "collection": "users", "id": "<guid>", "doc": {...} }

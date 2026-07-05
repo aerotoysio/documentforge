@@ -30,6 +30,12 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     private System.Threading.Timer? _ttlSweeper;
     private const string TtlMetaCollection = "__ttl_meta";
 
+    // Issue #106 — opt-in per-collection schema/constraint registry, persisted
+    // in a reserved meta collection and loaded on Open.
+    private readonly Dictionary<string, CollectionSchema> _schemaByCollection = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _schemaLock = new();
+    private const string SchemaMetaCollection = "__schema_meta";
+
     private ReplicationServer? _replicationServer;
     private ReplicationFollower? _replicationFollower;
     private LogicalReplicationServer? _logicalServer;
@@ -82,7 +88,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         _durableCommits = options.DurableCommits && options.EnableWal;
 
         _transactionManager = new TransactionManager();
-        _queryExecutor = new QueryExecutor(_catalog, _indexManager);
+        _queryExecutor = new QueryExecutor(_catalog, _indexManager, ValidateDocument);
     }
 
     /// <summary>
@@ -219,7 +225,8 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                 db._catalog.GetCollection(collName)?.BuildLocationMap();
             }
 
-            // Issue #104: restore persisted TTL rules and start the sweeper.
+            // Issue #104/#106: restore persisted TTL rules + schemas.
+            db.LoadSchemas();
             db.LoadTtlConfigs();
 
             if (recoveredPages > 0)
@@ -381,11 +388,11 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
 
     public IReadOnlyList<string> GetCollectionNames()
     {
-        // Hide the reserved TTL-metadata collection (issue #104) from public
-        // listings — it's engine bookkeeping, not user data. Still fully
-        // addressable internally via GetCollection.
+        // Hide the reserved engine-metadata collections (TTL #104, schema #106)
+        // from public listings — they're bookkeeping, not user data. Still
+        // fully addressable internally via GetCollection.
         return _catalog.GetCollectionNames()
-            .Where(n => !string.Equals(n, TtlMetaCollection, StringComparison.OrdinalIgnoreCase))
+            .Where(n => !IsReservedMetaCollection(n))
             .ToList();
     }
 
@@ -505,6 +512,9 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                 // forge them.
                 doc.StampFreshEtag();
 
+                // Enforce the collection's schema (issue #106) before any write.
+                ValidateDocument(collectionName, doc);
+
                 // Pre-validate uniqueness. If any unique index would reject the doc,
                 // throw BEFORE the page write so the on-disk state is untouched.
                 // Pre-fix this happened in the wrong order: page wrote, index threw,
@@ -592,6 +602,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                     var doc = documents[i];
                     doc.EnsureId();
                     doc.StampFreshEtag(); // issue #18 — same discipline as single Insert
+                    ValidateDocument(collectionName, doc); // schema (issue #106)
                     // Validate before the page write so a unique-index conflict
                     // doesn't leave a stranded doc behind (issue #9).
                     _indexManager.ValidateUniqueInsert(collectionName, doc);
@@ -671,6 +682,9 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                 // mints a fresh _etag so subsequent If-Match clients see the change.
                 newDoc.StampFreshEtag();
 
+                // Enforce the collection's schema on the new document (issue #106).
+                ValidateDocument(collectionName, newDoc);
+
                 // Validate + apply index changes FIRST. If validation throws (e.g. a
                 // unique-index collision with a different doc), the page is untouched -
                 // no half-commits. Only if the index transition succeeds do we commit
@@ -740,6 +754,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             // broadcast.
             newDoc["_id"] = oldDoc["_id"];
             newDoc.StampFreshEtag();
+            ValidateDocument(collectionName, newDoc); // schema (issue #106)
             _indexManager.OnDocumentUpdated(collectionName, id, oldDoc, newDoc);
             if (!collection.Update(id, newDoc))
             {
@@ -811,6 +826,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                 newDoc["_id"] = oldDoc["_id"]; // preserve identity
                 newDoc.StampFreshEtag();       // every write refreshes the CAS token
 
+                ValidateDocument(collectionName, newDoc); // schema (issue #106)
                 _indexManager.OnDocumentUpdated(collectionName, id, oldDoc, newDoc);
                 if (!collection.Update(id, newDoc))
                 {
@@ -1103,6 +1119,186 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     }
 
     private static string JsonString(string s) => System.Text.Json.JsonSerializer.Serialize(s);
+
+    // ---- Schema / constraints (issue #106) ----
+
+    /// <summary>
+    /// Configure (or replace) the integrity contract for a collection. Opt-in:
+    /// a collection with no schema is unconstrained. The config is persisted
+    /// (survives restart) and takes effect immediately for every subsequent
+    /// write — Insert, bulk, Replace, conditional-update, transaction apply, and
+    /// SQL INSERT/UPDATE. Existing documents are NOT re-validated.
+    /// </summary>
+    public void ConfigureSchema(CollectionSchema schema)
+    {
+        if (schema is null) throw new ArgumentNullException(nameof(schema));
+        if (string.IsNullOrWhiteSpace(schema.Collection))
+            throw new ArgumentException("schema.Collection is required.", nameof(schema));
+        if (IsReservedMetaCollection(schema.Collection))
+            throw new ArgumentException($"'{schema.Collection}' is a reserved system collection.", nameof(schema));
+
+        PersistSchema(schema);
+        lock (_schemaLock) _schemaByCollection[schema.Collection] = schema;
+    }
+
+    /// <summary>Remove a collection's schema (writes become unconstrained again).</summary>
+    public bool RemoveSchema(string collection)
+    {
+        bool removed;
+        lock (_schemaLock) removed = _schemaByCollection.Remove(collection);
+        if (removed) DeleteSchemaConfig(collection);
+        return removed;
+    }
+
+    /// <summary>The schema for a collection, or null if it's unconstrained.</summary>
+    public CollectionSchema? GetSchema(string collection)
+    {
+        lock (_schemaLock) return _schemaByCollection.TryGetValue(collection, out var s) ? s : null;
+    }
+
+    public IReadOnlyList<CollectionSchema> GetSchemas()
+    {
+        lock (_schemaLock) return _schemaByCollection.Values.ToList();
+    }
+
+    /// <summary>
+    /// Throw <see cref="SchemaViolationException"/> if <paramref name="doc"/>
+    /// breaks the collection's schema. No-op when the collection has no schema.
+    /// Called before every write reaches storage (also handed to the query
+    /// executor so SQL INSERT/UPDATE are covered).
+    /// </summary>
+    internal void ValidateDocument(string collection, BsonDocument doc)
+    {
+        CollectionSchema? schema;
+        lock (_schemaLock)
+        {
+            if (!_schemaByCollection.TryGetValue(collection, out schema)) return;
+        }
+
+        foreach (var req in schema.Required)
+        {
+            if (!doc.ContainsKey(req) || doc[req].IsNull)
+                throw new SchemaViolationException(collection, $"missing required field '{req}'.");
+        }
+
+        foreach (var (field, type) in schema.Types)
+        {
+            if (!doc.ContainsKey(field) || doc[field].IsNull) continue; // absence is a 'required' concern
+            if (!MatchesType(doc[field], type))
+                throw new SchemaViolationException(collection,
+                    $"field '{field}' must be {type}, got {doc[field].Type}.");
+        }
+
+        foreach (var chk in schema.Checks)
+        {
+            if (!EvaluateCondition(doc, chk))
+                throw new SchemaViolationException(collection, $"check failed: {DescribeCondition(chk)}.");
+        }
+    }
+
+    private static bool MatchesType(BsonValue v, FieldTypeConstraint type) => type switch
+    {
+        FieldTypeConstraint.String => v.Type == BsonType.String,
+        FieldTypeConstraint.Int => v.Type is BsonType.Int32 or BsonType.Int64,
+        FieldTypeConstraint.Number => v.IsNumeric,
+        FieldTypeConstraint.Bool => v.Type == BsonType.Boolean,
+        FieldTypeConstraint.DateTime => v.Type == BsonType.DateTime,
+        FieldTypeConstraint.Object => v.Type == BsonType.Document,
+        FieldTypeConstraint.Array => v.Type == BsonType.Array,
+        _ => true,
+    };
+
+    private static bool IsReservedMetaCollection(string name) =>
+        string.Equals(name, TtlMetaCollection, StringComparison.OrdinalIgnoreCase)
+        || string.Equals(name, SchemaMetaCollection, StringComparison.OrdinalIgnoreCase);
+
+    private void LoadSchemas()
+    {
+        var coll = _catalog.GetCollection(SchemaMetaCollection);
+        if (coll is null) return;
+        lock (_schemaLock)
+        {
+            foreach (var doc in coll.FindAll())
+            {
+                var schema = DeserializeSchema(doc);
+                if (schema is not null) _schemaByCollection[schema.Collection] = schema;
+            }
+        }
+    }
+
+    private void PersistSchema(CollectionSchema schema)
+    {
+        DeleteSchemaConfig(schema.Collection);
+        Insert(SchemaMetaCollection, SerializeSchema(schema));
+    }
+
+    private void DeleteSchemaConfig(string collection)
+    {
+        _transactionManager.AcquireWriteLock();
+        try
+        {
+            var coll = _catalog.GetCollection(SchemaMetaCollection);
+            if (coll is null) return;
+            var toDelete = coll.FindAll()
+                .Where(d => !d["collection"].IsNull &&
+                            string.Equals(d["collection"].AsString, collection, StringComparison.OrdinalIgnoreCase))
+                .Select(d => (d.GetId(), d)).ToList();
+            foreach (var (id, doc) in toDelete)
+                if (coll.Delete(id)) _indexManager.OnDocumentDeleted(SchemaMetaCollection, id, doc);
+            if (toDelete.Count > 0) CommitDurableLocked();
+        }
+        finally { _transactionManager.ReleaseWriteLock(); }
+    }
+
+    private static string SerializeSchema(CollectionSchema s)
+    {
+        var sb = new System.Text.StringBuilder();
+        sb.Append('{').Append("\"collection\":").Append(JsonString(s.Collection));
+        sb.Append(",\"required\":[").Append(string.Join(",", s.Required.Select(JsonString))).Append(']');
+        sb.Append(",\"types\":{").Append(string.Join(",",
+            s.Types.Select(kv => $"{JsonString(kv.Key)}:{JsonString(kv.Value.ToString())}"))).Append('}');
+        sb.Append(",\"checks\":[").Append(string.Join(",", s.Checks.Select(c =>
+            $"{{\"field\":{JsonString(c.Field)},\"op\":{JsonString(c.Op.ToString())},\"value\":{ValueToJson(c.Value)}}}"))).Append(']');
+        sb.Append('}');
+        return sb.ToString();
+    }
+
+    private static string ValueToJson(BsonValue? v)
+    {
+        if (v is null || v.IsNull) return "null";
+        return v.Type switch
+        {
+            BsonType.String => JsonString(v.AsString),
+            BsonType.Boolean => v.AsBoolean ? "true" : "false",
+            BsonType.Int32 => v.AsInt32.ToString(),
+            BsonType.Int64 => v.AsInt64.ToString(),
+            BsonType.Double => v.AsDouble.ToString(System.Globalization.CultureInfo.InvariantCulture),
+            _ => JsonString(v.ToString()),
+        };
+    }
+
+    private static CollectionSchema? DeserializeSchema(BsonDocument doc)
+    {
+        if (doc["collection"].IsNull) return null;
+        var collection = doc["collection"].AsString;
+        var required = doc.ContainsKey("required") && doc["required"].Type == BsonType.Array
+            ? doc["required"].AsArray.Items.Select(v => v.AsString).ToList() : new List<string>();
+        var types = new Dictionary<string, FieldTypeConstraint>(StringComparer.OrdinalIgnoreCase);
+        if (doc.ContainsKey("types") && doc["types"].Type == BsonType.Document)
+            foreach (var kv in doc["types"].AsDocument)
+                if (Enum.TryParse<FieldTypeConstraint>(kv.Value.AsString, ignoreCase: true, out var t))
+                    types[kv.Key] = t;
+        var checks = new List<UpdateCondition>();
+        if (doc.ContainsKey("checks") && doc["checks"].Type == BsonType.Array)
+            foreach (var c in doc["checks"].AsArray.Items)
+            {
+                var cd = c.AsDocument;
+                if (cd["field"].IsNull || cd["op"].IsNull) continue;
+                if (Enum.TryParse<ConditionOp>(cd["op"].AsString, ignoreCase: true, out var op))
+                    checks.Add(new UpdateCondition(cd["field"].AsString, op, cd.ContainsKey("value") ? cd["value"] : null));
+            }
+        return new CollectionSchema(collection, required, types, checks);
+    }
 
     /// <summary>
     /// Convenience overload: parse JSON then replace.
@@ -1678,6 +1874,15 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     internal void ApplyWorkingSetsLocked(IReadOnlyDictionary<string, CollectionWorkingSet> workingSets)
     {
         ValidateUniqueIndexesForWorkingSets(workingSets);
+
+        // Schema validation up-front (issue #106): reject the whole transaction
+        // before any storage mutation if a staged insert/replace breaks its
+        // collection's schema, so we never rely on reverse-apply for it.
+        foreach (var (collectionName, ws) in workingSets)
+        {
+            foreach (var (_, doc) in ws.Inserts) ValidateDocument(collectionName, doc);
+            foreach (var (_, newDoc) in ws.Replaces) ValidateDocument(collectionName, newDoc);
+        }
 
         // Issue #23: snapshot every doc we touch so a non-uniqueness failure
         // mid-Apply (IOException, an unexpected throw from Collection.Insert,

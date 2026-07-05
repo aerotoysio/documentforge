@@ -10,10 +10,17 @@ public sealed class QueryExecutor
     private readonly CollectionCatalog _catalog;
     private readonly IndexManager _indexManager;
 
-    public QueryExecutor(CollectionCatalog catalog, IndexManager indexManager)
+    /// <summary>Issue #106 — optional schema-validation hook the engine injects
+    /// so SQL INSERT/UPDATE are constrained like every other write path. Null
+    /// (schemaless) is a no-op.</summary>
+    private readonly Action<string, BsonDocument>? _validateDocument;
+
+    public QueryExecutor(CollectionCatalog catalog, IndexManager indexManager,
+        Action<string, BsonDocument>? validateDocument = null)
     {
         _catalog = catalog;
         _indexManager = indexManager;
+        _validateDocument = validateDocument;
     }
 
     public QueryResult Execute(string query)
@@ -932,6 +939,8 @@ public sealed class QueryExecutor
         }
 
         var collection = _catalog.GetOrCreateCollection(stmt.Collection);
+        // Enforce the collection's schema before the write (issue #106).
+        _validateDocument?.Invoke(stmt.Collection, doc);
         // Pre-validate uniqueness so a function-generated value (e.g. a NEWID
         // collision against an existing _id, vanishingly rare but possible if
         // someone used a fixed-seed RNG client-side and then NEWID() from
@@ -975,6 +984,8 @@ public sealed class QueryExecutor
             // SQL-modified state. Re-stamping keeps SQL writes consistent with
             // the Insert/Replace path.
             newDoc.StampFreshEtag();
+            // Enforce schema on the updated document (issue #106).
+            _validateDocument?.Invoke(stmt.Collection, newDoc);
             if (collection.Update(id, newDoc))
             {
                 _indexManager.OnDocumentUpdated(stmt.Collection, id, oldDoc, newDoc);

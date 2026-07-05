@@ -46,6 +46,19 @@ public class DuplicateKeyException : DocumentForgeException
         : base($"Duplicate key '{keyValue}' in index '{indexName}'") => IndexName = indexName;
 }
 
+/// <summary>
+/// Issue #106 — a document failed the opt-in schema/constraint validation
+/// configured on its collection (missing required field, wrong field type, or a
+/// failed CHECK). Thrown before the write touches storage, so the on-disk state
+/// is untouched; the HTTP layer maps it to 400.
+/// </summary>
+public class SchemaViolationException : DocumentForgeException
+{
+    public string Collection { get; }
+    public SchemaViolationException(string collection, string message)
+        : base($"Schema violation in '{collection}': {message}") => Collection = collection;
+}
+
 public class CollectionNotFoundException : DocumentForgeException
 {
     public string CollectionName { get; }
