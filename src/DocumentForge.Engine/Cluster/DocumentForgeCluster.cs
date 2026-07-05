@@ -816,10 +816,41 @@ public sealed class DocumentForgeCluster : IDisposable
         return -1;
     }
 
+    private System.Threading.Timer? _recoverySweeper;
+
+    /// <summary>Default cadence for the background in-doubt recovery sweep.</summary>
+    public static readonly TimeSpan DefaultRecoverySweepInterval = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Issue #97 — wire <see cref="Recover"/> into a background path instead of
+    /// leaving it test-only. Runs one recovery pass immediately (startup
+    /// recovery), then repeats on <paramref name="interval"/>, so a coordinator
+    /// crash between PREPARE and COMMIT no longer leaves participants blocked on
+    /// in-doubt transactions until their 30s self-abort timer fires (and, with
+    /// the timeout fix, that timer no longer decides the outcome at all —
+    /// this sweep does, by consulting the coordinator decision log). Idempotent
+    /// and best-effort; a failing pass is retried next tick. Returns this for
+    /// chaining. The sweeper is stopped in <see cref="Dispose"/>.
+    /// </summary>
+    public DocumentForgeCluster StartRecoverySweep(TimeSpan? interval = null)
+    {
+        var period = interval ?? DefaultRecoverySweepInterval;
+        try { Recover(); } catch { /* startup pass is best-effort; the timer retries */ }
+        _recoverySweeper?.Dispose();
+        _recoverySweeper = new System.Threading.Timer(_ =>
+        {
+            if (_disposed) return;
+            try { Recover(); } catch { /* retried next tick */ }
+        }, null, period, period);
+        return this;
+    }
+
     public void Dispose()
     {
         if (_disposed) return;
-        foreach (var s in _shards) try { s.Dispose(); } catch { }
         _disposed = true;
+        try { _recoverySweeper?.Dispose(); } catch { }
+        _recoverySweeper = null;
+        foreach (var s in _shards) try { s.Dispose(); } catch { }
     }
 }

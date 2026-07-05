@@ -317,11 +317,19 @@ internal sealed class PreparedTxCoordinator : IDisposable
     }
 
     /// <summary>
-    /// Phase D self-abort: the prepare timeout fired before COMMIT or
-    /// ROLLBACK arrived. Treat as ABORT — release the lock, write a
-    /// RESOLVED-aborted record, drop _active. A late CommitPrepared for
-    /// this txId then throws "no prepared tx" (the log scan won't find an
-    /// in-flight record because we just RESOLVED it).
+    /// Phase D liveness: the prepare timeout fired before COMMIT or ROLLBACK
+    /// arrived. Issue #97 — the participant must NOT unilaterally decide the
+    /// outcome here. It cannot reach the coordinator's decision log, so a blind
+    /// ROLLBACK could tear a transaction the coordinator already committed.
+    ///
+    /// <para>Instead we free the write lock (so the shard isn't wedged) but
+    /// leave the PREPARED record in-doubt on disk — no RESOLVED marker. The
+    /// authoritative resolution comes later from either a late
+    /// CommitPrepared/RollbackPrepared (the coordinator's decision arriving
+    /// after the deadline), or the cluster recovery sweep, which consults the
+    /// coordinator log and only aborts when NO decision was recorded. Both use
+    /// <see cref="HandleResolve"/>'s log-rebuild path, since <c>_active</c> is
+    /// cleared here.</para>
     /// </summary>
     private void HandleTimeout(TimeoutCommand cmd)
     {
@@ -331,25 +339,14 @@ internal sealed class PreparedTxCoordinator : IDisposable
             return;
         }
 
-        try
-        {
-            _log.AppendResolved(_active.TxId, committed: false);
-            Interlocked.Increment(ref _stats.TimedOutTotal);
-        }
-        catch
-        {
-            // Log write failed; we still have to release the lock to avoid
-            // wedging the participant. Recovery on next open will scan the
-            // log and notice the PREPARED-without-RESOLVED — and either
-            // resolve correctly via the coord log or abort.
-        }
-        finally
-        {
-            try { _active?.TimeoutCts?.Dispose(); } catch { }
-            try { _txManager.ReleaseWriteLock(); } catch { }
-            _active = null;
-            Interlocked.Decrement(ref _stats.InFlightPrepared);
-        }
+        // Do NOT AppendResolved — leaving the record PREPARED (in-doubt) is what
+        // lets the coordinator's decision win. Just release the lock + drop the
+        // in-memory slot; the durable prepared.log record survives for recovery.
+        Interlocked.Increment(ref _stats.TimedOutTotal);
+        try { _active?.TimeoutCts?.Dispose(); } catch { }
+        try { _txManager.ReleaseWriteLock(); } catch { }
+        _active = null;
+        Interlocked.Decrement(ref _stats.InFlightPrepared);
     }
 
     public void Dispose()

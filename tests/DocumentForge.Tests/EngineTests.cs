@@ -2808,6 +2808,53 @@ public class EngineTests : IDisposable
     }
 
     [Fact]
+    public void ClusterRecoverySweep_ResolvesInDoubtTx_WithoutManualCall()
+    {
+        // Issue #97: the recovery sweep runs in the background, so an in-doubt
+        // tx (coordinator decided COMMIT, participant still PREPARED) gets
+        // resolved automatically — no test/operator has to call Recover().
+        var pathA = Path.Combine(Path.GetTempPath(), $"rec_{Guid.NewGuid():N}.dfdb");
+        var pathB = Path.Combine(Path.GetTempPath(), $"rec_{Guid.NewGuid():N}.dfdb");
+        var paths = new[] { pathA, pathB };
+        try
+        {
+            const string txId = "tx-sweep-commit";
+            using (var dbA = DocumentForgeDb.Create(pathA))
+            using (var dbB = DocumentForgeDb.Create(pathB))
+            {
+                var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+                {
+                    DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                        DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"SWEEP","leg":1}""")),
+                };
+                Assert.Equal(PrepareVote.Prepared, dbA.PrepareTransaction(txId, "B", ops).Vote);
+                dbB.RecordCoordinatorDecision(txId, commit: true); // decided, but COMMIT never broadcast
+            }
+
+            using var dbA2 = DocumentForgeDb.Open(pathA);
+            using var dbB2 = DocumentForgeDb.Open(pathB);
+            using var cluster = new DocumentForge.Engine.Cluster.DocumentForgeCluster()
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("A", dbA2))
+                .AddShard(new DocumentForge.Engine.Cluster.InProcessShardTransport("B", dbB2))
+                .ShardCollection("orders", "pnr")
+                .StartRecoverySweep(TimeSpan.FromMilliseconds(200)); // background sweep
+
+            // Without ever calling Recover() ourselves, the sweep applies it.
+            var deadline = DateTime.UtcNow.AddSeconds(5);
+            while (DateTime.UtcNow < deadline &&
+                   dbA2.Execute("SELECT * FROM orders WHERE pnr = 'SWEEP'").Documents.Count == 0)
+                Thread.Sleep(100);
+
+            Assert.Single(dbA2.Execute("SELECT * FROM orders WHERE pnr = 'SWEEP'").Documents);
+        }
+        finally
+        {
+            foreach (var p in paths)
+                try { File.Delete(p); File.Delete(p + ".wal"); File.Delete(p + ".recovery"); File.Delete(p + ".prepared.log"); File.Delete(p + ".coord.log"); } catch { }
+        }
+    }
+
+    [Fact]
     public void ClusterRecover_PreparedWithoutDecision_Aborts()
     {
         // Coordinator died BEFORE deciding, leaving the participant
@@ -3398,12 +3445,13 @@ public class EngineTests : IDisposable
     // would leave participants PREPARED with their write lock held until
     // someone runs cluster.Recover() manually. Phase D adds a per-tx
     // deadline: the participant's worker thread schedules a Task.Delay
-    // that, on expiry, posts a TimeoutCommand to its own queue and self-
-    // aborts (releases the lock, writes a RESOLVED-aborted record).
-    // A late CommitPrepared for that txId then throws.
+    // that, on expiry, posts a TimeoutCommand to its own queue. Issue #97:
+    // the timeout now only RELEASES THE LOCK and leaves the tx in-doubt —
+    // it does not write a RESOLVED decision — so a late commit/rollback or
+    // the recovery sweep resolves it per the coordinator's decision.
 
     [Fact]
-    public void Participant_PreparedTimeout_SelfAborts()
+    public void Participant_PreparedTimeout_ReleasesLock_LeavesTxInDoubt()
     {
         var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
         try
@@ -3447,14 +3495,14 @@ public class EngineTests : IDisposable
     }
 
     [Fact]
-    public void Participant_LateCommitAfterTimeout_Throws()
+    public void Participant_LateCommitAfterTimeout_HonoursCoordinatorCommit()
     {
-        // Coordinator decided COMMIT and called CommitPrepared, but the
-        // participant's timeout had already fired. The late commit must
-        // fail — the participant already wrote RESOLVED-aborted to its
-        // log. (In a real cluster this would surface as a tx failure on
-        // the coordinator-side broadcast loop; the next Recover would
-        // then see no in-flight on this shard and confirm aborted.)
+        // Issue #97: the coordinator decided COMMIT and called CommitPrepared,
+        // but the participant's prepare timeout had already fired. Pre-fix the
+        // timeout wrote a blind RESOLVED-abort and the late commit threw — a
+        // TORN transaction (coordinator committed, participant aborted). Now the
+        // timeout leaves the tx in-doubt, so the late commit is honoured and the
+        // row lands.
         var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
         try
         {
@@ -3469,9 +3517,43 @@ public class EngineTests : IDisposable
 
             Assert.Equal(PrepareVote.Prepared,
                 shard.Prepare("tx-late", "A", ops, TimeSpan.FromMilliseconds(100)).Vote);
-            Thread.Sleep(500);  // let the timeout fire and abort
+            Thread.Sleep(500);  // let the timeout fire — leaves the tx in-doubt
 
-            Assert.ThrowsAny<Exception>(() => shard.CommitPrepared("tx-late"));
+            // Late commit is accepted (no throw) and applies the tx.
+            shard.CommitPrepared("tx-late");
+            Assert.Single(db.Execute("SELECT * FROM orders WHERE pnr = 'X'").Documents);
+        }
+        finally
+        {
+            try { File.Delete(path); File.Delete(path + ".wal"); File.Delete(path + ".recovery"); File.Delete(path + ".prepared.log"); } catch { }
+        }
+    }
+
+    [Fact]
+    public void Participant_LateRollbackAfterTimeout_HonoursCoordinatorAbort()
+    {
+        // The mirror: coordinator decided ABORT. After the timeout leaves the tx
+        // in-doubt, a late RollbackPrepared cleanly discards it and the row never
+        // lands. (No decision at all also resolves to abort — via the recovery
+        // sweep — but here we exercise the explicit late rollback.)
+        var path = Path.Combine(Path.GetTempPath(), $"part_{Guid.NewGuid():N}.dfdb");
+        try
+        {
+            using var db = DocumentForgeDb.Create(path);
+            var shard = new DocumentForge.Engine.Cluster.InProcessShardTransport("A", db);
+
+            var ops = new List<DocumentForge.Engine.Cluster.ShardTxOp>
+            {
+                DocumentForge.Engine.Cluster.ShardTxOp.ForInsert("orders",
+                    DocumentForge.Document.BsonDocument.FromJson("""{"pnr":"Y"}""")),
+            };
+
+            Assert.Equal(PrepareVote.Prepared,
+                shard.Prepare("tx-late-rb", "A", ops, TimeSpan.FromMilliseconds(100)).Vote);
+            Thread.Sleep(500);
+
+            shard.RollbackPrepared("tx-late-rb");
+            Assert.Empty(db.Execute("SELECT * FROM orders WHERE pnr = 'Y'").Documents);
         }
         finally
         {
