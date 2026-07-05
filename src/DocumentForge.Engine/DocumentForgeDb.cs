@@ -62,6 +62,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         FilePath = filePath;
         _lock = lockHandle;
         _dataFile = dataFile;
+        _leaderTerm = LoadLeaderTerm(filePath); // issue #96 — per-node stable term
         _pageCache = new PageCache(dataFile, options.CacheSizeInPages);
         _allocator = new PageAllocator(dataFile, _pageCache);
         _catalog = new CollectionCatalog(_pageCache, _allocator);
@@ -2191,7 +2192,12 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     {
         if (_logicalServer is not null)
             throw new DocumentForgeException("Logical replication server already running.");
-        _logicalServer = new LogicalReplicationServer(port, opLogCapacity: 10_000, secret: sharedSecret);
+        _logicalServer = new LogicalReplicationServer(port, opLogCapacity: 10_000, secret: sharedSecret, leaderTerm: LeaderTerm)
+        {
+            // Issue #96 — if a connecting follower carries a newer term, a
+            // fresher leader has superseded us; fence ourselves.
+            OnHigherTermObserved = t => ObserveTerm(t),
+        };
         // Issue #20: provide a snapshot when a fresh follower needs to
         // bootstrap. We reuse db.Snapshot from #27 — same atomic semantics
         // (write lock, flush, copy). The snapshot path is a sibling of the
@@ -2280,6 +2286,12 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             // file integrates by detecting the sibling .snapshot.incoming.seq
             // marker.
             SnapshotTempPath = snapshotPath,
+            // Issue #96 — advertise our term and fence a stale (lower-term)
+            // leader. ObserveTerm adopts a newer term (and steps us down if we
+            // were somehow still leading); StaleRejected tells the follower to
+            // refuse a superseded leader.
+            OwnTerm = LeaderTerm,
+            OnLeaderTerm = t => ObserveTerm(t) == TermObservation.StaleRejected,
         };
         _logicalFollower.Start();
     }
@@ -2374,18 +2386,28 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     /// </summary>
     public void PromoteToLeader(int serverPort, int opLogCapacity = 10_000)
     {
+        // Issue #96 — bump the monotonic term so this leadership is a strictly
+        // newer epoch than any prior leader. The higher term fences the old
+        // leader the moment it makes contact (ObserveTerm on the handshake).
+        var term = BumpTermForPromotion();
+
         // Stop being a follower
         _logicalFollower?.Dispose();
         _logicalFollower = null;
 
-        // Start a replication server of our own
-        _logicalServer = new LogicalReplicationServer(serverPort, opLogCapacity);
+        // Start a replication server of our own, advertising our term. Wire the
+        // fencing callback so this new leader also steps down if it ever meets a
+        // still-newer term (issue #96).
+        _logicalServer = new LogicalReplicationServer(serverPort, opLogCapacity, leaderTerm: term)
+        {
+            OnHigherTermObserved = t => ObserveTerm(t),
+        };
         _logicalServer.Start();
 
         // Accept writes
         ExitReadOnlyMode();
 
-        Console.WriteLine($"[Handover] Promoted to leader on port {serverPort}");
+        Console.WriteLine($"[Handover] Promoted to leader on port {serverPort} (term {term})");
     }
 
     /// <summary>
@@ -2427,6 +2449,129 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     public ulong LeaderCurrentSeq => _logicalServer?.CurrentSeq ?? 0;
     public DateTimeOffset? LastLeaderMessage =>
         _logicalFollower?.LastMessageAt == DateTimeOffset.MinValue ? null : _logicalFollower?.LastMessageAt;
+
+    // --- Leader term / fencing epoch (issue #96) ---
+
+    private ulong _leaderTerm;
+    private readonly object _termLock = new();
+
+    /// <summary>
+    /// Issue #96 — this node's monotonic leader term (a.k.a. epoch). Every
+    /// promotion bumps it; the value is persisted per-node in a
+    /// <c>&lt;db&gt;.term</c> sidecar (Raft-style stable state) so a restarted
+    /// node never regresses to a stale term. A higher term always wins: a node
+    /// that observes one steps down (fences). Exposed so a term-aware router /
+    /// client can prefer the highest-term leader.
+    /// </summary>
+    public ulong LeaderTerm { get { lock (_termLock) return _leaderTerm; } }
+
+    private static ulong LoadLeaderTerm(string filePath)
+    {
+        var path = filePath + ".term";
+        try
+        {
+            if (!File.Exists(path)) return 0;
+            var bytes = File.ReadAllBytes(path);
+            return bytes.Length >= 8 ? BitConverter.ToUInt64(bytes, 0) : 0;
+        }
+        catch { return 0; }
+    }
+
+    private void PersistLeaderTerm(ulong term)
+    {
+        var path = FilePath + ".term";
+        var tmp = path + ".tmp";
+        var bytes = BitConverter.GetBytes(term);
+        // Write-through a temp file then move, so a crash can't leave a
+        // half-written (and possibly LOWER) term on disk.
+        using (var fs = new FileStream(tmp, FileMode.Create, FileAccess.Write, FileShare.None, 8, FileOptions.WriteThrough))
+        {
+            fs.Write(bytes, 0, bytes.Length);
+            fs.Flush(true);
+        }
+        File.Move(tmp, path, overwrite: true);
+    }
+
+    /// <summary>
+    /// Bump this node's term for a promotion and persist it. Returns the new
+    /// term. Called on every path that makes this node a leader.
+    /// </summary>
+    private ulong BumpTermForPromotion()
+    {
+        lock (_termLock)
+        {
+            _leaderTerm++;
+            PersistLeaderTerm(_leaderTerm);
+            return _leaderTerm;
+        }
+    }
+
+    /// <summary>Result of <see cref="ObserveTerm"/>.</summary>
+    public enum TermObservation
+    {
+        /// <summary>Incoming term matches ours — nothing to do.</summary>
+        Current,
+        /// <summary>Incoming term is newer; we adopted it (we were not a leader).</summary>
+        Adopted,
+        /// <summary>Incoming term is newer AND we were a leader, so we STEPPED
+        /// DOWN to read-only (fenced ourselves).</summary>
+        AdoptedAndFenced,
+        /// <summary>Incoming term is OLDER than ours — the source is a stale,
+        /// superseded leader and the caller must reject it.</summary>
+        StaleRejected,
+    }
+
+    /// <summary>
+    /// Issue #96 — the fencing primitive. Compare an incoming leader term
+    /// against ours. A strictly-higher term means a newer leader exists: we
+    /// adopt it and, if we were acting as a leader, step down to read-only so
+    /// two leaders can't both accept writes. A strictly-lower term means the
+    /// source is a superseded leader that must be rejected. Idempotent and
+    /// thread-safe. This is how an old, partitioned leader demotes itself the
+    /// moment it makes contact with anything carrying the newer term.
+    /// </summary>
+    public TermObservation ObserveTerm(ulong incomingTerm)
+    {
+        bool fenced = false;
+        lock (_termLock)
+        {
+            if (incomingTerm < _leaderTerm) return TermObservation.StaleRejected;
+            if (incomingTerm == _leaderTerm) return TermObservation.Current;
+
+            _leaderTerm = incomingTerm;
+            PersistLeaderTerm(_leaderTerm);
+            if (_logicalServer is not null)
+            {
+                // We thought we were the leader but a newer term exists — fence.
+                fenced = true;
+            }
+        }
+        if (fenced) StepDownToFollower();
+        return fenced ? TermObservation.AdoptedAndFenced : TermObservation.Adopted;
+    }
+
+    /// <summary>
+    /// Stop being a leader and refuse writes (issue #96 fencing). Tears down
+    /// the replication server and enters read-only mode. Safe to call when not
+    /// a leader. Reconnecting to the new leader as a follower is the operator's
+    /// / router's responsibility.
+    /// </summary>
+    public void StepDownToFollower()
+    {
+        DisableAutoFailover();
+        LogicalReplicationServer? server;
+        lock (_termLock)
+        {
+            server = _logicalServer;
+            _logicalServer = null;
+        }
+        if (server is not null)
+        {
+            try { server.Dispose(); } catch { }
+            Console.WriteLine($"[Fencing] Stepped down to read-only — a higher leader term ({LeaderTerm}) was observed.");
+        }
+        EnterReadOnlyMode();
+    }
 
     // --- Auto-failover ---
 

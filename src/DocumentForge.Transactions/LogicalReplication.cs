@@ -234,6 +234,16 @@ public sealed class LogicalReplicationServer : IDisposable
     public int FollowerCount { get { lock (_lock) return _followers.Count; } }
     public ulong CurrentSeq => (ulong)Interlocked.Read(ref _nextSeq) - 1;
 
+    /// <summary>Issue #96 — this leader's monotonic term (epoch). Advertised to
+    /// each connecting follower so a stale lower-term leader is refused.</summary>
+    public ulong LeaderTerm { get; }
+
+    /// <summary>Issue #96 — invoked when a connecting follower advertises a
+    /// term HIGHER than this leader's, meaning a newer leader has superseded us.
+    /// The engine wires this to step down (fence). Runs on the accept thread;
+    /// keep it fast.</summary>
+    public Action<ulong>? OnHigherTermObserved { get; set; }
+
     /// <summary>
     /// Snapshot of currently-connected followers. Used by the
     /// <c>/replication/status</c> admin endpoint for topology auto-discovery.
@@ -281,9 +291,10 @@ public sealed class LogicalReplicationServer : IDisposable
     /// </summary>
     public Func<(string TempPath, ulong SnapshotSeq)>? SnapshotProvider { get; set; }
 
-    public LogicalReplicationServer(int port, int opLogCapacity = 10_000, string? secret = null)
+    public LogicalReplicationServer(int port, int opLogCapacity = 10_000, string? secret = null, ulong leaderTerm = 0)
     {
         Port = port;
+        LeaderTerm = leaderTerm;
         OpLog = new OpLogBuffer(opLogCapacity);
         _listener = new TcpListener(IPAddress.Any, port);
         _secret = secret;
@@ -421,6 +432,41 @@ public sealed class LogicalReplicationServer : IDisposable
                 // fine; httpEndpoint stays null and the admin-UI falls back
                 // to its existing port-guess behaviour.
             }
+
+            // Issue #96 — term fencing. Read the follower's advertised term
+            // (back-compat: legacy followers send nothing, so a short timeout
+            // treats them as term 0). If the follower carries a HIGHER term, a
+            // newer leader has superseded us: fence ourselves and drop the
+            // connection. Then advertise OUR term so the follower can refuse a
+            // stale (lower-term) leader.
+            ulong followerTerm = 0;
+            try
+            {
+                using var termTimeoutCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+                using var linkedTermCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, termTimeoutCts.Token);
+                var termBuf = new byte[8];
+                if (await ReadExactBytes(stream, termBuf, linkedTermCts.Token))
+                    followerTerm = BitConverter.ToUInt64(termBuf, 0);
+            }
+            catch (OperationCanceledException) { /* legacy follower → term 0 */ }
+
+            if (followerTerm > LeaderTerm)
+            {
+                Console.WriteLine($"[Fencing] Follower advertised term {followerTerm} > our term {LeaderTerm} — a newer leader exists. Stepping down.");
+                try { OnHigherTermObserved?.Invoke(followerTerm); } catch { }
+                client.Close();
+                return;
+            }
+
+            // Advertise our term to the follower (the follower fences a
+            // lower-term leader). Best-effort — a legacy follower ignores it.
+            try
+            {
+                var myTerm = new byte[8];
+                BitConverter.TryWriteBytes(myTerm, LeaderTerm);
+                await stream.WriteAsync(myTerm, _cts.Token);
+            }
+            catch { client.Close(); return; }
 
             // Figure out what we need to catchup. If the OpLog can't help
             // (follower seq < oldest buffered, or follower is at seq 0 and
@@ -643,6 +689,16 @@ public sealed class LogicalReplicationFollower : IDisposable
     /// and the next Open integrates via the marker.</summary>
     public Action<string, ulong>? OnSnapshotReceived { get; set; }
 
+    /// <summary>Issue #96 — this node's own term, advertised to the leader on
+    /// the handshake so an old leader superseded by us can fence itself.</summary>
+    public ulong OwnTerm { get; set; }
+
+    /// <summary>Issue #96 — invoked with the leader's advertised term right
+    /// after handshake. The engine wires this to <c>ObserveTerm</c>; it returns
+    /// true when the leader is STALE (its term is lower than ours), telling the
+    /// follower to reject and disconnect from that superseded leader.</summary>
+    public Func<ulong, bool>? OnLeaderTerm { get; set; }
+
     // In-flight snapshot reception state. Only valid between SnapshotStart
     // and SnapshotEnd; reset on End or on disconnect mid-transfer.
     private FileStream? _snapshotWriter;
@@ -721,6 +777,32 @@ public sealed class LogicalReplicationFollower : IDisposable
             await stream.WriteAsync(endpointLenPrefix, _cts.Token);
             if (endpointBytes.Length > 0)
                 await stream.WriteAsync(endpointBytes, _cts.Token);
+
+            // Issue #96 — advertise our term, then read the leader's term. A
+            // leader whose term is LOWER than ours is a superseded (stale)
+            // leader; refuse it. Back-compat: a legacy leader sends no term, so
+            // a short read timeout leaves leaderTerm effectively unknown and we
+            // proceed without fencing (pre-#96 behaviour).
+            var ownTermBuf = new byte[8];
+            BitConverter.TryWriteBytes(ownTermBuf, OwnTerm);
+            await stream.WriteAsync(ownTermBuf, _cts.Token);
+
+            try
+            {
+                using var leaderTermTimeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(500));
+                using var linkedLeaderTermCts = CancellationTokenSource.CreateLinkedTokenSource(_cts.Token, leaderTermTimeout.Token);
+                var leaderTermBuf = new byte[8];
+                if (await ReadExactAsync(stream, leaderTermBuf, linkedLeaderTermCts.Token))
+                {
+                    var leaderTerm = BitConverter.ToUInt64(leaderTermBuf, 0);
+                    if (OnLeaderTerm?.Invoke(leaderTerm) == true)
+                    {
+                        Console.WriteLine($"[Fencing] Leader advertised stale term {leaderTerm} < our term {OwnTerm} — refusing this leader.");
+                        return;
+                    }
+                }
+            }
+            catch (OperationCanceledException) { /* legacy leader → no term; proceed */ }
 
             while (!_cts.IsCancellationRequested)
             {
