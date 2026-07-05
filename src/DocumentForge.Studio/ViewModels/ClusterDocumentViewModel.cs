@@ -69,6 +69,11 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
     [ObservableProperty] private ShardingStrategy _newCollectionStrategy;
     [ObservableProperty] private string _newCollectionShardKey = "";
 
+    /// <summary>Only a hash-sharded collection needs a shard key.</summary>
+    public bool NeedsShardKey => NewCollectionStrategy == ShardingStrategy.Hash;
+
+    partial void OnNewCollectionStrategyChanged(ShardingStrategy value) => OnPropertyChanged(nameof(NeedsShardKey));
+
     public string SummaryText =>
         $"{Shards.Count} shard(s) · {Collections.Count} collection policy(ies) · {_config.VirtualNodesPerShard} vnodes/shard";
 

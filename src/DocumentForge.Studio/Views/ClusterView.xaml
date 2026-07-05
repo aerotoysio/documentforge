@@ -80,7 +80,8 @@
                     <ComboBox ItemsSource="{Binding Strategies}" SelectedItem="{Binding NewCollectionStrategy}"
                               Width="120" Margin="8,0,0,0"/>
                     <TextBox Text="{Binding NewCollectionShardKey, UpdateSourceTrigger=PropertyChanged}" Width="160" Margin="8,0,0,0"
-                             ToolTip="Shard key path (hash strategy only), e.g. customerId"/>
+                             IsEnabled="{Binding NeedsShardKey}"
+                             ToolTip="Shard key path — required for hash, ignored for replicated (e.g. customerId)"/>
                     <Button Content="Add / update" Command="{Binding AddCollectionCommand}" Padding="10,2" Margin="8,0,0,0"/>
                 </StackPanel>
 
