@@ -33,32 +33,112 @@ namespace DocumentForge.Cli.Router;
 /// </summary>
 public sealed class ClusterRouter : IDisposable
 {
-    private readonly ClusterConfig _config;
-    private readonly Dictionary<string, RingClient> _ringByName;
-    private readonly ConsistentHashRing _hashRing;
+    /// <summary>
+    /// Issue #134 — an immutable snapshot of everything a request needs to
+    /// route: the config, the per-shard clients, and the hash ring. The router
+    /// holds exactly one of these behind a single reference; a hot-reload builds
+    /// a fresh snapshot and swaps the reference in one assignment. Every request
+    /// method reads the reference ONCE into a local, so a swap mid-request can
+    /// never tear (the in-flight request keeps using its captured snapshot).
+    /// </summary>
+    private sealed class RoutingState
+    {
+        public ClusterConfig Config { get; }
+        public Dictionary<string, RingClient> RingByName { get; }
+        public ConsistentHashRing HashRing { get; }
 
-    public ClusterConfig Config => _config;
+        public RoutingState(ClusterConfig config, Dictionary<string, RingClient> ringByName, ConsistentHashRing hashRing)
+        {
+            Config = config;
+            RingByName = ringByName;
+            HashRing = hashRing;
+        }
+    }
+
+    // The single swappable reference. `volatile` so a reader on another thread
+    // always sees the latest published snapshot, never a half-constructed one.
+    private volatile RoutingState _state;
+
+    // Ring clients dropped by a hot-reload (a shard was removed or re-pointed).
+    // Disposed at shutdown rather than at swap time so an in-flight request that
+    // captured the old snapshot can finish against a still-open HttpClient.
+    private readonly List<RingClient> _retired = new();
+    private readonly object _applyLock = new();
+
+    public ClusterConfig Config => _state.Config;
 
     public ClusterRouter(ClusterConfig config)
     {
+        _state = BuildState(config, previous: null);
+    }
+
+    /// <summary>Build a fresh <see cref="RoutingState"/>. When a
+    /// <paramref name="previous"/> snapshot is supplied, ring clients for
+    /// shards that are unchanged (same name + same leader endpoint) are reused
+    /// so a hot-reload doesn't churn live HttpClients or drop their connections.</summary>
+    private static RoutingState BuildState(ClusterConfig config, RoutingState? previous)
+    {
         config.Validate();
-        _config = config;
-        // One client per shard leader. Followers aren't dialed by the
-        // router today — replication handles the read side. A future
-        // "read from followers" optimisation will dial them too.
-        _ringByName = config.Shards.ToDictionary(
-            s => s.Name,
-            s => new RingClient(s.Name, s.Leader!),
-            StringComparer.OrdinalIgnoreCase);
-        _hashRing = new ConsistentHashRing(
+        var ringByName = new Dictionary<string, RingClient>(StringComparer.OrdinalIgnoreCase);
+        foreach (var s in config.Shards)
+        {
+            if (previous is not null
+                && previous.RingByName.TryGetValue(s.Name, out var existing)
+                && EndpointsEqual(existing.Endpoint, s.Leader!))
+            {
+                ringByName[s.Name] = existing; // reuse unchanged ring
+            }
+            else
+            {
+                ringByName[s.Name] = new RingClient(s.Name, s.Leader!);
+            }
+        }
+        var hashRing = new ConsistentHashRing(
             config.Shards.Select(s => s.Name).ToList(),
             config.VirtualNodesPerShard);
+        return new RoutingState(config, ringByName, hashRing);
+    }
+
+    private static bool EndpointsEqual(ShardEndpoint a, ShardEndpoint b) =>
+        string.Equals(a.BaseUrl, b.BaseUrl, StringComparison.OrdinalIgnoreCase)
+        && string.Equals(a.Database ?? "", b.Database ?? "", StringComparison.Ordinal)
+        && string.Equals(a.ApiKey ?? "", b.ApiKey ?? "", StringComparison.Ordinal);
+
+    /// <summary>
+    /// Issue #134 — atomically hot-swap the routing config on a live router.
+    /// Validates the new config, builds a fresh ring snapshot (reusing unchanged
+    /// ring clients), bumps <see cref="ClusterConfig.Version"/> to
+    /// <c>previous + 1</c>, and publishes it in a single reference assignment.
+    /// Returns the new version. Throws <see cref="InvalidOperationException"/>
+    /// (from <see cref="ClusterConfig.Validate"/>) on a structurally bad config,
+    /// in which case the live state is left untouched.
+    /// </summary>
+    public int ApplyConfig(ClusterConfig newConfig)
+    {
+        lock (_applyLock) // serialise concurrent PUTs; the read path stays lock-free
+        {
+            var old = _state;
+            // Validate + build BEFORE mutating anything, so a bad config can't
+            // leave a half-applied ring.
+            newConfig.Version = old.Config.Version + 1;
+            var next = BuildState(newConfig, previous: old);
+
+            _state = next; // single atomic publish
+
+            // Retire ring clients that weren't carried into the new snapshot.
+            foreach (var kv in old.RingByName)
+            {
+                if (!next.RingByName.TryGetValue(kv.Key, out var carried) || !ReferenceEquals(carried, kv.Value))
+                    _retired.Add(kv.Value);
+            }
+            return newConfig.Version;
+        }
     }
 
     /// <summary>Public clients keyed by shard name. Useful for callers
     /// that want to drive a specific ring directly (health probes,
-    /// admin ops).</summary>
-    public IReadOnlyDictionary<string, RingClient> Rings => _ringByName;
+    /// admin ops). Reflects the current (possibly hot-reloaded) snapshot.</summary>
+    public IReadOnlyDictionary<string, RingClient> Rings => _state.RingByName;
 
     // -------------------------------------------------------------- insert
 
@@ -70,14 +150,15 @@ public sealed class ClusterRouter : IDisposable
     /// </summary>
     public async Task<HttpResponseMessage> InsertAsync(string collection, JsonElement doc, CancellationToken ct = default)
     {
-        var policy = _config.FindCollection(collection)
+        var state = _state; // snapshot once — a concurrent hot-reload can't tear this request
+        var policy = state.Config.FindCollection(collection)
             ?? new CollectionConfig { Name = collection, Strategy = ShardStrategy.Single };
 
         switch (policy.Strategy)
         {
             case ShardStrategy.Hash:
             {
-                var ring = SelectRingByHash(doc, policy.ShardKeyPath!);
+                var ring = SelectRingByHash(state, doc, policy.ShardKeyPath!);
                 return await ring.InsertAsync(collection, doc, ct);
             }
             case ShardStrategy.Replicated:
@@ -87,7 +168,7 @@ public sealed class ClusterRouter : IDisposable
                 // that's worse than failing closed.
                 HttpResponseMessage? firstOk = null;
                 Exception? firstErr = null;
-                foreach (var (_, ring) in _ringByName)
+                foreach (var (_, ring) in state.RingByName)
                 {
                     try
                     {
@@ -107,7 +188,7 @@ public sealed class ClusterRouter : IDisposable
             case ShardStrategy.Single:
             default:
             {
-                var ring = _ringByName[_config.Shards[0].Name];
+                var ring = state.RingByName[state.Config.Shards[0].Name];
                 return await ring.InsertAsync(collection, doc, ct);
             }
         }
@@ -128,8 +209,9 @@ public sealed class ClusterRouter : IDisposable
         // a strategy. INSERT/DELETE/UPDATE that hit the router today
         // get the same fan-out treatment (correct for replicated,
         // hash-key-aware INSERT happens in InsertAsync).
+        var state = _state; // snapshot once
         var coll = TryExtractCollectionFromSql(sql);
-        var policy = coll is null ? null : _config.FindCollection(coll);
+        var policy = coll is null ? null : state.Config.FindCollection(coll);
         var strategy = policy?.Strategy ?? ShardStrategy.Single;
 
         switch (strategy)
@@ -137,7 +219,7 @@ public sealed class ClusterRouter : IDisposable
             case ShardStrategy.Hash:
             {
                 // Fan-out + merge documents from every ring.
-                var responses = await Task.WhenAll(_ringByName.Values
+                var responses = await Task.WhenAll(state.RingByName.Values
                     .Select(r => r.QueryAsync(sql, ct)));
                 return MergeQueryResponses(responses);
             }
@@ -145,7 +227,7 @@ public sealed class ClusterRouter : IDisposable
             case ShardStrategy.Single:
             default:
             {
-                var firstRing = _ringByName[_config.Shards[0].Name];
+                var firstRing = state.RingByName[state.Config.Shards[0].Name];
                 return await firstRing.QueryAsync(sql, ct);
             }
         }
@@ -153,20 +235,24 @@ public sealed class ClusterRouter : IDisposable
 
     // -------------------------------------------------------------- helpers
 
-    private RingClient SelectRingByHash(JsonElement doc, string shardKeyPath)
+    private static RingClient SelectRingByHash(RoutingState state, JsonElement doc, string shardKeyPath)
     {
         var keyValue = ExtractKey(doc, shardKeyPath);
         if (keyValue is null)
             throw new InvalidOperationException(
                 $"Hash routing requires '{shardKeyPath}' in the document; not present.");
-        return _ringByName[PickShardNameForKey(keyValue)];
+        var shardName = state.Config.Shards[state.HashRing.PickShardIndex(keyValue)].Name;
+        return state.RingByName[shardName];
     }
 
     /// <summary>The shard a given key value routes to — placement is
     /// identical to <see cref="DocumentForgeCluster"/>'s for the same
-    /// shard names and vnode count (issue #100).</summary>
-    public string PickShardNameForKey(string keyValue) =>
-        _config.Shards[_hashRing.PickShardIndex(keyValue)].Name;
+    /// shard names and vnode count (issue #100). Reads the current snapshot.</summary>
+    public string PickShardNameForKey(string keyValue)
+    {
+        var state = _state;
+        return state.Config.Shards[state.HashRing.PickShardIndex(keyValue)].Name;
+    }
 
     /// <summary>Pull the shard-key value out of the document. Supports
     /// simple top-level paths ("pnr") and dotted paths ("customer.id").
@@ -252,7 +338,12 @@ public sealed class ClusterRouter : IDisposable
 
     public void Dispose()
     {
-        foreach (var c in _ringByName.Values) c.Dispose();
-        _ringByName.Clear();
+        var state = _state;
+        foreach (var c in state.RingByName.Values) c.Dispose();
+        lock (_applyLock)
+        {
+            foreach (var c in _retired) c.Dispose(); // ring clients dropped by hot-reloads
+            _retired.Clear();
+        }
     }
 }

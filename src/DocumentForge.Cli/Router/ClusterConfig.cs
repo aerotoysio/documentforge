@@ -31,6 +31,12 @@ public sealed class ClusterConfig
     /// CLI flags override these when both are present.</summary>
     public RouterConfig Router { get; set; } = new();
 
+    /// <summary>Issue #134 — monotonic config version. Bumped every time a
+    /// live router hot-swaps its config via <c>PUT /cluster/config</c>, and
+    /// persisted back to the file so a restart is consistent with the last
+    /// applied state. Starts at 0 for a hand-written / freshly loaded file.</summary>
+    public int Version { get; set; }
+
     /// <summary>Shard rings — each one is a leader plus zero or more
     /// followers. Hash-sharded collections distribute documents across
     /// these rings via the engine's consistent-hash ring.</summary>
