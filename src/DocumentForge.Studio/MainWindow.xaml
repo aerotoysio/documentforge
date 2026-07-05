@@ -118,6 +118,10 @@
             <views:SqlReferenceView/>
         </DataTemplate>
 
+        <DataTemplate DataType="{x:Type vm:ClusterDocumentViewModel}">
+            <views:ClusterView/>
+        </DataTemplate>
+
         <DataTemplate DataType="{x:Type vm:WelcomeDocumentViewModel}">
             <ScrollViewer>
                 <StackPanel Margin="40" MaxWidth="620" HorizontalAlignment="Left">
@@ -155,6 +159,10 @@
             </MenuItem>
             <MenuItem Header="_View">
                 <MenuItem Header="_Refresh All" Command="{Binding RefreshAllCommand}" InputGestureText="F5"/>
+            </MenuItem>
+            <MenuItem Header="_Cluster">
+                <MenuItem Header="_Open cluster.json…" Command="{Binding OpenClusterFileCommand}"/>
+                <MenuItem Header="_New cluster.json…" Command="{Binding NewClusterFileCommand}"/>
             </MenuItem>
             <MenuItem Header="_Help">
                 <MenuItem Header="_SQL Reference…" Command="{Binding OpenSqlReferenceCommand}"/>

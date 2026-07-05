@@ -390,6 +390,39 @@ public sealed partial class MainViewModel : ObservableObject
     }
 
     [RelayCommand]
+    private void OpenClusterFile()
+    {
+        var path = _dialogs.PickOpenFile("Cluster config (*.json)|*.json|All files (*.*)|*.*");
+        if (path is null) return;
+        try
+        {
+            var config = Core.Cluster.ClusterConfig.Load(path);
+            OpenCluster(config, path);
+        }
+        catch (Exception ex)
+        {
+            _dialogs.ShowError("Open cluster config failed", ex.Message);
+        }
+    }
+
+    [RelayCommand]
+    private void NewClusterFile() => OpenCluster(new Core.Cluster.ClusterConfig(), null);
+
+    private void OpenCluster(Core.Cluster.ClusterConfig config, string? path)
+    {
+        var contentId = path is null ? null : $"cluster:{path}";
+        if (contentId is not null)
+        {
+            var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
+            if (existing is not null) { ActiveDocument = existing; return; }
+        }
+        var document = new ClusterDocumentViewModel(config, path, _dialogs);
+        Documents.Add(document);
+        ActiveDocument = document;
+        StatusText = path is null ? "New cluster config" : $"Cluster — {System.IO.Path.GetFileName(path)}";
+    }
+
+    [RelayCommand]
     private void OpenSqlReference()
     {
         var existing = Documents.FirstOrDefault(d => d.ContentId == "sqlref");

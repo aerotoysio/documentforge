@@ -1,0 +1,99 @@
+<UserControl x:Class="DocumentForge.Studio.Views.ClusterView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="clr-namespace:DocumentForge.Studio.ViewModels"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             mc:Ignorable="d"
+             d:DataContext="{d:DesignInstance vm:ClusterDocumentViewModel}">
+    <DockPanel>
+        <!-- Toolbar -->
+        <ToolBarTray DockPanel.Dock="Top" IsLocked="True">
+            <ToolBar>
+                <Button Content="💾 Save" Command="{Binding SaveCommand}" Padding="8,2"/>
+                <Button Content="🩺 Check health" Command="{Binding CheckHealthCommand}" Padding="8,2"/>
+                <Separator/>
+                <TextBlock Text="{Binding SummaryText}" VerticalAlignment="Center" Margin="4,0"/>
+            </ToolBar>
+        </ToolBarTray>
+
+        <TextBlock DockPanel.Dock="Bottom" Text="{Binding StatusMessage}" Margin="12,4" TextWrapping="Wrap"/>
+
+        <ScrollViewer VerticalScrollBarVisibility="Auto">
+            <StackPanel Margin="14">
+                <TextBlock Text="Shards" FontSize="15" FontWeight="SemiBold"/>
+                <TextBlock Foreground="Gray" FontSize="11" Margin="0,2,0,6" TextWrapping="Wrap"
+                           Text="Each shard is a node (or a leader+followers replication group). Data is spread across shards by the consistent-hash ring."/>
+                <DataGrid ItemsSource="{Binding Shards}" AutoGenerateColumns="False" IsReadOnly="True"
+                          HeadersVisibility="Column" CanUserAddRows="False" MaxHeight="200"
+                          GridLinesVisibility="Horizontal" FontSize="12">
+                    <DataGrid.Columns>
+                        <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="140"/>
+                        <DataGridTextColumn Header="Leader endpoint" Binding="{Binding LeaderEndpoint}" Width="*"/>
+                        <DataGridTextColumn Header="Followers" Binding="{Binding FollowerCount}" Width="80"/>
+                        <DataGridTextColumn Header="Health" Binding="{Binding Health}" Width="200"/>
+                        <DataGridTemplateColumn Width="70">
+                            <DataGridTemplateColumn.CellTemplate>
+                                <DataTemplate>
+                                    <Button Content="Remove" Padding="4,0" Margin="2"
+                                            Command="{Binding DataContext.RemoveShardCommand,
+                                                RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                            CommandParameter="{Binding}"/>
+                                </DataTemplate>
+                            </DataGridTemplateColumn.CellTemplate>
+                        </DataGridTemplateColumn>
+                    </DataGrid.Columns>
+                </DataGrid>
+                <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                    <TextBox Text="{Binding NewShardName, UpdateSourceTrigger=PropertyChanged}" Width="140"
+                             ToolTip="Shard name"/>
+                    <TextBox Text="{Binding NewShardEndpoint, UpdateSourceTrigger=PropertyChanged}" Width="240" Margin="8,0,0,0"
+                             ToolTip="Leader endpoint, e.g. http://shard-a:5001"/>
+                    <Button Content="Add shard" Command="{Binding AddShardCommand}" Padding="10,2" Margin="8,0,0,0"/>
+                </StackPanel>
+
+                <TextBlock Text="Collection sharding" FontSize="15" FontWeight="SemiBold" Margin="0,20,0,0"/>
+                <TextBlock Foreground="Gray" FontSize="11" Margin="0,2,0,6" TextWrapping="Wrap"
+                           Text="hash = partitioned across shards by a shard key (e.g. orders by customerId). replicated = a full copy on every shard (small reference tables, so joins stay local)."/>
+                <DataGrid ItemsSource="{Binding Collections}" AutoGenerateColumns="False" IsReadOnly="True"
+                          HeadersVisibility="Column" CanUserAddRows="False" MaxHeight="200"
+                          GridLinesVisibility="Horizontal" FontSize="12">
+                    <DataGrid.Columns>
+                        <DataGridTextColumn Header="Collection" Binding="{Binding Name}" Width="180"/>
+                        <DataGridTextColumn Header="Strategy" Binding="{Binding Strategy}" Width="120"/>
+                        <DataGridTextColumn Header="Shard key" Binding="{Binding ShardKeyPath}" Width="*"/>
+                        <DataGridTemplateColumn Width="70">
+                            <DataGridTemplateColumn.CellTemplate>
+                                <DataTemplate>
+                                    <Button Content="Remove" Padding="4,0" Margin="2"
+                                            Command="{Binding DataContext.RemoveCollectionCommand,
+                                                RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                            CommandParameter="{Binding}"/>
+                                </DataTemplate>
+                            </DataGridTemplateColumn.CellTemplate>
+                        </DataGridTemplateColumn>
+                    </DataGrid.Columns>
+                </DataGrid>
+                <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
+                    <TextBox Text="{Binding NewCollectionName, UpdateSourceTrigger=PropertyChanged}" Width="180"
+                             ToolTip="Collection name"/>
+                    <ComboBox ItemsSource="{Binding Strategies}" SelectedItem="{Binding NewCollectionStrategy}"
+                              Width="120" Margin="8,0,0,0"/>
+                    <TextBox Text="{Binding NewCollectionShardKey, UpdateSourceTrigger=PropertyChanged}" Width="160" Margin="8,0,0,0"
+                             ToolTip="Shard key path (hash strategy only), e.g. customerId"/>
+                    <Button Content="Add / update" Command="{Binding AddCollectionCommand}" Padding="10,2" Margin="8,0,0,0"/>
+                </StackPanel>
+
+                <Border Background="#FFF8E6" BorderBrush="#F0E0A0" BorderThickness="1" CornerRadius="4"
+                        Padding="10,7" Margin="0,20,0,0">
+                    <TextBlock TextWrapping="Wrap" FontSize="11" Foreground="#665500">
+                        Studio edits this cluster.json and health-checks shards. Live rebalancing runs through the
+                        engine (issue for HTTP rebalance endpoints is tracked). Known engine caveats to keep in mind:
+                        cross-shard AVG is currently inaccurate (#99) and the CLI router uses a different hash than the
+                        engine ring (#100).
+                    </TextBlock>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
+    </DockPanel>
+</UserControl>
