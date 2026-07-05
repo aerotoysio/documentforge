@@ -63,7 +63,7 @@ Name: "{group}\Uninstall DocumentForge Studio"; Filename: "{uninstallexe}"
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Components: studio; Flags: unchecked
-Name: "startupservice"; Description: "Run the DocumentForge service automatically at Windows startup (background, as SYSTEM — needs admin approval)"; GroupDescription: "Service:"; Components: service; Flags: unchecked
+Name: "startupservice"; Description: "Install as a Windows service (auto-start on boot, managed in services.msc — needs admin approval)"; GroupDescription: "Service:"; Components: service; Flags: unchecked
 
 [Registry]
 ; Per-user .dfdb file association -> opens Studio (only if the client is installed).
@@ -117,7 +117,7 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  Ps1, Content: String;
+  Exe, Params: String;
   ResultCode: Integer;
 begin
   if CurStep <> ssPostInstall then
@@ -127,25 +127,20 @@ begin
   // and the service shortcut agree.
   SaveStringToFile(ExpandConstant('{app}\port.txt'), GetPort(''), False);
 
-  // Optional: register a startup Scheduled Task (runs the service at boot as
-  // SYSTEM). Elevated via a UAC prompt because the installer itself is per-user.
+  // Optional: register a real Windows service (dfdb service install, which also
+  // starts it). Elevated via UAC because the installer itself is per-user.
   if WizardIsComponentSelected('service') and WizardIsTaskSelected('startupservice') then
   begin
-    Ps1 := ExpandConstant('{app}\install-service-task.ps1');
-    Content :=
-      '$exe = ''' + ExpandConstant('{app}\service\dfdb.exe') + '''' + #13#10 +
-      '$arg = ''serve --port ' + GetPort('') + ' --data-dir "{#DataDir}"''' + #13#10 +
-      '$a = New-ScheduledTaskAction -Execute $exe -Argument $arg' + #13#10 +
-      '$t = New-ScheduledTaskTrigger -AtStartup' + #13#10 +
-      '$p = New-ScheduledTaskPrincipal -UserId ''SYSTEM'' -RunLevel Highest' + #13#10 +
-      '$s = New-ScheduledTaskSettingsSet -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)' + #13#10 +
-      'Register-ScheduledTask -TaskName ''DocumentForge Service'' -Action $a -Trigger $t -Principal $p -Settings $s -Force' + #13#10;
-    SaveStringToFile(Ps1, Content, False);
-    if not ShellExec('runas', 'powershell.exe',
-        '-NoProfile -ExecutionPolicy Bypass -File "' + Ps1 + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+    Exe := ExpandConstant('{app}\service\dfdb.exe');
+    Params := 'service install --port ' + GetPort('') + ' --data-dir "{#DataDir}"';
+    if not ShellExec('runas', Exe, Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
        or (ResultCode <> 0) then
-      MsgBox('The startup service task could not be registered (you may have declined the admin prompt). ' +
-             'You can still start the service from the Start Menu shortcut, or re-run setup.', mbInformation, MB_OK);
+      MsgBox('The Windows service could not be installed (you may have declined the admin prompt). ' +
+             'You can install it later from an elevated prompt with:  dfdb service install, ' +
+             'or run it manually from the Start Menu shortcut.', mbInformation, MB_OK)
+    else
+      // Marker so uninstall knows to remove the service.
+      SaveStringToFile(ExpandConstant('{app}\service-installed.txt'), 'DocumentForge', False);
   end;
 end;
 
@@ -153,7 +148,7 @@ procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 var
   ResultCode: Integer;
 begin
-  // Only prompt for elevation if we actually created the startup task.
-  if (CurUninstallStep = usUninstall) and FileExists(ExpandConstant('{app}\install-service-task.ps1')) then
-    ShellExec('runas', 'schtasks.exe', '/delete /tn "DocumentForge Service" /f', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  // Remove the Windows service before the files go (only if we installed it).
+  if (CurUninstallStep = usUninstall) and FileExists(ExpandConstant('{app}\service-installed.txt')) then
+    ShellExec('runas', ExpandConstant('{app}\service\dfdb.exe'), 'service uninstall', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
