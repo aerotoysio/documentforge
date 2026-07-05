@@ -24,6 +24,8 @@
                                   Visibility="{Binding CanManageServer, Converter={StaticResource BoolToVis}}"/>
                         <MenuItem Header="API Keys…" Command="{Binding ApiKeysCommand}"
                                   Visibility="{Binding CanManageServer, Converter={StaticResource BoolToVis}}"/>
+                        <MenuItem Header="Backups…" Command="{Binding BackupsCommand}"
+                                  Visibility="{Binding CanManageServer, Converter={StaticResource BoolToVis}}"/>
                         <MenuItem Header="Refresh" Command="{Binding RefreshCommand}"/>
                         <Separator/>
                         <MenuItem Header="Disconnect" Command="{Binding DisconnectCommand}"/>
@@ -131,6 +133,10 @@
 
         <DataTemplate DataType="{x:Type vm:ApiKeysDocumentViewModel}">
             <views:ApiKeysView/>
+        </DataTemplate>
+
+        <DataTemplate DataType="{x:Type vm:BackupsDocumentViewModel}">
+            <views:BackupsView/>
         </DataTemplate>
 
         <DataTemplate DataType="{x:Type vm:WelcomeDocumentViewModel}">

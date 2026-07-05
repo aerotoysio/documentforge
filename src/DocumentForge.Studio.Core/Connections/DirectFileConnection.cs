@@ -172,6 +172,11 @@ public sealed class DirectFileConnection : IDfConnection
 
     private const string ServerOnly = "This is only available through a DocumentForge service, not a direct-file connection.";
 
+    public Task<IReadOnlyList<BackupInfo>> GetBackupsAsync(CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task<BackupInfo> TakeBackupAsync(string database, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task DeleteBackupAsync(string backupId, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task<string> RestoreBackupAsync(string backupId, string newDatabaseName, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+
     public Task<IReadOnlyList<ApiKeyInfo>> GetApiKeysAsync(CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
     public Task<CreatedApiKey> CreateApiKeyAsync(string? description, IReadOnlyList<string> scopes, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
     public Task RevokeApiKeyAsync(string id, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);

@@ -229,6 +229,57 @@ public sealed class HttpConnection : IDfConnection
             root.TryGetProperty("timeMs", out var t) ? t.GetDouble() : 0);
     }
 
+    public async Task<IReadOnlyList<BackupInfo>> GetBackupsAsync(CancellationToken ct = default)
+    {
+        var body = await GetRawAsync("admin/backups", ct).ConfigureAwait(false);
+        using var doc = JsonDocument.Parse(body);
+        var result = new List<BackupInfo>();
+        if (doc.RootElement.TryGetProperty("backups", out var arr) && arr.ValueKind == JsonValueKind.Array)
+            foreach (var b in arr.EnumerateArray())
+                result.Add(ParseBackup(b));
+        return result;
+    }
+
+    public async Task<BackupInfo> TakeBackupAsync(string database, CancellationToken ct = default)
+    {
+        using var response = await _http.PostAsync(
+            $"databases/{Uri.EscapeDataString(database)}/backup", content: null, ct).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        using var doc = JsonDocument.Parse(body);
+        return ParseBackup(doc.RootElement);
+    }
+
+    public async Task DeleteBackupAsync(string backupId, CancellationToken ct = default)
+    {
+        using var response = await _http.DeleteAsync($"admin/backups/{Uri.EscapeDataString(backupId)}", ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        }
+    }
+
+    public async Task<string> RestoreBackupAsync(string backupId, string newDatabaseName, CancellationToken ct = default)
+    {
+        using var response = await _http.PostAsJsonAsync(
+            "admin/backup/restore", new { backupId, newDatabaseName }, Json, ct).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        using var doc = JsonDocument.Parse(body);
+        return doc.RootElement.TryGetProperty("filePath", out var fp) ? fp.GetString() ?? newDatabaseName : newDatabaseName;
+    }
+
+    private static BackupInfo ParseBackup(JsonElement b) => new(
+        b.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "",
+        b.TryGetProperty("database", out var db) ? db.GetString() ?? "" : "",
+        b.TryGetProperty("path", out var p) && p.ValueKind == JsonValueKind.String ? p.GetString() : null,
+        b.TryGetProperty("sizeBytes", out var sz) && sz.ValueKind == JsonValueKind.Number ? sz.GetInt64() : 0,
+        b.TryGetProperty("createdAtUtc", out var ca) && ca.ValueKind == JsonValueKind.String ? ca.GetString() : null,
+        b.TryGetProperty("kind", out var k) && k.ValueKind == JsonValueKind.String ? k.GetString() : null);
+
     public async Task<IReadOnlyList<ApiKeyInfo>> GetApiKeysAsync(CancellationToken ct = default)
     {
         var body = await GetRawAsync("admin/keys", ct).ConfigureAwait(false);

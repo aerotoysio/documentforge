@@ -28,6 +28,8 @@ public sealed record CreatedApiKey(string Id, string Secret, IReadOnlyList<strin
 
 public sealed record CompactionInfo(long PagesCompacted, long BytesReclaimed, double TimeMs);
 
+public sealed record BackupInfo(string Id, string Database, string? Path, long SizeBytes, string? CreatedAtUtc, string? Kind);
+
 /// <summary>Per-database health + diagnostics. Recommendation is one of
 /// "healthy" / "rebuild-catalog" / "recovery-pending" / "engine-degraded".</summary>
 public sealed record DatabaseHealthReport(

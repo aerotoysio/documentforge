@@ -470,6 +470,19 @@ public sealed partial class MainViewModel : ObservableObject
         StatusText = $"New query on {database}";
     }
 
+    /// <summary>Opens (or re-focuses) the backups panel for a server.</summary>
+    public void OpenBackups(ServerNodeViewModel server)
+    {
+        var contentId = $"backups:{server.Connection.Descriptor.Id}";
+        var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
+        if (existing is not null) { ActiveDocument = existing; return; }
+
+        var document = new BackupsDocumentViewModel(server.Connection);
+        Documents.Add(document);
+        ActiveDocument = document;
+        StatusText = $"Backups — {server.Connection.Descriptor.Name}";
+    }
+
     /// <summary>Opens (or re-focuses) the API key manager for a server.</summary>
     public void OpenApiKeys(ServerNodeViewModel server)
     {

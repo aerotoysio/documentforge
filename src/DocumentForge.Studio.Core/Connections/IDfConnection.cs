@@ -46,6 +46,14 @@ public interface IDfConnection : IAsyncDisposable
     /// <summary>Defragments a collection, reclaiming space from deleted documents.</summary>
     Task<CompactionInfo> CompactCollectionAsync(string database, string collection, CancellationToken ct = default);
 
+    // --- Backups (server connections only; requires ServerAdmin) ---
+
+    Task<IReadOnlyList<BackupInfo>> GetBackupsAsync(CancellationToken ct = default);
+    Task<BackupInfo> TakeBackupAsync(string database, CancellationToken ct = default);
+    Task DeleteBackupAsync(string backupId, CancellationToken ct = default);
+    /// <summary>Restores a backup as a new database. Returns the new database's file path.</summary>
+    Task<string> RestoreBackupAsync(string backupId, string newDatabaseName, CancellationToken ct = default);
+
     // --- API keys (server connections only; requires ServerAdmin) ---
 
     Task<IReadOnlyList<ApiKeyInfo>> GetApiKeysAsync(CancellationToken ct = default);
