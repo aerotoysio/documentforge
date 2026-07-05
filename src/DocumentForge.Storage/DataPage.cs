@@ -183,6 +183,19 @@ public sealed class DataPage
         FlushHeader();
     }
 
+    /// <summary>
+    /// Set the page type and persist it. Must be used instead of mutating a
+    /// copy of <see cref="Header"/> then WriteTo-ing it: any later Insert /
+    /// SetNextPage calls FlushHeader, which rewrites the in-struct header and
+    /// would otherwise clobber a type set only in the raw bytes. (This was the
+    /// latent bug that left catalog pages mistyped as Data — issue #93.)
+    /// </summary>
+    public void SetPageType(PageType pageType)
+    {
+        _header.PageType = pageType;
+        FlushHeader();
+    }
+
     public void SetPrevPage(PageId prevPageId)
     {
         _header.PrevPageId = prevPageId;
