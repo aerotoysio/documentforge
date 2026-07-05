@@ -1192,7 +1192,7 @@ public static class ServeCommand
         });
     }
 
-    private static void MapAdminEndpoints(WebApplication app, DocumentForgeDb db, NodeConfig config)
+    internal static void MapAdminEndpoints(WebApplication app, DocumentForgeDb db, NodeConfig config)
     {
         // Liveness + identity
         app.MapGet("/health", () =>
@@ -1231,6 +1231,82 @@ public static class ServeCommand
             image = BuildInfo.Image,
             node = config.NodeName,
         }));
+
+        // Issue #111 — service settings API. GET returns the effective node
+        // configuration with all secrets redacted to presence + a short
+        // fingerprint (never the raw key / TLS password). Admin-scope gated.
+        // The semi-sync knobs reflect the LIVE engine values, which PUT can
+        // change without a restart.
+        app.MapGet("/admin/config", (HttpContext httpCtx) =>
+        {
+            if (ScopeCheck.RequireAdmin(httpCtx) is { } deny) return deny;
+            return Results.Ok(BuildConfigView(db, config));
+        });
+
+        // PUT applies the live-editable subset only (currently the semi-sync
+        // replication knobs, which live on the engine). Restart-required fields
+        // (port, data dir, bind-all, TLS, replication role/topology, keys) are
+        // rejected with a 400 that tells the operator to edit node.json and
+        // restart — they are never silently ignored.
+        app.MapPut("/admin/config", async (HttpContext httpCtx) =>
+        {
+            if (ScopeCheck.RequireAdmin(httpCtx) is { } deny) return deny;
+
+            using var reader = new StreamReader(httpCtx.Request.Body);
+            var raw = await reader.ReadToEndAsync();
+            if (string.IsNullOrWhiteSpace(raw))
+                return Results.BadRequest(new { error = "Empty body. Send the live-editable fields to change (e.g. { \"minSyncReplicas\": 1 })." });
+
+            JsonElement root;
+            try { using var doc = JsonDocument.Parse(raw); root = doc.RootElement.Clone(); }
+            catch (JsonException ex) { return Results.BadRequest(new { error = $"Invalid JSON: {ex.Message}" }); }
+            if (root.ValueKind != JsonValueKind.Object)
+                return Results.BadRequest(new { error = "Body must be a JSON object." });
+
+            // Guard: reject any restart-required field explicitly so an operator
+            // never thinks a port change took effect when it didn't.
+            foreach (var restart in RestartRequiredFields)
+                if (root.TryGetProperty(restart, out _))
+                    return Results.BadRequest(new
+                    {
+                        error = $"'{restart}' is restart-required and cannot be changed over the API. Edit node.json and restart the service.",
+                        code = "restartRequired",
+                        field = restart,
+                    });
+
+            var applied = new List<string>();
+            try
+            {
+                if (root.TryGetProperty("minSyncReplicas", out var msr))
+                {
+                    if (msr.ValueKind != JsonValueKind.Number || !msr.TryGetInt32(out var v) || v < 0)
+                        return Results.BadRequest(new { error = "'minSyncReplicas' must be a non-negative integer." });
+                    db.MinSyncReplicas = v;
+                    config.Replication ??= new ReplicationConfig();
+                    config.Replication.MinSyncReplicas = v;
+                    applied.Add("minSyncReplicas");
+                }
+                if (root.TryGetProperty("syncTimeoutSeconds", out var sts))
+                {
+                    if (sts.ValueKind != JsonValueKind.Number || !sts.TryGetDouble(out var s) || s <= 0)
+                        return Results.BadRequest(new { error = "'syncTimeoutSeconds' must be a positive number." });
+                    db.SyncReplicationTimeout = TimeSpan.FromSeconds(s);
+                    config.Replication ??= new ReplicationConfig();
+                    config.Replication.SyncTimeoutSeconds = s;
+                    applied.Add("syncTimeoutSeconds");
+                }
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+
+            if (applied.Count == 0)
+                return Results.BadRequest(new
+                {
+                    error = "No live-editable fields present. Editable now: minSyncReplicas, syncTimeoutSeconds.",
+                    liveEditable = LiveEditableFields,
+                });
+
+            return Results.Ok(new { saved = true, applied, config = BuildConfigView(db, config) });
+        });
 
         // Force a cache flush (all dirty pages to disk, truncate recovery log)
         app.MapPost("/admin/flush", (HttpContext httpCtx) =>
@@ -1350,6 +1426,87 @@ public static class ServeCommand
             }
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
+    }
+
+    // Issue #111 — fields that require a process restart to change; the config
+    // API is explicit about these rather than silently ignoring an edit.
+    private static readonly string[] RestartRequiredFields =
+    {
+        "port", "dataDir", "bindAllInterfaces", "insecureDevMode", "nodeName",
+        "apiKey", "replicationSecret", "tls", "scopedKeys", "role",
+        "leaderHost", "leaderPort", "replicationPort", "publicBaseUrl",
+    };
+
+    private static readonly string[] LiveEditableFields =
+    {
+        "minSyncReplicas", "syncTimeoutSeconds",
+    };
+
+    /// <summary>
+    /// Issue #111 — the redacted, effective node-configuration view. Secrets are
+    /// reduced to a boolean "configured" plus a short SHA-256 fingerprint so an
+    /// operator can confirm <em>which</em> key is loaded without it ever leaving
+    /// the box in plaintext. The semi-sync knobs are read from the LIVE engine.
+    /// </summary>
+    private static object BuildConfigView(DocumentForgeDb db, NodeConfig config)
+    {
+        var sec = config.Security;
+        return new
+        {
+            node = new
+            {
+                nodeName = config.NodeName,
+                port = config.Port,
+                dataDir = config.DataDir,
+                bindAllInterfaces = config.BindAllInterfaces,
+                insecureDevMode = config.InsecureDevMode,
+                httpEndpoint = config.ResolveHttpEndpoint(),
+            },
+            security = new
+            {
+                adminKeyConfigured = !string.IsNullOrEmpty(sec?.ApiKey),
+                adminKeyFingerprint = Fingerprint(sec?.ApiKey),
+                replicationSecretConfigured = !string.IsNullOrEmpty(sec?.ReplicationSecret),
+                replicationSecretFingerprint = Fingerprint(sec?.ReplicationSecret),
+                tls = new
+                {
+                    configured = sec?.Tls is not null,
+                    certPath = sec?.Tls?.CertPath,
+                    certPasswordConfigured = !string.IsNullOrEmpty(sec?.Tls?.CertPassword),
+                },
+                scopedKeys = (sec?.ScopedKeys ?? new List<ScopedApiKey>()).Select(k => new
+                {
+                    description = k.Description,
+                    scopes = k.Scopes,
+                    keyFingerprint = Fingerprint(k.Key),
+                }).ToList(),
+            },
+            replication = new
+            {
+                role = config.Replication?.NormalizedRole is { Length: > 0 } r ? r : null,
+                port = config.Replication?.Port,
+                leaderHost = config.Replication?.LeaderHost,
+                leaderPort = config.Replication?.LeaderPort,
+                // Live engine values — reflect any PUT applied since startup.
+                minSyncReplicas = db.MinSyncReplicas,
+                syncTimeoutSeconds = db.SyncReplicationTimeout.TotalSeconds,
+                autoFailover = config.Replication?.AutoFailover is { } af
+                    ? new { silenceSeconds = af.SilenceSeconds, newLeaderPort = af.NewLeaderPort }
+                    : null,
+            },
+            network = new { publicBaseUrl = config.Network?.PublicBaseUrl },
+            restartRequired = RestartRequiredFields,
+            liveEditable = LiveEditableFields,
+        };
+    }
+
+    /// <summary>Non-reversible short fingerprint of a secret: "sha256:xxxxxxxx"
+    /// (first 4 bytes of the digest, hex). Null/empty in → null out.</summary>
+    private static string? Fingerprint(string? secret)
+    {
+        if (string.IsNullOrEmpty(secret)) return null;
+        var hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(secret));
+        return "sha256:" + Convert.ToHexString(hash, 0, 4).ToLowerInvariant();
     }
 
     private static void MapReplicationEndpoints(WebApplication app, DocumentForgeDb db, NodeConfig config)
