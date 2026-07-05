@@ -44,7 +44,6 @@ jobs:
       matrix:
         image:
           - documentforge
-          - documentforge-admin
     name: Retag ${{ matrix.image }}
     steps:
       - name: Set up Docker Buildx

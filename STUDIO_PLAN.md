@@ -119,7 +119,7 @@ Each phase lands as its own PR against `master`, keeping the sln green throughou
 
 1. **Name**: DocumentForge Studio (`DocumentForgeStudio.exe`).
 2. **Bundle the service**: yes — installer ships `dfdb.exe` alongside Studio, and Studio can start/stop a local service.
-3. **admin-ui**: keep for now; revisit after Phase 4 parity.
+3. **admin-ui**: RETIRED (2026-07-05) — Studio reached Phase 4 parity, so the Next.js admin UI and its container image were removed.
 4. **Direct-file mode**: full read/write. Embedded connect is for local app testing; anything at scale uses the service.
 5. **Dependencies**: approved (all free/OSS: MIT/MS-PL).
 6. **Rebalance**: extend the DF service with HTTP rebalance endpoints (plan preview + execute) — DF services must be fully capable. This is a service-side work item scheduled just before Phase 5; Studio never shells out to the CLI.

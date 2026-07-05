@@ -72,7 +72,7 @@ public class Program
         Console.WriteLine("          [--insecure-dev-mode]  [--bind-all]");
         Console.WriteLine("          [--replication-role leader|follower --replication-port N");
         Console.WriteLine("           --leader-host H --leader-port N --auto-failover-seconds N]");
-        Console.WriteLine("        Start the REST API for one node. Pairs with the admin UI.");
+        Console.WriteLine("        Start the REST API for one node. Manage it with DocumentForge Studio.");
         Console.WriteLine("        An API key (or scoped keys) is required; --insecure-dev-mode runs");
         Console.WriteLine("        without auth for local development (loopback only, full admin).");
         Console.WriteLine("        Optional replication flags stand up a leader listener or follower loop.");

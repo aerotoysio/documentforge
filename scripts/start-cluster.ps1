@@ -42,8 +42,6 @@ Write-Host ""
 Write-Host "Then check health:" -ForegroundColor Yellow
 Write-Host "  dfdb health $cluster/cluster.json"
 Write-Host ""
-Write-Host "Or point the admin UI at shard A:" -ForegroundColor Yellow
-Write-Host "  cd admin-ui"
-Write-Host '  $env:NEXT_PUBLIC_DFDB_URL = "http://localhost:5001"'
-Write-Host "  npm run dev"
+Write-Host "Or open DocumentForge Studio and add an HTTP connection to shard A:" -ForegroundColor Yellow
+Write-Host "  http://localhost:5001"
 Write-Host ""

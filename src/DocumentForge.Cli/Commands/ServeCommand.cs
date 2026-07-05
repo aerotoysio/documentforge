@@ -382,7 +382,7 @@ public static class ServeCommand
         Console.WriteLine("             POST /replication/promote | /replication/read-only | /replication/read-write");
         Console.WriteLine("             POST /replication/auto-failover/enable | /disable");
         Console.WriteLine();
-        Console.WriteLine($"  admin UI:  http://localhost:3000  (set NEXT_PUBLIC_DFDB_URL={bindUrl})");
+        Console.WriteLine($"  Manage with DocumentForge Studio — add an HTTP connection to {bindUrl}");
         Console.WriteLine();
     }
 

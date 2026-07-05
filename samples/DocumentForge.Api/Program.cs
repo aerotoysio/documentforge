@@ -92,7 +92,7 @@ Console.WriteLine("    GET    /indexes/{collection} - List indexes");
 Console.WriteLine("    POST   /index               - Create an index");
 Console.WriteLine("    GET    /stats               - Node statistics");
 Console.WriteLine();
-Console.WriteLine($"  Admin UI:  http://localhost:3000  (set NEXT_PUBLIC_DFDB_URL=http://localhost:{config.Port})");
+Console.WriteLine($"  Manage with DocumentForge Studio — add an HTTP connection to http://localhost:{config.Port}");
 Console.WriteLine("=============================================================");
 
 // ---- POST /query ----
