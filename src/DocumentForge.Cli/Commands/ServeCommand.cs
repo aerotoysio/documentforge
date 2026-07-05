@@ -308,8 +308,13 @@ public static class ServeCommand
             });
         }
 
+        // Out-of-line blob store (issues #109/#71) — one per database, opened
+        // lazily beside each data file. Blob bytes never enter the data file,
+        // page cache, or WAL.
+        var blobs = new Blobs.BlobStoreManager();
+
         PrintBanner(config, bindUrl, replicationSummary);
-        MapEndpoints(app, db, registry);
+        MapEndpoints(app, db, registry, blobs);
         MapAdminEndpoints(app, db, config);
         MapReplicationEndpoints(app, db, config);
         // Issue #66 Phase 2: multi-database admin verbs (list/attach/create/
@@ -338,6 +343,7 @@ public static class ServeCommand
         app.Lifetime.ApplicationStopping.Register(() =>
         {
             try { serviceManager.Dispose(); } catch { }
+            try { blobs.Dispose(); } catch { }
             try { registry.Dispose(); } catch { }
         });
         app.Run();
@@ -440,8 +446,44 @@ public static class ServeCommand
             $"Unknown replication role '{rep.Role}'. Expected 'leader' or 'follower'.");
     }
 
-    private static void MapEndpoints(WebApplication app, DocumentForgeDb db, DatabaseRegistry registry)
+    private static void MapEndpoints(WebApplication app, DocumentForgeDb db, DatabaseRegistry registry, Blobs.BlobStoreManager blobs)
     {
+        // Issues #109/#71 — out-of-line blob storage on a document field. Bytes
+        // stream to a content-addressed sibling store, never the data file; the
+        // field ends up holding a small { "$blob": ... } descriptor.
+        app.MapPut("/collections/{name}/{id}/blob/{field}", (string name, string id, string field, HttpRequest request) =>
+        {
+            if (!IsValidCollectionName(name)) return Task.FromResult(InvalidCollectionNameResult());
+            return Blobs.BlobHandler.Upload(db, blobs.For(db), name, id, field, request);
+        });
+
+        app.MapGet("/collections/{name}/{id}/blob/{field}", (string name, string id, string field, HttpRequest request, HttpResponse response) =>
+        {
+            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
+            return Blobs.BlobHandler.Download(db, blobs.For(db), name, id, field, request, response);
+        });
+
+        app.MapDelete("/collections/{name}/{id}/blob/{field}", (string name, string id, string field, HttpRequest request) =>
+        {
+            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
+            return Blobs.BlobHandler.Remove(db, name, id, field, request);
+        });
+
+        // Out-of-band mark-sweep GC: reclaim blobs no document references.
+        app.MapPost("/admin/blobs/gc", () =>
+        {
+            var referenced = Blobs.BlobStoreManager.CollectReferencedBlobIds(db);
+            var store = blobs.For(db);
+            var collected = store.GarbageCollect(referenced);
+            return Results.Ok(new { success = true, referenced = referenced.Count, collected, liveBytes = store.LiveBytes });
+        });
+
+        app.MapGet("/blobs/stats", () =>
+        {
+            var store = blobs.For(db);
+            return Results.Ok(new { count = store.Count, liveBytes = store.LiveBytes });
+        });
+
         // POST /query - materialised JSON response (default, back-compat).
         // Pass ?stream=true OR Accept: application/x-ndjson for an NDJSON stream:
         // first line is the metadata envelope, then one document per line.
