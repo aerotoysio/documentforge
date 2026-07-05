@@ -243,7 +243,8 @@ public sealed class HttpConnection : IDfConnection
                 followers.Add(new ReplicationFollowerInfo(
                     el.TryGetProperty("endpoint", out var ep) ? ep.GetString() ?? "" : "",
                     el.TryGetProperty("httpEndpoint", out var he) && he.ValueKind == JsonValueKind.String ? he.GetString() : null,
-                    el.TryGetProperty("worstCaseLagSeq", out var lag) ? (long)lag.GetUInt64() : 0));
+                    el.TryGetProperty("worstCaseLagSeq", out var lag) ? (long)lag.GetUInt64() : 0,
+                    el.TryGetProperty("connectedAt", out var ca) && ca.ValueKind == JsonValueKind.String ? ca.GetString() : null));
 
         string? followerLeader = null;
         if (follower.ValueKind == JsonValueKind.Object

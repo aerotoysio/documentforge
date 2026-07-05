@@ -11,8 +11,12 @@
 
             <!-- Header -->
             <DockPanel>
-                <Button DockPanel.Dock="Right" Content="🔄 Refresh" Padding="10,4"
-                        Command="{Binding RefreshCommand}"/>
+                <StackPanel DockPanel.Dock="Right" Orientation="Horizontal">
+                    <Button Content="🩺 Test followers" Padding="10,4" Margin="0,0,8,0"
+                            Command="{Binding TestFollowersCommand}"
+                            ToolTip="Write a marker to this leader and verify reachable followers apply it"/>
+                    <Button Content="🔄 Refresh" Padding="10,4" Command="{Binding RefreshCommand}"/>
+                </StackPanel>
                 <StackPanel Orientation="Horizontal">
                     <TextBlock Text="Replication" FontSize="20" FontWeight="Light"/>
                     <Border Background="#EEF3FF" CornerRadius="3" Padding="8,2" Margin="12,0,0,0" VerticalAlignment="Center">
@@ -33,9 +37,10 @@
                       HeadersVisibility="Column" GridLinesVisibility="Horizontal" MaxHeight="160"
                       FontFamily="Consolas" FontSize="12">
                 <DataGrid.Columns>
-                    <DataGridTextColumn Header="Endpoint" Binding="{Binding Endpoint}" Width="*"/>
-                    <DataGridTextColumn Header="HTTP" Binding="{Binding HttpEndpoint}" Width="*"/>
-                    <DataGridTextColumn Header="Lag (seq)" Binding="{Binding LagSeq}" Width="100"/>
+                    <DataGridTextColumn Header="Replication link" Binding="{Binding Endpoint}" Width="*"/>
+                    <DataGridTextColumn Header="Connected since" Binding="{Binding ConnectedAtUtc}" Width="Auto"/>
+                    <DataGridTextColumn Header="Lag (seq)" Binding="{Binding LagSeq}" Width="90"/>
+                    <DataGridTextColumn Header="Status" Binding="{Binding StatusText}" Width="140"/>
                 </DataGrid.Columns>
             </DataGrid>
 

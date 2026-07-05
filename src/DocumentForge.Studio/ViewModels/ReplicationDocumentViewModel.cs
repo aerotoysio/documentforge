@@ -86,6 +86,88 @@ public sealed partial class ReplicationDocumentViewModel : DocumentViewModel
         }
     }
 
+    /// <summary>Active liveness test: write a marker to this leader to advance
+    /// its sequence, then poll follower databases reachable on this connection
+    /// until they apply it — proving they're live, not just "connected".</summary>
+    [RelayCommand]
+    private async Task TestFollowersAsync()
+    {
+        IsBusy = true;
+        try
+        {
+            var status = await _connection.GetReplicationStatusAsync(Database);
+            if (status.Role != "leader")
+            {
+                StatusMessage = "This database isn't a leader — start it as a leader to push a test write.";
+                return;
+            }
+            if (status.FollowerCount == 0)
+            {
+                StatusMessage = "No followers are currently connected to this leader.";
+                return;
+            }
+
+            // Advance the leader's sequence with a throwaway marker write.
+            await _connection.InsertDocumentAsync(Database, "_repltest", $"{{\"probe\":\"{Guid.NewGuid():N}\"}}");
+            var target = (await _connection.GetReplicationStatusAsync(Database)).CurrentSeq;
+
+            var results = new List<string>();
+            var reachable = 0;
+            foreach (var db in await _connection.GetDatabasesAsync())
+            {
+                if (db.Name == Database) continue;
+                ReplicationStatus fs;
+                try { fs = await _connection.GetReplicationStatusAsync(db.Name); }
+                catch { continue; }
+                if (fs.Role != "follower" || !FollowsPort(fs.FollowerLeaderEndpoint, status.LeaderPort)) continue;
+
+                reachable++;
+                var (ok, ms) = await PollCaughtUpAsync(db.Name, target, TimeSpan.FromSeconds(5));
+                results.Add(ok
+                    ? $"🟢 {db.Name}: live — applied seq {target:N0} in {ms} ms"
+                    : $"🔴 {db.Name}: stalled — never reached seq {target:N0}");
+            }
+
+            try { await _connection.DropCollectionAsync(Database, "_repltest"); } catch { /* best-effort cleanup */ }
+
+            StatusMessage = reachable == 0
+                ? $"Leader reports {status.FollowerCount} connected follower(s), but none are databases on THIS connection to probe directly. They're connected from the leader's view (see the followers list). To actively test a remote follower, connect Studio to its service and test from there."
+                : string.Join("    ", results);
+            await RefreshAsync();
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = ex.Message;
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    private static bool FollowsPort(string? leaderEndpoint, int leaderPort)
+    {
+        if (string.IsNullOrEmpty(leaderEndpoint)) return false;
+        var idx = leaderEndpoint.LastIndexOf(':');
+        return idx >= 0 && int.TryParse(leaderEndpoint.AsSpan(idx + 1), out var p) && p == leaderPort;
+    }
+
+    private async Task<(bool CaughtUp, long ElapsedMs)> PollCaughtUpAsync(string followerDb, long target, TimeSpan timeout)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (sw.Elapsed < timeout)
+        {
+            try
+            {
+                var fs = await _connection.GetReplicationStatusAsync(followerDb);
+                if (fs.FollowerLastAppliedSeq >= target) return (true, sw.ElapsedMilliseconds);
+            }
+            catch { /* transient; keep polling */ }
+            await Task.Delay(250);
+        }
+        return (false, sw.ElapsedMilliseconds);
+    }
+
     [RelayCommand]
     private Task StartLeaderAsync() =>
         RunAsync(() => _connection.StartReplicationLeaderAsync(Database, LeaderPort),

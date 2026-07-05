@@ -23,7 +23,13 @@ public sealed record ServerHealth(bool Healthy, string Status, string? Version, 
 public sealed record CompactionInfo(long PagesCompacted, long BytesReclaimed, double TimeMs);
 
 /// <summary>A follower peer as seen from a leader.</summary>
-public sealed record ReplicationFollowerInfo(string Endpoint, string? HttpEndpoint, long LagSeq);
+public sealed record ReplicationFollowerInfo(string Endpoint, string? HttpEndpoint, long LagSeq, string? ConnectedAtUtc = null)
+{
+    /// <summary>Caught up with the leader (no known lag).</summary>
+    public bool InSync => LagSeq == 0;
+
+    public string StatusText => LagSeq == 0 ? "in sync" : $"lagging ({LagSeq:N0} behind)";
+}
 
 /// <summary>Per-database replication state. Role is "leader", "follower", or
 /// "none". Leader fields populate when this DB leads; follower fields when it
