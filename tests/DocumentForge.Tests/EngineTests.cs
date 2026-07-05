@@ -4878,11 +4878,26 @@ public class EngineTests : IDisposable
             }
             Assert.True(firstDataPage.IsValid);
 
-            // Stamp NextPageId at offset 11 of the first data page → cycle.
-            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Write))
+            // Point NextPageId (offset 11) at the page itself → cycle. Read the
+            // whole page, edit the link, then RE-STAMP its CRC and write it back
+            // so the page stays checksum-valid. Without the re-stamp the torn
+            // bytes would trip the #92 checksum guard on read first, and this
+            // test would never exercise the cycle guard it's here to cover.
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.ReadWrite))
             {
-                fs.Seek(firstDataPage.FileOffset + 11, SeekOrigin.Begin);
-                fs.Write(BitConverter.GetBytes(firstDataPage.Value), 0, 4);
+                var page = new byte[DocumentForge.Core.Constants.PageSize];
+                fs.Seek(firstDataPage.FileOffset, SeekOrigin.Begin);
+                int off = 0;
+                while (off < page.Length)
+                {
+                    int n = fs.Read(page, off, page.Length - off);
+                    if (n == 0) break;
+                    off += n;
+                }
+                BitConverter.GetBytes(firstDataPage.Value).CopyTo(page.AsSpan(11));
+                DocumentForge.Storage.PageChecksum.Stamp(page);
+                fs.Seek(firstDataPage.FileOffset, SeekOrigin.Begin);
+                fs.Write(page, 0, page.Length);
             }
 
             // Wall-clock guard: the test process must not block. If the chain

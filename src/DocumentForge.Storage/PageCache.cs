@@ -177,7 +177,7 @@ public sealed class PageCache : IPageCache
                 // and our marker below seals them.
                 if (_entries.TryGetValue(pageIdValue, out var entry) && entry.IsDirty)
                 {
-                    _preFlushHook.OnBeforeFlush(new PageId(pageIdValue), entry.Data);
+                    CaptureToLog(new PageId(pageIdValue), entry.Data);
                     captured = true;
                 }
             }
@@ -201,7 +201,7 @@ public sealed class PageCache : IPageCache
                 {
                     if (_entries.TryGetValue(pageIdValue, out var entry) && entry.IsDirty)
                     {
-                        _preFlushHook.OnBeforeFlush(new PageId(pageIdValue), entry.Data);
+                        CaptureToLog(new PageId(pageIdValue), entry.Data);
                         captured = true;
                     }
                 }
@@ -241,7 +241,7 @@ public sealed class PageCache : IPageCache
                     // owning commit's marker (FlushCommit) seals them for
                     // replay. The page leaves the delta set — its bytes are
                     // in the log already.
-                    _preFlushHook?.OnBeforeFlush(pageId, entry.Data);
+                    if (_preFlushHook is not null) CaptureToLog(pageId, entry.Data);
                     _dataFile.WritePage(pageId, entry.Data);
                     _preFlushHook?.EnsureLogDurable();
                 }
@@ -263,7 +263,7 @@ public sealed class PageCache : IPageCache
             if (entry.IsDirty)
             {
                 // Same WAL-fsync discipline as Evict — see comment there.
-                _preFlushHook?.OnBeforeFlush(new PageId(pageId), entry.Data);
+                if (_preFlushHook is not null) CaptureToLog(new PageId(pageId), entry.Data);
                 _dataFile.WritePage(new PageId(pageId), entry.Data);
                 _preFlushHook?.EnsureLogDurable();
             }
@@ -271,5 +271,21 @@ public sealed class PageCache : IPageCache
             _entries.Remove(pageId);
         }
         _lruList.RemoveLast();
+    }
+
+    /// <summary>
+    /// Stamp the page's CRC into its own bytes, THEN hand it to the pre-flush
+    /// hook (WAL log + replication + archiver). Issue #92: the checksum used to
+    /// be stamped only later, inside DataFile.WritePage, so a modified page's
+    /// logged/replicated/archived image still carried its stale PRIOR checksum.
+    /// A commit-only page (never flushed to the data file) then failed
+    /// verification on WAL/PITR replay. Stamping here means the identical
+    /// checksum-valid bytes reach the WAL, followers, archived segments, AND
+    /// the data file. DataFile.WritePage re-stamps the same value harmlessly.
+    /// </summary>
+    private void CaptureToLog(PageId pageId, byte[] pageData)
+    {
+        PageChecksum.Stamp(pageData);
+        _preFlushHook!.OnBeforeFlush(pageId, pageData);
     }
 }

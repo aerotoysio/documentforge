@@ -91,32 +91,45 @@ public sealed class IndexManager
         corruptionReason = null;
         if (_catalog is null || _cache is null || _allocator is null) return true;
 
-        if (!_catalog.TryLoad(out corruptionReason))
-            return false;
-
-        foreach (var def in _catalog.Definitions)
+        // Issue #92: a torn index/catalog page now throws PageCorruptionException
+        // from the page cache instead of yielding a garbage buffer. Treat that as
+        // the same "index catalog is unusable" signal as structural corruption
+        // (#64) so Open degrades to no-indexes rather than crashing — the
+        // document data lives on a separate page chain and is unaffected.
+        try
         {
-            var index = new BTreeIndex(def);
+            if (!_catalog.TryLoad(out corruptionReason))
+                return false;
 
-            if (def.RootPage.IsValid)
+            foreach (var def in _catalog.Definitions)
             {
-                var storage = new IndexStorage(_cache, _allocator, def.RootPage);
-                // Load entries from disk into in-memory structure
-                index.LoadFromStorage(storage.ReadAllEntries());
-                // Attach storage AFTER loading so we don't re-append during load
-                index.AttachStorage(storage);
-            }
+                var index = new BTreeIndex(def);
 
-            var collKey = def.CollectionName.Value;
-            if (!_indexesByCollection.TryGetValue(collKey, out var list))
-            {
-                list = new List<BTreeIndex>();
-                _indexesByCollection[collKey] = list;
+                if (def.RootPage.IsValid)
+                {
+                    var storage = new IndexStorage(_cache, _allocator, def.RootPage);
+                    // Load entries from disk into in-memory structure
+                    index.LoadFromStorage(storage.ReadAllEntries());
+                    // Attach storage AFTER loading so we don't re-append during load
+                    index.AttachStorage(storage);
+                }
+
+                var collKey = def.CollectionName.Value;
+                if (!_indexesByCollection.TryGetValue(collKey, out var list))
+                {
+                    list = new List<BTreeIndex>();
+                    _indexesByCollection[collKey] = list;
+                }
+                list.Add(index);
+                _indexesByName[def.Name] = index;
             }
-            list.Add(index);
-            _indexesByName[def.Name] = index;
+            return true;
         }
-        return true;
+        catch (Core.PageCorruptionException ex)
+        {
+            corruptionReason = ex.Message;
+            return false;
+        }
     }
 
     /// <summary>

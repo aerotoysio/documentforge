@@ -4,7 +4,15 @@ namespace DocumentForge.Storage;
 
 public interface IDataFile : IDisposable
 {
+    /// <summary>Read a page, verifying its checksum. Throws
+    /// <see cref="PageCorruptionException"/> on a mismatch (issue #92).</summary>
     byte[] ReadPage(PageId pageId);
+
+    /// <summary>Corruption-tolerant read: false on checksum mismatch instead
+    /// of throwing, for self-healing loaders. <paramref name="buffer"/> holds
+    /// the raw bytes regardless.</summary>
+    bool TryReadPage(PageId pageId, out byte[] buffer);
+
     void WritePage(PageId pageId, byte[] data);
     uint PageCount { get; }
     PageId AllocateNewPage();
@@ -150,7 +158,50 @@ public sealed class DataFile : IDataFile
     /// </summary>
     public long ChecksumMismatches { get; private set; }
 
+    /// <summary>
+    /// Read a page, verifying its checksum. On mismatch this THROWS
+    /// <see cref="PageCorruptionException"/> rather than returning the corrupt
+    /// buffer (issue #92): serving a torn b-tree/catalog page as if it were
+    /// valid propagates garbage into query results and index walks. A torn
+    /// write that happened during the last flush window is repaired earlier,
+    /// on Open, by redo-replaying the WAL over the data file (issues #89/#90),
+    /// so a mismatch that reaches here is media corruption outside any recovery
+    /// window — fail loud so the operator restores from backup.
+    ///
+    /// <para>Callers that must tolerate corruption to make progress — the
+    /// catalog / index self-heal loaders, and offline scanners — go through
+    /// <see cref="TryReadPage"/> (or their own raw readers) instead.</para>
+    /// </summary>
     public byte[] ReadPage(PageId pageId)
+    {
+        var buffer = ReadPageRawInternal(pageId);
+        if (!PageChecksum.Verify(buffer))
+        {
+            lock (_lock) ChecksumMismatches++;
+            throw new PageCorruptionException(pageId,
+                "checksum mismatch — the page is torn or bit-rotted. It was not recoverable " +
+                "from the write-ahead log (so the damage is outside the last flush window). " +
+                "Restore from a backup or run catalog rebuild.");
+        }
+        return buffer;
+    }
+
+    /// <summary>
+    /// Corruption-tolerant read: returns false on a checksum mismatch instead
+    /// of throwing, so callers that self-heal (catalog/index loaders scanning
+    /// a possibly-damaged file) can skip a bad page and carry on. Still counts
+    /// the mismatch. <paramref name="buffer"/> holds the raw (possibly corrupt)
+    /// bytes either way, for callers that want to inspect them.
+    /// </summary>
+    public bool TryReadPage(PageId pageId, out byte[] buffer)
+    {
+        buffer = ReadPageRawInternal(pageId);
+        if (PageChecksum.Verify(buffer)) return true;
+        lock (_lock) ChecksumMismatches++;
+        return false;
+    }
+
+    private byte[] ReadPageRawInternal(PageId pageId)
     {
         var buffer = new byte[Constants.PageSize];
         lock (_lock)
@@ -164,14 +215,6 @@ public sealed class DataFile : IDataFile
                 totalRead += read;
             }
         }
-
-        // Verify checksum (skipped for legacy pages with Checksum=0)
-        if (!PageChecksum.Verify(buffer))
-        {
-            lock (_lock) ChecksumMismatches++;
-            Console.WriteLine($"[DocumentForge] WARNING: page {pageId} checksum mismatch - possible corruption");
-        }
-
         return buffer;
     }
 

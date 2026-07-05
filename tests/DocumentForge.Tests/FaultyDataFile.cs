@@ -85,6 +85,7 @@ internal sealed class FaultyDataFile : IDataFile
     public IOException? LastInjectedFault { get; private set; }
 
     public byte[] ReadPage(PageId pageId) => _inner.ReadPage(pageId);
+    public bool TryReadPage(PageId pageId, out byte[] buffer) => _inner.TryReadPage(pageId, out buffer);
     public uint PageCount => _inner.PageCount;
     public PageId AllocateNewPage() => _inner.AllocateNewPage();
     public PageId GetIndexCatalogPage() => _inner.GetIndexCatalogPage();
