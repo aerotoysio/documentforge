@@ -503,7 +503,7 @@ public sealed partial class MainViewModel : ObservableObject
         var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
         if (existing is not null) { ActiveDocument = existing; return; }
 
-        var document = new ApiKeysDocumentViewModel(server.Connection, () => SecureServerAsync(server));
+        var document = new ApiKeysDocumentViewModel(server.Connection, () => SecureServerAsync(server), _dialogs);
         Documents.Add(document);
         ActiveDocument = document;
         StatusText = $"API Keys — {server.Connection.Descriptor.Name}";
