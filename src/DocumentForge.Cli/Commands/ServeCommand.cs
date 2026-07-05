@@ -872,6 +872,55 @@ public static class ServeCommand
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
 
+        // Issue #104 — TTL / expiry. Configure a rule so documents whose
+        // {field} timestamp is at/before now get deleted by the background
+        // sweep. The field is an ISO-8601 datetime or a Unix-epoch-millis
+        // number. Body: { "field": "holdExpiry", "intervalSeconds": 30 }.
+        app.MapPut("/collections/{name}/ttl", async (string name, HttpRequest request) =>
+        {
+            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
+            using var reader = new StreamReader(request.Body);
+            var body = await reader.ReadToEndAsync();
+            try
+            {
+                using var json = JsonDocument.Parse(string.IsNullOrWhiteSpace(body) ? "{}" : body);
+                if (!json.RootElement.TryGetProperty("field", out var f) || f.ValueKind != JsonValueKind.String
+                    || string.IsNullOrWhiteSpace(f.GetString()))
+                    return Results.BadRequest(new { error = "Body must include a non-empty string 'field'." });
+                TimeSpan? interval = null;
+                if (json.RootElement.TryGetProperty("intervalSeconds", out var iv) && iv.ValueKind == JsonValueKind.Number)
+                    interval = TimeSpan.FromSeconds(iv.GetDouble());
+                db.ConfigureTtl(name, f.GetString()!, interval);
+                return Results.Ok(new { success = true, collection = name, field = f.GetString(),
+                    intervalSeconds = (interval ?? TtlConfig.DefaultSweepInterval).TotalSeconds });
+            }
+            catch (JsonException ex) { return Results.BadRequest(new { error = $"Invalid JSON: {ex.Message}" }); }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        app.MapDelete("/collections/{name}/ttl", (string name) =>
+        {
+            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
+            var removed = db.RemoveTtl(name);
+            return removed ? Results.Ok(new { success = true, collection = name, removed = true })
+                           : Results.NotFound(new { error = $"No TTL configured on '{name}'." });
+        });
+
+        app.MapGet("/ttl", () => Results.Ok(new
+        {
+            ttls = db.GetTtlConfigs().Select(t => new
+            {
+                collection = t.Collection, field = t.Field, intervalSeconds = t.SweepInterval.TotalSeconds
+            })
+        }));
+
+        // Force an immediate expiry sweep (the timer also runs it periodically).
+        app.MapPost("/admin/ttl/sweep", () =>
+        {
+            var deleted = db.SweepExpired();
+            return Results.Ok(new { success = true, deleted });
+        });
+
         // Atomic multi-document transaction. Body is a JSON array of ops:
         //   { "op": "insert",        "collection": "users", "doc": {...} }
         //   { "op": "replace",       "collection": "users", "id": "<guid>", "doc": {...} }

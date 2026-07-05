@@ -21,6 +21,15 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     private readonly TransactionManager _transactionManager;
     private readonly RecoveryLog? _recoveryLog;
     private readonly bool _durableCommits;
+
+    // Issue #104 — TTL/expiry. Config (per collection) + a single background
+    // sweeper timer. The reserved collection below persists the config so
+    // TTLs survive restart; the engine loads it on Open.
+    private readonly Dictionary<string, TtlConfig> _ttlByCollection = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _ttlLock = new();
+    private System.Threading.Timer? _ttlSweeper;
+    private const string TtlMetaCollection = "__ttl_meta";
+
     private ReplicationServer? _replicationServer;
     private ReplicationFollower? _replicationFollower;
     private LogicalReplicationServer? _logicalServer;
@@ -210,6 +219,9 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                 db._catalog.GetCollection(collName)?.BuildLocationMap();
             }
 
+            // Issue #104: restore persisted TTL rules and start the sweeper.
+            db.LoadTtlConfigs();
+
             if (recoveredPages > 0)
                 Console.WriteLine($"[DocumentForge] Recovered {recoveredPages} page(s) from crash recovery log.");
             return db;
@@ -369,7 +381,12 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
 
     public IReadOnlyList<string> GetCollectionNames()
     {
-        return _catalog.GetCollectionNames();
+        // Hide the reserved TTL-metadata collection (issue #104) from public
+        // listings — it's engine bookkeeping, not user data. Still fully
+        // addressable internally via GetCollection.
+        return _catalog.GetCollectionNames()
+            .Where(n => !string.Equals(n, TtlMetaCollection, StringComparison.OrdinalIgnoreCase))
+            .ToList();
     }
 
     public bool DropCollection(string name)
@@ -894,6 +911,198 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         c.Op is ConditionOp.Exists or ConditionOp.NotExists
             ? $"{c.Field} {c.Op}"
             : $"{c.Field} {c.Op} {c.Value}";
+
+    // ---- TTL / expiry (issue #104) ----
+
+    /// <summary>
+    /// Configure (or replace) a TTL rule: documents in
+    /// <paramref name="collection"/> are deleted by the background sweep once
+    /// their <paramref name="field"/> timestamp is at or before now. The field
+    /// is a DateTime value or a number read as Unix epoch milliseconds. The
+    /// config is persisted (survives restart) and the sweeper starts
+    /// immediately. Passing a sub-second interval is clamped to
+    /// <see cref="TtlConfig.MinSweepInterval"/>.
+    /// </summary>
+    public void ConfigureTtl(string collection, string field, TimeSpan? sweepInterval = null)
+    {
+        if (string.IsNullOrWhiteSpace(collection)) throw new ArgumentException("collection is required.", nameof(collection));
+        if (string.IsNullOrWhiteSpace(field)) throw new ArgumentException("field is required.", nameof(field));
+        if (string.Equals(collection, TtlMetaCollection, StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException($"'{TtlMetaCollection}' is a reserved TTL-metadata collection.", nameof(collection));
+
+        var interval = sweepInterval ?? TtlConfig.DefaultSweepInterval;
+        if (interval < TtlConfig.MinSweepInterval) interval = TtlConfig.MinSweepInterval;
+        var cfg = new TtlConfig(collection, field, interval);
+
+        PersistTtlConfig(cfg);
+        lock (_ttlLock) _ttlByCollection[collection] = cfg;
+        RestartSweeper();
+    }
+
+    /// <summary>Remove the TTL rule for a collection (if any). Existing
+    /// documents are left alone.</summary>
+    public bool RemoveTtl(string collection)
+    {
+        bool removed;
+        lock (_ttlLock) removed = _ttlByCollection.Remove(collection);
+        if (removed)
+        {
+            DeleteTtlConfig(collection);
+            RestartSweeper();
+        }
+        return removed;
+    }
+
+    /// <summary>The TTL rules currently in effect.</summary>
+    public IReadOnlyList<TtlConfig> GetTtlConfigs()
+    {
+        lock (_ttlLock) return _ttlByCollection.Values.ToList();
+    }
+
+    /// <summary>
+    /// Delete every expired document across all TTL collections, atomically
+    /// under the write lock (so a hold that gets extended between the scan and
+    /// the delete in the same sweep can't be wrongly reaped, and index
+    /// maintenance + WAL commit are consistent). Returns the number deleted.
+    /// A read-only node (replication follower) skips — it receives the deletes
+    /// from its leader instead. This is what the background timer calls; it's
+    /// also public so operators/tests can force a sweep.
+    /// </summary>
+    public int SweepExpired()
+    {
+        if (IsReadOnly) return 0;
+        TtlConfig[] configs;
+        lock (_ttlLock) configs = _ttlByCollection.Values.ToArray();
+        if (configs.Length == 0) return 0;
+
+        EnsureHealthy();
+        _transactionManager.AcquireWriteLock();
+        try
+        {
+            return TrackHealth(() =>
+            {
+                var now = DateTimeOffset.UtcNow;
+                int deleted = 0;
+                foreach (var cfg in configs)
+                {
+                    var coll = _catalog.GetCollection(cfg.Collection);
+                    if (coll is null) continue;
+
+                    // Snapshot expired ids first, then delete — mutating a
+                    // collection while enumerating it is unsafe.
+                    var expired = new List<(DocumentId id, BsonDocument doc)>();
+                    foreach (var doc in coll.FindAll())
+                        if (IsExpired(doc, cfg.Field, now))
+                            expired.Add((doc.GetId(), doc));
+
+                    foreach (var (id, doc) in expired)
+                    {
+                        if (coll.Delete(id))
+                        {
+                            _indexManager.OnDocumentDeleted(cfg.Collection, id, doc);
+                            _logicalServer?.BroadcastNewOp(LogicalOpType.Delete, cfg.Collection, BsonSerializer.Serialize(doc));
+                            deleted++;
+                        }
+                    }
+                }
+                if (deleted > 0) CommitDurableLocked();
+                return deleted;
+            });
+        }
+        finally
+        {
+            _transactionManager.ReleaseWriteLock();
+        }
+    }
+
+    private static bool IsExpired(BsonDocument doc, string field, DateTimeOffset now)
+    {
+        if (!doc.ContainsKey(field)) return false;
+        var v = doc[field];
+        return v.Type switch
+        {
+            BsonType.DateTime => v.AsDateTime <= now,
+            // Numeric expiry is Unix epoch milliseconds.
+            BsonType.Int32 or BsonType.Int64 => DateTimeOffset.FromUnixTimeMilliseconds(v.AsInt64) <= now,
+            BsonType.Double => DateTimeOffset.FromUnixTimeMilliseconds((long)v.AsDouble) <= now,
+            _ => false, // absent / non-temporal → never expire
+        };
+    }
+
+    private void RestartSweeper()
+    {
+        lock (_ttlLock)
+        {
+            _ttlSweeper?.Dispose();
+            _ttlSweeper = null;
+            if (_ttlByCollection.Count == 0) return;
+
+            // Fire at the finest configured cadence; each fire sweeps every
+            // collection whose own interval has elapsed is overkill — a single
+            // shared timer at the minimum interval keeps it simple and holds
+            // are coarse enough that over-sweeping is cheap.
+            var period = _ttlByCollection.Values.Min(c => c.SweepInterval);
+            _ttlSweeper = new System.Threading.Timer(_ =>
+            {
+                try { SweepExpired(); }
+                catch { /* background sweep is best-effort; a failure is retried next tick */ }
+            }, null, period, period);
+        }
+    }
+
+    /// <summary>Load persisted TTL configs from the reserved meta collection
+    /// and start the sweeper. Called once at the end of Open.</summary>
+    private void LoadTtlConfigs()
+    {
+        var coll = _catalog.GetCollection(TtlMetaCollection);
+        if (coll is null) return;
+        lock (_ttlLock)
+        {
+            foreach (var doc in coll.FindAll())
+            {
+                var collection = doc["collection"].IsNull ? null : doc["collection"].AsString;
+                var field = doc["field"].IsNull ? null : doc["field"].AsString;
+                if (string.IsNullOrEmpty(collection) || string.IsNullOrEmpty(field)) continue;
+                var seconds = doc.ContainsKey("intervalSeconds") && doc["intervalSeconds"].IsNumeric
+                    ? doc["intervalSeconds"].AsDouble : TtlConfig.DefaultSweepInterval.TotalSeconds;
+                var interval = TimeSpan.FromSeconds(Math.Max(seconds, TtlConfig.MinSweepInterval.TotalSeconds));
+                _ttlByCollection[collection] = new TtlConfig(collection, field, interval);
+            }
+        }
+        RestartSweeper();
+    }
+
+    private void PersistTtlConfig(TtlConfig cfg)
+    {
+        // Upsert: one meta doc per collection. Remove any prior config for the
+        // same collection, then insert the new one — all under the engine's
+        // normal locked write paths, so it's WAL-durable like any document.
+        DeleteTtlConfig(cfg.Collection);
+        var json = $"{{\"collection\":{JsonString(cfg.Collection)},\"field\":{JsonString(cfg.Field)},\"intervalSeconds\":{cfg.SweepInterval.TotalSeconds}}}";
+        Insert(TtlMetaCollection, json);
+    }
+
+    private void DeleteTtlConfig(string collection)
+    {
+        _transactionManager.AcquireWriteLock();
+        try
+        {
+            var coll = _catalog.GetCollection(TtlMetaCollection);
+            if (coll is null) return;
+            var toDelete = coll.FindAll()
+                .Where(d => !d["collection"].IsNull &&
+                            string.Equals(d["collection"].AsString, collection, StringComparison.OrdinalIgnoreCase))
+                .Select(d => (d.GetId(), d)).ToList();
+            foreach (var (id, doc) in toDelete)
+            {
+                if (coll.Delete(id)) _indexManager.OnDocumentDeleted(TtlMetaCollection, id, doc);
+            }
+            if (toDelete.Count > 0) CommitDurableLocked();
+        }
+        finally { _transactionManager.ReleaseWriteLock(); }
+    }
+
+    private static string JsonString(string s) => System.Text.Json.JsonSerializer.Serialize(s);
 
     /// <summary>
     /// Convenience overload: parse JSON then replace.
@@ -2284,6 +2493,9 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         Exception? deferredFlushError = null;
         try
         {
+            // Stop the TTL sweeper first so a background sweep can't race the
+            // page-cache flush / lock release below (issue #104).
+            lock (_ttlLock) { _ttlSweeper?.Dispose(); _ttlSweeper = null; }
             DisableAutoFailover();
             try { _replicationServer?.Dispose(); } catch { }
             try { _replicationFollower?.Dispose(); } catch { }
