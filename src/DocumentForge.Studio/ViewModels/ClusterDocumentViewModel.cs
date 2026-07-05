@@ -41,7 +41,8 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
     private readonly ClusterConfig _config;
     private readonly IDialogService _dialogs;
 
-    public ClusterDocumentViewModel(ClusterConfig config, string? filePath, IDialogService dialogs)
+    public ClusterDocumentViewModel(ClusterConfig config, string? filePath, IDialogService dialogs,
+        IReadOnlyList<string>? knownEndpoints = null)
     {
         _config = config;
         _dialogs = dialogs;
@@ -50,11 +51,25 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
         UpdateTitle();
         ReloadRows();
         NewCollectionStrategy = ShardingStrategy.Hash;
+
+        // Suggest shard endpoints from the user's saved connections + any endpoints
+        // already in this config, so they can pick instead of typing a URL.
+        foreach (var e in (knownEndpoints ?? Array.Empty<string>())
+                     .Concat(_config.Shards.Select(s => s.LeaderEndpoint))
+                     .Where(e => !string.IsNullOrWhiteSpace(e))
+                     .Distinct(StringComparer.OrdinalIgnoreCase))
+            ShardEndpointSuggestions.Add(e);
     }
 
     public ObservableCollection<ClusterShardRow> Shards { get; } = new();
     public ObservableCollection<ClusterCollectionRow> Collections { get; } = new();
     public IReadOnlyList<ShardingStrategy> Strategies { get; } = new[] { ShardingStrategy.Hash, ShardingStrategy.Replicated };
+
+    /// <summary>Endpoint URLs offered in the "add shard" box (saved connections + existing shards).</summary>
+    public ObservableCollection<string> ShardEndpointSuggestions { get; } = new();
+
+    /// <summary>Collection names discovered on healthy shards during a health check.</summary>
+    public ObservableCollection<string> CollectionSuggestions { get; } = new();
 
     [ObservableProperty] private string? _filePath;
     [ObservableProperty] private string _statusMessage = "";
@@ -176,6 +191,7 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
         var up = 0;
         try
         {
+            var discovered = new SortedSet<string>(CollectionSuggestions, StringComparer.OrdinalIgnoreCase);
             foreach (var row in Shards)
             {
                 row.Health = "checking…";
@@ -184,6 +200,10 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
                 {
                     up++;
                     row.Health = $"🟢 up{(h.Version is null ? "" : $" · v{h.Version}")}";
+                    // Best-effort: learn the collection names living on this shard
+                    // so the "add collection" box can suggest them.
+                    foreach (var c in await ClusterHealth.TryGetCollectionsAsync(row.LeaderEndpoint, TimeSpan.FromSeconds(5)))
+                        discovered.Add(c);
                 }
                 else if (h.Reachable)
                 {
@@ -193,6 +213,11 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
                 {
                     row.Health = $"🔴 unreachable · {h.Error}";
                 }
+            }
+            if (discovered.Count != CollectionSuggestions.Count)
+            {
+                CollectionSuggestions.Clear();
+                foreach (var c in discovered) CollectionSuggestions.Add(c);
             }
             StatusMessage = Shards.Count == 0
                 ? "No shards to check — add some first."

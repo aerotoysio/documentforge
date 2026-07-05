@@ -47,8 +47,9 @@
                 <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
                     <TextBox Text="{Binding NewShardName, UpdateSourceTrigger=PropertyChanged}" Width="140"
                              ToolTip="Shard name"/>
-                    <TextBox Text="{Binding NewShardEndpoint, UpdateSourceTrigger=PropertyChanged}" Width="240" Margin="8,0,0,0"
-                             ToolTip="Leader endpoint, e.g. http://shard-a:5001"/>
+                    <ComboBox IsEditable="True" Text="{Binding NewShardEndpoint, UpdateSourceTrigger=PropertyChanged}"
+                              ItemsSource="{Binding ShardEndpointSuggestions}" Width="240" Margin="8,0,0,0"
+                              ToolTip="Leader endpoint — pick a saved server or type one, e.g. http://shard-a:5001"/>
                     <Button Content="Add shard" Command="{Binding AddShardCommand}" Padding="10,2" Margin="8,0,0,0"/>
                 </StackPanel>
 
@@ -75,8 +76,9 @@
                     </DataGrid.Columns>
                 </DataGrid>
                 <StackPanel Orientation="Horizontal" Margin="0,6,0,0">
-                    <TextBox Text="{Binding NewCollectionName, UpdateSourceTrigger=PropertyChanged}" Width="180"
-                             ToolTip="Collection name"/>
+                    <ComboBox IsEditable="True" Text="{Binding NewCollectionName, UpdateSourceTrigger=PropertyChanged}"
+                              ItemsSource="{Binding CollectionSuggestions}" Width="180"
+                              ToolTip="Collection name — suggestions come from healthy shards after a health check"/>
                     <ComboBox ItemsSource="{Binding Strategies}" SelectedItem="{Binding NewCollectionStrategy}"
                               Width="120" Margin="8,0,0,0"/>
                     <TextBox Text="{Binding NewCollectionShardKey, UpdateSourceTrigger=PropertyChanged}" Width="160" Margin="8,0,0,0"

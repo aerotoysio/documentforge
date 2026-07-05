@@ -429,7 +429,11 @@ public sealed partial class MainViewModel : ObservableObject
             var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
             if (existing is not null) { ActiveDocument = existing; return; }
         }
-        var document = new ClusterDocumentViewModel(config, path, _dialogs);
+        var knownEndpoints = _workspace.Connections
+            .Where(c => c.Kind == Core.Connections.ConnectionKind.Http && !string.IsNullOrWhiteSpace(c.Url))
+            .Select(c => c.Url!)
+            .ToList();
+        var document = new ClusterDocumentViewModel(config, path, _dialogs, knownEndpoints);
         Documents.Add(document);
         ActiveDocument = document;
         StatusText = path is null ? "New cluster config" : $"Cluster — {System.IO.Path.GetFileName(path)}";
