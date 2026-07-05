@@ -112,6 +112,8 @@ public sealed partial class ServerNodeViewModel : TreeNodeViewModel
 
     public IDfConnection Connection { get; }
 
+    public bool CanManageServer => Connection.Capabilities.HasFlag(ConnectionCapabilities.ServerAdmin);
+
     protected override async Task<IReadOnlyList<TreeNodeViewModel>> LoadChildrenAsync()
     {
         var databases = await Connection.GetDatabasesAsync();
@@ -123,6 +125,9 @@ public sealed partial class ServerNodeViewModel : TreeNodeViewModel
 
     [RelayCommand]
     private Task NewQuery() => _main.OpenQueryOnServerAsync(this);
+
+    [RelayCommand]
+    private void Topology() => _main.OpenTopology(this);
 }
 
 public sealed partial class DatabaseNodeViewModel : TreeNodeViewModel

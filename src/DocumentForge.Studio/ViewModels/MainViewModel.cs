@@ -363,6 +363,19 @@ public sealed partial class MainViewModel : ObservableObject
         StatusText = $"New query on {database}";
     }
 
+    /// <summary>Opens (or re-focuses) the replication topology graph for a server.</summary>
+    public void OpenTopology(ServerNodeViewModel server)
+    {
+        var contentId = $"topo:{server.Connection.Descriptor.Id}";
+        var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
+        if (existing is not null) { ActiveDocument = existing; return; }
+
+        var document = new TopologyDocumentViewModel(server.Connection);
+        Documents.Add(document);
+        ActiveDocument = document;
+        StatusText = $"Topology — {server.Connection.Descriptor.Name}";
+    }
+
     /// <summary>Opens (or re-focuses) the replication panel for a database.</summary>
     public void OpenReplication(DatabaseNodeViewModel database)
     {

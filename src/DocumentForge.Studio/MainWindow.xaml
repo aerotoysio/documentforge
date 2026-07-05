@@ -20,6 +20,8 @@
                 <StackPanel.ContextMenu>
                     <ContextMenu>
                         <MenuItem Header="New Query" Command="{Binding NewQueryCommand}"/>
+                        <MenuItem Header="Topology…" Command="{Binding TopologyCommand}"
+                                  Visibility="{Binding CanManageServer, Converter={StaticResource BoolToVis}}"/>
                         <MenuItem Header="Refresh" Command="{Binding RefreshCommand}"/>
                         <Separator/>
                         <MenuItem Header="Disconnect" Command="{Binding DisconnectCommand}"/>
@@ -106,6 +108,10 @@
 
         <DataTemplate DataType="{x:Type vm:ReplicationDocumentViewModel}">
             <views:ReplicationView/>
+        </DataTemplate>
+
+        <DataTemplate DataType="{x:Type vm:TopologyDocumentViewModel}">
+            <views:TopologyView/>
         </DataTemplate>
 
         <DataTemplate DataType="{x:Type vm:WelcomeDocumentViewModel}">
