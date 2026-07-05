@@ -168,6 +168,9 @@ public sealed partial class DatabaseNodeViewModel : TreeNodeViewModel
     private void NewQuery() => _main.OpenQuery(Server.Connection, Info.Name);
 
     [RelayCommand]
+    private void Dashboard() => _main.OpenDashboard(this);
+
+    [RelayCommand]
     private void Replication() => _main.OpenReplication(this);
 
     [RelayCommand]

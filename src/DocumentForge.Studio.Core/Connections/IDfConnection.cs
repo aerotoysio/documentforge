@@ -23,6 +23,10 @@ public interface IDfConnection : IAsyncDisposable
     Task<DatabaseStats> GetStatsAsync(string database, CancellationToken ct = default);
     Task<ServerHealth> GetHealthAsync(CancellationToken ct = default);
 
+    /// <summary>Per-database health + diagnostics (recommendation states, file
+    /// sizes, lock holder).</summary>
+    Task<DatabaseHealthReport> GetDatabaseHealthAsync(string database, CancellationToken ct = default);
+
     /// <summary>Replaces a document by its internal <c>_id</c>, guarded by its
     /// <c>_etag</c> (optimistic concurrency). Returns the new ETag. Throws
     /// <see cref="EtagConflictException"/> if the document changed since it was

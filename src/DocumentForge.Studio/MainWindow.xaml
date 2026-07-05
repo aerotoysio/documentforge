@@ -36,6 +36,7 @@
             <StackPanel Orientation="Horizontal">
                 <StackPanel.ContextMenu>
                     <ContextMenu>
+                        <MenuItem Header="Dashboard…" Command="{Binding DashboardCommand}"/>
                         <MenuItem Header="New Query" Command="{Binding NewQueryCommand}"/>
                         <MenuItem Header="Refresh" Command="{Binding RefreshCommand}"/>
                         <MenuItem Header="Replication…" Command="{Binding ReplicationCommand}"
@@ -120,6 +121,10 @@
 
         <DataTemplate DataType="{x:Type vm:ClusterDocumentViewModel}">
             <views:ClusterView/>
+        </DataTemplate>
+
+        <DataTemplate DataType="{x:Type vm:DashboardDocumentViewModel}">
+            <views:DashboardView/>
         </DataTemplate>
 
         <DataTemplate DataType="{x:Type vm:WelcomeDocumentViewModel}">

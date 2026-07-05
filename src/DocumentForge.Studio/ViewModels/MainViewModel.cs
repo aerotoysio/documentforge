@@ -483,6 +483,19 @@ public sealed partial class MainViewModel : ObservableObject
         StatusText = $"Topology — {server.Connection.Descriptor.Name}";
     }
 
+    /// <summary>Opens (or re-focuses) the dashboard for a database.</summary>
+    public void OpenDashboard(DatabaseNodeViewModel database)
+    {
+        var contentId = $"dash:{database.Server.Connection.Descriptor.Id}:{database.Info.Name}";
+        var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
+        if (existing is not null) { ActiveDocument = existing; return; }
+
+        var document = new DashboardDocumentViewModel(database.Server.Connection, database.Info.Name);
+        Documents.Add(document);
+        ActiveDocument = document;
+        StatusText = $"Dashboard — {database.Info.Name}";
+    }
+
     /// <summary>Opens (or re-focuses) the replication panel for a database.</summary>
     public void OpenReplication(DatabaseNodeViewModel database)
     {

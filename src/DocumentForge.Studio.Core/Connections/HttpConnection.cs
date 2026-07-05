@@ -278,6 +278,37 @@ public sealed class HttpConnection : IDfConnection
         _ => false,
     };
 
+    public async Task<DatabaseHealthReport> GetDatabaseHealthAsync(string database, CancellationToken ct = default)
+    {
+        var body = await GetRawAsync($"databases/{Uri.EscapeDataString(database)}/health", ct).ConfigureAwait(false);
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        var collections = root.GetProperty("collections");
+        var files = root.GetProperty("files");
+
+        string? lockHolder = null;
+        if (root.TryGetProperty("lockHolder", out var lh) && lh.ValueKind == JsonValueKind.Object)
+        {
+            var pid = lh.TryGetProperty("pid", out var p) && p.ValueKind == JsonValueKind.Number ? p.GetInt32().ToString() : "?";
+            var host = lh.TryGetProperty("host", out var h) ? h.GetString() : "?";
+            var since = lh.TryGetProperty("openedAtUtc", out var o) ? o.GetString() : null;
+            lockHolder = $"pid {pid} on {host}" + (since is null ? "" : $" since {since}");
+        }
+
+        return new DatabaseHealthReport(
+            HealthStatus: root.TryGetProperty("healthStatus", out var hs) ? hs.GetString() ?? "" : "",
+            ReadOnly: root.TryGetProperty("readOnly", out var ro) && ro.GetBoolean(),
+            CollectionCount: collections.TryGetProperty("count", out var cc) ? cc.GetInt32() : 0,
+            TotalDocuments: collections.TryGetProperty("totalDocuments", out var td) ? td.GetInt64() : 0,
+            DataSizeBytes: files.TryGetProperty("dataSizeBytes", out var ds) ? ds.GetInt64() : 0,
+            RecoveryLogBytes: files.TryGetProperty("recoveryLogBytes", out var rl) ? rl.GetInt64() : 0,
+            WalBytes: files.TryGetProperty("walBytes", out var wb) ? wb.GetInt64() : 0,
+            SnapshotMarkerPresent: files.TryGetProperty("snapshotMarkerPresent", out var sm) && sm.GetBoolean(),
+            LockHolder: lockHolder,
+            Recommendation: root.TryGetProperty("recommendation", out var rec) ? rec.GetString() ?? "healthy" : "healthy",
+            RecommendationDetail: root.TryGetProperty("recommendationDetail", out var rd) && rd.ValueKind == JsonValueKind.String ? rd.GetString() : null);
+    }
+
     public Task StartReplicationLeaderAsync(string database, int port, CancellationToken ct = default) =>
         PostReplicationAsync($"db/{Uri.EscapeDataString(database)}/replication/start-leader", new { port }, ct);
 

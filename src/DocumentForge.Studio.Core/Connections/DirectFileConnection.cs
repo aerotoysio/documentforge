@@ -101,6 +101,32 @@ public sealed class DirectFileConnection : IDfConnection
             Detail: db.LastHealthFailure?.Message));
     }
 
+    public Task<DatabaseHealthReport> GetDatabaseHealthAsync(string database, CancellationToken ct = default) =>
+        Task.Run(() =>
+        {
+            var db = EnsureConnected();
+            var stats = db.GetStatistics();
+            long totalDocs = stats.Collections.Sum(c => c.DocumentCount);
+            var healthy = db.HealthStatus == DatabaseHealthStatus.Healthy;
+            long RecoverySize(string suffix)
+            {
+                var fi = new FileInfo(db.FilePath + suffix);
+                return fi.Exists ? fi.Length : 0;
+            }
+            return new DatabaseHealthReport(
+                HealthStatus: db.HealthStatus.ToString(),
+                ReadOnly: db.IsReadOnly,
+                CollectionCount: stats.Collections.Count,
+                TotalDocuments: totalDocs,
+                DataSizeBytes: stats.FileSize,
+                RecoveryLogBytes: RecoverySize(".recovery"),
+                WalBytes: RecoverySize(".wal"),
+                SnapshotMarkerPresent: File.Exists(db.FilePath + ".snapshot.incoming.seq"),
+                LockHolder: "this Studio (direct-file)",
+                Recommendation: healthy ? "healthy" : "engine-degraded",
+                RecommendationDetail: healthy ? null : db.LastHealthFailure?.Message);
+        }, ct);
+
     public Task<string> UpdateDocumentAsync(string database, string collection, string id, string json, string expectedEtag, CancellationToken ct = default) =>
         Task.Run(() =>
         {

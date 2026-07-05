@@ -22,6 +22,21 @@ public sealed record ServerHealth(bool Healthy, string Status, string? Version, 
 
 public sealed record CompactionInfo(long PagesCompacted, long BytesReclaimed, double TimeMs);
 
+/// <summary>Per-database health + diagnostics. Recommendation is one of
+/// "healthy" / "rebuild-catalog" / "recovery-pending" / "engine-degraded".</summary>
+public sealed record DatabaseHealthReport(
+    string HealthStatus,
+    bool ReadOnly,
+    int CollectionCount,
+    long TotalDocuments,
+    long DataSizeBytes,
+    long RecoveryLogBytes,
+    long WalBytes,
+    bool SnapshotMarkerPresent,
+    string? LockHolder,
+    string Recommendation,
+    string? RecommendationDetail);
+
 /// <summary>A follower peer as seen from a leader.</summary>
 public sealed record ReplicationFollowerInfo(string Endpoint, string? HttpEndpoint, long LagSeq, string? ConnectedAtUtc = null)
 {
