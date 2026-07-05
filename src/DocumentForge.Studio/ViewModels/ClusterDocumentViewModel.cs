@@ -33,12 +33,13 @@ public sealed class ClusterCollectionRow
     public string ShardKeyPath { get; }
 }
 
-/// <summary>Edits a DocumentForge cluster.json (shards + per-collection sharding
-/// strategy) and health-checks each shard. Client-only: it manipulates the file
-/// and pings endpoints; the engine still owns cluster behaviour.</summary>
+/// <summary>Edits a DocumentForge cluster config (shards + per-collection sharding
+/// strategy), health-checks each shard, and can pull the live config from a
+/// running router. Client-only: it manipulates the config and pings endpoints;
+/// the engine still owns cluster behaviour.</summary>
 public sealed partial class ClusterDocumentViewModel : DocumentViewModel
 {
-    private readonly ClusterConfig _config;
+    private ClusterConfig _config;
     private readonly IDialogService _dialogs;
 
     public ClusterDocumentViewModel(ClusterConfig config, string? filePath, IDialogService dialogs,
@@ -54,11 +55,15 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
 
         // Suggest shard endpoints from the user's saved connections + any endpoints
         // already in this config, so they can pick instead of typing a URL.
-        foreach (var e in (knownEndpoints ?? Array.Empty<string>())
-                     .Concat(_config.Shards.Select(s => s.LeaderEndpoint))
-                     .Where(e => !string.IsNullOrWhiteSpace(e))
-                     .Distinct(StringComparer.OrdinalIgnoreCase))
-            ShardEndpointSuggestions.Add(e);
+        AddEndpointSuggestions((knownEndpoints ?? Array.Empty<string>())
+            .Concat(_config.Shards.Select(s => s.LeaderEndpoint)));
+    }
+
+    private void AddEndpointSuggestions(IEnumerable<string> endpoints)
+    {
+        foreach (var e in endpoints.Where(e => !string.IsNullOrWhiteSpace(e)))
+            if (!ShardEndpointSuggestions.Contains(e, StringComparer.OrdinalIgnoreCase))
+                ShardEndpointSuggestions.Add(e);
     }
 
     public ObservableCollection<ClusterShardRow> Shards { get; } = new();
@@ -90,6 +95,9 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
     [ObservableProperty] private ShardingStrategy _newCollectionStrategy;
     [ObservableProperty] private string _newCollectionShardKey = "";
 
+    // "Load from live cluster" input — a running `dfdb router` endpoint.
+    [ObservableProperty] private string _routerEndpoint = "";
+
     /// <summary>Only a hash-sharded collection needs a shard key.</summary>
     public bool NeedsShardKey => NewCollectionStrategy == ShardingStrategy.Hash;
 
@@ -109,7 +117,7 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
 
     private void UpdateTitle()
     {
-        var baseTitle = FilePath is null ? "Cluster (unsaved)" : $"Cluster — {Path.GetFileName(FilePath)}";
+        var baseTitle = FilePath is null ? "Cluster (unsaved)" : $"Cluster — {Path.GetFileNameWithoutExtension(FilePath)}";
         Title = IsDirty ? $"{baseTitle} *" : baseTitle;
     }
 
@@ -143,7 +151,7 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
         NewShardEndpoint = "";
         ReloadRows();
         MarkDirty();
-        StatusMessage = $"Added shard '{name}'. Save to write cluster.json.";
+        StatusMessage = $"Added shard '{name}'. Save to write the cluster config.";
     }
 
     [RelayCommand]
@@ -177,7 +185,7 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
         NewCollectionShardKey = "";
         ReloadRows();
         MarkDirty();
-        StatusMessage = $"{(isUpdate ? "Updated" : "Added")} '{name}' → {NewCollectionStrategy}. Save to write cluster.json.";
+        StatusMessage = $"{(isUpdate ? "Updated" : "Added")} '{name}' → {NewCollectionStrategy}. Save to write the cluster config.";
     }
 
     [RelayCommand]
@@ -206,6 +214,59 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
         catch (Exception ex)
         {
             _dialogs.ShowError("Save failed", ex.Message);
+        }
+    }
+
+    /// <summary>Write a copy to a chosen location without adopting it as this
+    /// tab's file (a plain "export a copy").</summary>
+    [RelayCommand]
+    private void Export()
+    {
+        var suggested = FilePath is null ? "cluster.json" : Path.GetFileName(FilePath);
+        var path = _dialogs.PickSaveFile("DocumentForge cluster (*.json)|*.json|All files (*.*)|*.*", suggested);
+        if (path is null) return;
+        try
+        {
+            _config.Save(path);
+            StatusMessage = $"Exported a copy to {path}";
+        }
+        catch (Exception ex)
+        {
+            _dialogs.ShowError("Export failed", ex.Message);
+        }
+    }
+
+    /// <summary>Pull the live config from a running <c>dfdb router</c> so you can
+    /// edit what the cluster is actually running. It's read-only on the engine
+    /// side: Studio loads a copy, and applying changes still means saving a file
+    /// and restarting the router.</summary>
+    [RelayCommand]
+    private async Task LoadFromRouterAsync()
+    {
+        var endpoint = RouterEndpoint.Trim();
+        if (endpoint.Length == 0)
+        {
+            StatusMessage = "Enter the endpoint of a running `dfdb router` to load its live config.";
+            return;
+        }
+        IsBusy = true;
+        try
+        {
+            _config = await ClusterConfig.LoadFromRouterAsync(endpoint);
+            ReloadRows();
+            AddEndpointSuggestions(_config.Shards.Select(s => s.LeaderEndpoint));
+            MarkDirty();
+            StatusMessage = $"Loaded live config from {endpoint} (v{_config.Version}, {_config.Shards.Count} shard(s)). " +
+                            "This is a working copy — Save it to a file and restart the router to apply edits.";
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = $"Couldn't load from {endpoint}: {ex.Message}. " +
+                            "It must be a running `dfdb router` exposing GET /cluster/config.";
+        }
+        finally
+        {
+            IsBusy = false;
         }
     }
 

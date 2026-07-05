@@ -436,7 +436,7 @@ public sealed partial class MainViewModel : ObservableObject
         var document = new ClusterDocumentViewModel(config, path, _dialogs, knownEndpoints);
         Documents.Add(document);
         ActiveDocument = document;
-        StatusText = path is null ? "New cluster config" : $"Cluster — {System.IO.Path.GetFileName(path)}";
+        StatusText = path is null ? "New cluster config" : $"Cluster — {System.IO.Path.GetFileNameWithoutExtension(path)}";
     }
 
     [RelayCommand]
