@@ -499,10 +499,12 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     {
         ThrowIfReadOnly();
         EnsureHealthy();
+        DocumentId id;
+        ulong broadcastSeq;
         _transactionManager.AcquireWriteLock();
         try
         {
-            return TrackHealth(() =>
+            (id, broadcastSeq) = TrackHealth(() =>
             {
                 var collection = _catalog.GetOrCreateCollection(collectionName);
                 doc.EnsureId(); // ensure _id is set BEFORE we broadcast, so followers get the same id
@@ -522,23 +524,29 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                 // doc stranded on disk. (issue #9)
                 _indexManager.ValidateUniqueInsert(collectionName, doc);
 
-                var id = collection.Insert(doc);
-                _indexManager.OnDocumentInserted(collectionName, id, doc);
+                var newId = collection.Insert(doc);
+                _indexManager.OnDocumentInserted(collectionName, newId, doc);
 
                 // Broadcast to read-only followers (with sequence number assignment)
+                ulong seq = 0;
                 if (_logicalServer is not null)
                 {
                     var bytes = BsonSerializer.Serialize(doc);
-                    _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, bytes);
+                    seq = _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, bytes);
                 }
                 CommitDurableLocked();
-                return id;
+                return (newId, seq);
             });
         }
         finally
         {
             _transactionManager.ReleaseWriteLock();
         }
+
+        // Issue #95 — semi-sync: block (outside the lock) until the configured
+        // number of followers have durably applied this write before we return.
+        WaitForSyncReplication(broadcastSeq);
+        return id;
     }
 
     public DocumentId Insert(string collectionName, string json)
@@ -2449,6 +2457,38 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     public ulong LeaderCurrentSeq => _logicalServer?.CurrentSeq ?? 0;
     public DateTimeOffset? LastLeaderMessage =>
         _logicalFollower?.LastMessageAt == DateTimeOffset.MinValue ? null : _logicalFollower?.LastMessageAt;
+
+    // --- Semi-sync replication (issue #95) ---
+
+    /// <summary>
+    /// Issue #95 — how many followers must ACK durably applying a write before
+    /// the leader acknowledges it to the client. 0 (default) = asynchronous
+    /// fire-and-forget (unchanged behaviour); 1 = wait for one replica
+    /// (bounded RPO); N = quorum. Set at runtime on a leader.
+    /// </summary>
+    public int MinSyncReplicas { get; set; }
+
+    /// <summary>How long to wait for the semi-sync ack quorum before failing the
+    /// write with <see cref="ReplicationTimeoutException"/>.</summary>
+    public TimeSpan SyncReplicationTimeout { get; set; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Block until <see cref="MinSyncReplicas"/> followers have ACKed applying
+    /// <paramref name="broadcastSeq"/>. Called by each write path AFTER the
+    /// write lock is released, so semi-sync latency doesn't serialise writers.
+    /// No-op when semi-sync is off or there's no replication server.
+    /// </summary>
+    private void WaitForSyncReplication(ulong broadcastSeq)
+    {
+        var required = MinSyncReplicas;
+        var server = _logicalServer;
+        if (required <= 0 || broadcastSeq == 0 || server is null) return;
+
+        bool ok = server.WaitForReplicationAsync(broadcastSeq, required, SyncReplicationTimeout)
+            .GetAwaiter().GetResult();
+        if (!ok)
+            throw new ReplicationTimeoutException(broadcastSeq, required, server.AckedFollowerCount(broadcastSeq));
+    }
 
     // --- Leader term / fencing epoch (issue #96) ---
 

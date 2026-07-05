@@ -412,8 +412,18 @@ public static class ServeCommand
                     $"Replication port ({port}) must differ from the HTTP port ({config.Port}).");
 
             db.StartLogicalReplicationServer(port, secret);
+
+            // Issue #95 — semi-sync: gate write acks on follower ACKs when configured.
+            if (rep.MinSyncReplicas > 0)
+            {
+                db.MinSyncReplicas = rep.MinSyncReplicas;
+                if (rep.SyncTimeoutSeconds > 0)
+                    db.SyncReplicationTimeout = TimeSpan.FromSeconds(rep.SyncTimeoutSeconds);
+            }
+
             return $"\x1b[32mLEADER\x1b[0m  listening on :{port}" +
-                   (string.IsNullOrEmpty(secret) ? "" : "  (shared-secret required)");
+                   (string.IsNullOrEmpty(secret) ? "" : "  (shared-secret required)") +
+                   (rep.MinSyncReplicas > 0 ? $"  (semi-sync: {rep.MinSyncReplicas} replica ack)" : "");
         }
 
         if (rep.IsFollower)

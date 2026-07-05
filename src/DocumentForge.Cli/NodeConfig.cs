@@ -93,6 +93,10 @@ public sealed class NodeConfig
                     c.Replication ??= new ReplicationConfig();
                     c.Replication.LeaderPort = int.Parse(args[i + 1]);
                     break;
+                case "--min-sync-replicas":
+                    c.Replication ??= new ReplicationConfig();
+                    c.Replication.MinSyncReplicas = int.Parse(args[i + 1]);
+                    break;
                 case "--auto-failover-seconds":
                     c.Replication ??= new ReplicationConfig();
                     c.Replication.AutoFailover ??= new AutoFailoverConfig();
@@ -274,6 +278,18 @@ public sealed class ReplicationConfig
 
     /// <summary>For role=follower: replication port on the leader.</summary>
     public int? LeaderPort { get; set; }
+
+    /// <summary>
+    /// Issue #95 — semi-sync replication. For role=leader: how many followers
+    /// must ACK a write before the leader acknowledges it to the client.
+    /// 0 (default) = asynchronous fire-and-forget; 1 = wait for one replica
+    /// (bounded RPO). A write that can't reach the quorum within
+    /// <see cref="SyncTimeoutSeconds"/> fails with a replication-timeout error.
+    /// </summary>
+    public int MinSyncReplicas { get; set; }
+
+    /// <summary>Timeout (seconds) for the semi-sync ack quorum. Default 5.</summary>
+    public double SyncTimeoutSeconds { get; set; } = 5;
 
     /// <summary>Optional auto-failover (only honored when role=follower).</summary>
     public AutoFailoverConfig? AutoFailover { get; set; }

@@ -129,6 +129,26 @@ public class EtagMismatchException : DocumentForgeException
 /// message names the holder (pid + hostname + open time) so operators can
 /// kill the right process before retrying.
 /// </summary>
+/// <summary>
+/// Issue #95 — semi-sync replication: an acknowledged write must reach a
+/// configured number of followers before the client is told it succeeded.
+/// Thrown when that quorum wasn't ACKed within the timeout. The write IS
+/// durable on the leader (WAL-committed); this signals that it is not yet
+/// safely replicated, so the caller must not treat it as cluster-durable.
+/// </summary>
+public class ReplicationTimeoutException : DocumentForgeException
+{
+    public ulong Seq { get; }
+    public int Required { get; }
+    public int Achieved { get; }
+    public ReplicationTimeoutException(ulong seq, int required, int achieved)
+        : base($"Semi-sync replication timed out for seq {seq}: needed {required} follower ack(s), got {achieved}. " +
+               "The write is durable on the leader but not yet confirmed on a replica.")
+    {
+        Seq = seq; Required = required; Achieved = achieved;
+    }
+}
+
 public class DatabaseLockedException : DocumentForgeException
 {
     public string FilePath { get; }

@@ -43,6 +43,12 @@ public enum LogicalOpType : byte
 
     Heartbeat = 0xFE,
     Handshake = 0xFF,
+
+    /// <summary>Follower → leader acknowledgement carrying the highest seq the
+    /// follower has durably applied. Enables semi-sync replication (issue #95):
+    /// the leader can wait for a quorum of acks before acking the client.
+    /// Wire frame: [Magic:4][Ack:1][appliedSeq:8].</summary>
+    Ack = 0xFD,
 }
 
 /// <summary>
@@ -273,7 +279,60 @@ public sealed class LogicalReplicationServer : IDisposable
         public required ulong HandshakeSeq { get; init; }
         /// <summary>HTTP base URL the follower advertised; null if it's running an older build. Issue #51.</summary>
         public string? HttpEndpoint { get; init; }
+        /// <summary>Highest seq this follower has ACKed as durably applied (issue #95).</summary>
+        public long AckedSeq;
     }
+
+    // Issue #95 — replaceable pulse completed whenever any follower's AckedSeq
+    // advances (or a follower drops), so WaitForReplication wakes without
+    // polling and without an ever-growing signal count.
+    private volatile TaskCompletionSource<bool> _ackPulse =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    private void PulseAcks()
+    {
+        var fresh = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Interlocked.Exchange(ref _ackPulse, fresh).TrySetResult(true);
+    }
+
+    /// <summary>
+    /// Issue #95 — semi-sync wait. Block until at least
+    /// <paramref name="requiredAcks"/> followers have ACKed applying
+    /// <paramref name="seq"/> (or higher), up to <paramref name="timeout"/>.
+    /// Returns true if the quorum was reached. A requiredAcks of 0 returns
+    /// immediately (async replication). Callers wait OUTSIDE the write lock so
+    /// throughput isn't gated on the network round-trip.
+    /// </summary>
+    public async Task<bool> WaitForReplicationAsync(ulong seq, int requiredAcks, TimeSpan timeout, CancellationToken ct = default)
+    {
+        if (requiredAcks <= 0 || seq == 0) return true;
+        var deadline = DateTime.UtcNow + timeout;
+        while (true)
+        {
+            // Capture the pulse BEFORE checking, so an ack that lands between the
+            // check and the await still wakes us (no lost wakeup).
+            var pulse = _ackPulse.Task;
+            if (CountAcksAtLeast(seq) >= requiredAcks) return true;
+            var remaining = deadline - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero) return false;
+            var completed = await Task.WhenAny(pulse, Task.Delay(remaining, ct));
+            if (completed != pulse && CountAcksAtLeast(seq) < requiredAcks) return false; // timed out
+        }
+    }
+
+    private int CountAcksAtLeast(ulong seq)
+    {
+        lock (_lock)
+        {
+            int n = 0;
+            foreach (var f in _followers)
+                if ((ulong)Interlocked.Read(ref f.AckedSeq) >= seq) n++;
+            return n;
+        }
+    }
+
+    /// <summary>Number of followers whose applied-seq is at least <paramref name="seq"/>.</summary>
+    public int AckedFollowerCount(ulong seq) => CountAcksAtLeast(seq);
 
     /// <summary>
     /// Optional snapshot provider — invoked when a follower handshakes with
@@ -542,11 +601,53 @@ public sealed class LogicalReplicationServer : IDisposable
                 HttpEndpoint = followerHttpEndpoint,
             };
             lock (_lock) _followers.Add(conn);
+
+            // Issue #95 — read this follower's applied-seq acks on the same
+            // socket (concurrent with the broadcast writes; TCP is full-duplex)
+            // so semi-sync waiters can make progress.
+            _ = Task.Run(() => ReadFollowerAcksAsync(conn, stream));
         }
         catch (Exception ex)
         {
             Console.WriteLine($"[LogicalRep] Handshake error: {ex.Message}");
             try { client.Close(); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// Issue #95 — read a follower's applied-seq ACK frames
+    /// (<c>[Magic:4][Ack:1][seq:8]</c>) and advance its <c>AckedSeq</c>, pulsing
+    /// semi-sync waiters. Ends when the follower disconnects (also removing it
+    /// from the broadcast list so a dead follower stops counting toward quorum).
+    /// </summary>
+    private async Task ReadFollowerAcksAsync(FollowerConn conn, NetworkStream stream)
+    {
+        var frame = new byte[4 + 1 + 8];
+        try
+        {
+            while (!_cts.IsCancellationRequested)
+            {
+                if (!await ReadExactBytes(stream, frame, _cts.Token)) break;
+                if (frame[0] != 'D' || frame[1] != 'F' || frame[2] != 'L' || frame[3] != 'R'
+                    || frame[4] != (byte)LogicalOpType.Ack)
+                    break; // unexpected frame on the ack channel — drop the follower
+
+                var seq = BitConverter.ToUInt64(frame, 5);
+                // Monotonic advance.
+                long cur;
+                do { cur = Interlocked.Read(ref conn.AckedSeq); if ((long)seq <= cur) break; }
+                while (Interlocked.CompareExchange(ref conn.AckedSeq, (long)seq, cur) != cur);
+
+                PulseAcks();
+            }
+        }
+        catch { /* disconnect / read error → fall through to cleanup */ }
+        finally
+        {
+            lock (_lock) _followers.Remove(conn);
+            try { conn.Client.Close(); } catch { }
+            // Wake any waiter so it re-evaluates quorum against the now-smaller set.
+            PulseAcks();
         }
     }
 
@@ -857,6 +958,19 @@ public sealed class LogicalReplicationFollower : IDisposable
                 _lastAppliedSeq = seq;
                 SaveSeq(seq);
                 Interlocked.Increment(ref _opsApplied);
+
+                // Issue #95 — acknowledge the durably-applied seq so the leader
+                // can offer semi-sync (wait for a follower before acking the
+                // client). Best-effort: a legacy leader ignores the extra bytes.
+                try
+                {
+                    var ack = new byte[4 + 1 + 8];
+                    ack[0] = (byte)'D'; ack[1] = (byte)'F'; ack[2] = (byte)'L'; ack[3] = (byte)'R';
+                    ack[4] = (byte)LogicalOpType.Ack;
+                    BitConverter.TryWriteBytes(ack.AsSpan(5), seq);
+                    await stream.WriteAsync(ack, _cts.Token);
+                }
+                catch { /* ack is advisory; a write failure just means no semi-sync credit */ }
             }
         }
         catch (OperationCanceledException) { }
