@@ -4,6 +4,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using DocumentForge.Studio.Core.Connections;
 using DocumentForge.Studio.Core.Models;
+using DocumentForge.Studio.Services;
 
 namespace DocumentForge.Studio.ViewModels;
 
@@ -22,11 +23,13 @@ public sealed partial class ApiKeysDocumentViewModel : DocumentViewModel
 {
     private readonly IDfConnection _connection;
     private readonly Func<Task> _onSecure;
+    private readonly IDialogService _dialogs;
 
-    public ApiKeysDocumentViewModel(IDfConnection connection, Func<Task> onSecure)
+    public ApiKeysDocumentViewModel(IDfConnection connection, Func<Task> onSecure, IDialogService dialogs)
     {
         _connection = connection;
         _onSecure = onSecure;
+        _dialogs = dialogs;
         Title = $"API Keys — {connection.Descriptor.Name}";
         ContentId = $"keys:{connection.Descriptor.Id}";
         _selectedScope = ScopeChoices[0];
@@ -115,6 +118,27 @@ public sealed partial class ApiKeysDocumentViewModel : DocumentViewModel
                 return;
             }
             scope = choice.Kind == "db-read" ? $"db:{SelectedDatabase}:read" : $"db:{SelectedDatabase}";
+        }
+
+        // Lock-out protection: on an open (dev-mode) server, the first key ends
+        // dev-mode immediately. A non-admin first key locks you out of admin.
+        if (IsUnsecured)
+        {
+            var isAdmin = scope == "*";
+            var message = isAdmin
+                ? "This server is currently open (no auth). Creating this admin key will make it require a key for every request.\n\n" +
+                  "This connection isn't using a key yet, so you'd need to reconnect with the new key afterwards. The " +
+                  "\"Secure this server\" button does that for you automatically — prefer it unless you have a reason not to.\n\n" +
+                  "Create this admin key anyway?"
+                : "⚠  LOCK-OUT RISK\n\n" +
+                  "This server is open (no auth). Creating the first key locks it down immediately — and because this key " +
+                  "is NOT full admin, you will lose the ability to manage this server from here (and there's no undo without " +
+                  "server-side access).\n\n" +
+                  "Strongly recommended: Cancel, then use \"Secure this server\" at the top to create an admin key that keeps " +
+                  "you connected. You can add scoped keys like this one afterwards.\n\n" +
+                  "Create this non-admin key anyway?";
+            if (!_dialogs.Confirm("Create key — please read", message))
+                return;
         }
 
         IsBusy = true;

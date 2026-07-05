@@ -52,6 +52,7 @@
                         <ColumnDefinition Width="220"/>
                         <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="180"/>
+                        <ColumnDefinition Width="Auto"/>
                         <ColumnDefinition Width="*"/>
                         <ColumnDefinition Width="Auto"/>
                     </Grid.ColumnDefinitions>
@@ -66,10 +67,11 @@
                               VerticalAlignment="Center"
                               Visibility="{Binding NeedsDatabase, Converter={StaticResource BoolToVis}}"/>
 
-                    <TextBox Grid.Column="4" Text="{Binding NewDescription, UpdateSourceTrigger=PropertyChanged}"
-                             Margin="12,0,0,0" VerticalContentAlignment="Center"
-                             ToolTip="Description (optional)"/>
-                    <Button Grid.Column="5" Content="Create key" Padding="12,3" Margin="8,0,0,0"
+                    <TextBlock Grid.Column="4" Text="Description:" VerticalAlignment="Center" Margin="12,0,6,0"/>
+                    <TextBox Grid.Column="5" Text="{Binding NewDescription, UpdateSourceTrigger=PropertyChanged}"
+                             VerticalContentAlignment="Center"
+                             ToolTip="A label to remember what this key is for (optional)"/>
+                    <Button Grid.Column="6" Content="Create key" Padding="12,3" Margin="8,0,0,0"
                             Command="{Binding CreateCommand}"/>
                 </Grid>
             </StackPanel>
