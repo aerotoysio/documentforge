@@ -189,6 +189,41 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
     }
 
     [Fact]
+    public async Task PostDatabases_ReservedUnderscoreName_Returns400()
+    {
+        // Issue #105 — the '_' prefix is reserved for system databases; the
+        // API must refuse to create/attach one.
+        var (_, baseUrl, _) = BootServer();
+        var resp = await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "_evil" });
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task ScopedDataRoutes_OnReservedDatabase_Return403()
+    {
+        // Issue #105 — even with dev-mode (admin, all-DB) auth, the _system
+        // credential store is unreachable via the document data plane.
+        var (registry, baseUrl, dataDir) = BootServer();
+        registry.AttachOrCreate("_system", Path.Combine(dataDir, "_system.dfdb"));
+
+        var read = await _http.GetAsync($"{baseUrl}/db/_system/collections");
+        Assert.Equal(HttpStatusCode.Forbidden, read.StatusCode);
+
+        var query = await _http.PostAsJsonAsync($"{baseUrl}/db/_system/query",
+            new { sql = "SELECT * FROM _keys" });
+        Assert.Equal(HttpStatusCode.Forbidden, query.StatusCode);
+
+        var write = await _http.PostAsync($"{baseUrl}/db/_system/collections/_keys",
+            new StringContent("""{"x":1}""", System.Text.Encoding.UTF8, "application/json"));
+        Assert.Equal(HttpStatusCode.Forbidden, write.StatusCode);
+
+        // A normal database on the same server is still reachable.
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "orders" });
+        var ok = await _http.GetAsync($"{baseUrl}/db/orders/collections");
+        Assert.Equal(HttpStatusCode.OK, ok.StatusCode);
+    }
+
+    [Fact]
     public async Task GetDatabases_MultipleAttached_AllReturned()
     {
         var (_, baseUrl, _) = BootServer();

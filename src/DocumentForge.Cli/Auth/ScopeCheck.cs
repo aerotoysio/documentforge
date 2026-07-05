@@ -33,6 +33,7 @@ public static class ScopeCheck
     /// GET /collections/..., POST /query, etc.</summary>
     public static IResult? RequireDbRead(HttpContext ctx, string database)
     {
+        if (DenyIfReserved(database) is { } reserved) return reserved;
         var auth = ctx.GetAuth();
         if (auth.CanReadDb(database)) return null;
         return Forbid($"read db:{database}", auth);
@@ -42,10 +43,42 @@ public static class ScopeCheck
     /// PUT, DELETE, /index, /seed, /db/{name}/collections/* writes.</summary>
     public static IResult? RequireDbWrite(HttpContext ctx, string database)
     {
+        if (DenyIfReserved(database) is { } reserved) return reserved;
         var auth = ctx.GetAuth();
         if (auth.CanWriteDb(database)) return null;
         return Forbid($"write db:{database}", auth);
     }
+
+    /// <summary>
+    /// Returns a 403 when <paramref name="database"/> is reserved (see
+    /// <see cref="IsReservedDatabase"/>), else null. Baked into the db-scoped
+    /// read/write checks, and called explicitly by admin-gated routes that
+    /// still target a database by name (e.g. per-DB replication control) so a
+    /// reserved DB can't be routed there either.
+    /// </summary>
+    public static IResult? DenyIfReserved(string database) =>
+        IsReservedDatabase(database) ? ForbidReserved(database) : null;
+
+    /// <summary>
+    /// Issue #105 — reserved databases (name starts with '_', e.g. the
+    /// <c>_system</c> credential store that holds API-key hashes) are managed
+    /// only through the admin plane (<c>/admin/keys</c> + KeyStore, backup /
+    /// PITR jobs). They must NEVER be reachable through the document data
+    /// plane, or a broadly-scoped key (<c>db:*</c>, or even <c>db:_system</c>)
+    /// could read/write the key store via <c>?database=_system</c> or
+    /// <c>/db/_system/...</c>. The block is unconditional — no scope, not even
+    /// admin, grants data-plane access to these.
+    /// </summary>
+    public static bool IsReservedDatabase(string database) =>
+        !string.IsNullOrEmpty(database) && database[0] == '_';
+
+    private static IResult ForbidReserved(string database) =>
+        Results.Json(new
+        {
+            error = $"Forbidden — '{database}' is a reserved system database and is not accessible " +
+                    "via the data plane. Manage it through the admin API (e.g. /admin/keys).",
+            reserved = true,
+        }, statusCode: 403);
 
     private static IResult Forbid(string required, AuthContext auth)
     {

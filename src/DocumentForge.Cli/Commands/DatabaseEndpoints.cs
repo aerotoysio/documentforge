@@ -499,6 +499,14 @@ public static class DatabaseEndpoints
                 if (string.IsNullOrWhiteSpace(req.Name))
                     return Results.BadRequest(new { error = "Missing 'name' field." });
 
+                // Issue #105: the '_' prefix is reserved for internal system
+                // databases (e.g. _system, the key store). Refuse to create/attach
+                // one over the API — it would be unreachable via the data plane
+                // anyway, and must not shadow or collide with a system DB.
+                if (ScopeCheck.IsReservedDatabase(req.Name))
+                    return Results.BadRequest(new { error =
+                        $"Database name '{req.Name}' is reserved — names starting with '_' are for internal system databases." });
+
                 var path = string.IsNullOrWhiteSpace(req.Path)
                     ? Path.Combine(defaultDataDir, $"{req.Name}.dfdb")
                     : req.Path!;
@@ -570,6 +578,7 @@ public static class DatabaseEndpoints
         app.MapGet("/databases/{name}/health", (HttpContext ctx, string name) =>
         {
             if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (ScopeCheck.DenyIfReserved(name) is { } reserved) return reserved;
             var db = registry.TryGet(name);
             if (db is null)
                 return Results.NotFound(new { error = $"Database '{name}' is not attached." });
@@ -811,6 +820,7 @@ public static class DatabaseEndpoints
         app.MapGet("/db/{name}/replication/status", (HttpContext ctx, string name) =>
         {
             if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (ScopeCheck.DenyIfReserved(name) is { } reserved) return reserved;
             var db = registry.TryGet(name);
             if (db is null)
                 return Results.NotFound(new { error = $"Database '{name}' is not attached." });
@@ -858,6 +868,7 @@ public static class DatabaseEndpoints
         app.MapPost("/db/{name}/replication/start-leader", (HttpContext ctx, string name, StartLeaderBody body) =>
         {
             if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (ScopeCheck.DenyIfReserved(name) is { } reserved) return reserved;
             var db = registry.TryGet(name);
             if (db is null)
                 return Results.NotFound(new { error = $"Database '{name}' is not attached." });
@@ -875,6 +886,7 @@ public static class DatabaseEndpoints
         app.MapPost("/db/{name}/replication/start-follower", (HttpContext ctx, string name, StartFollowerBody body) =>
         {
             if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (ScopeCheck.DenyIfReserved(name) is { } reserved) return reserved;
             var db = registry.TryGet(name);
             if (db is null)
                 return Results.NotFound(new { error = $"Database '{name}' is not attached." });
@@ -898,6 +910,7 @@ public static class DatabaseEndpoints
         app.MapPost("/db/{name}/replication/promote", (HttpContext ctx, string name, PromoteBody body) =>
         {
             if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            if (ScopeCheck.DenyIfReserved(name) is { } reserved) return reserved;
             var db = registry.TryGet(name);
             if (db is null)
                 return Results.NotFound(new { error = $"Database '{name}' is not attached." });
