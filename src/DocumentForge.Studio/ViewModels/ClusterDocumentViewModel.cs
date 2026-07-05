@@ -75,6 +75,12 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
     [ObservableProperty] private string _statusMessage = "";
     [ObservableProperty] private bool _isBusy;
 
+    /// <summary>True when the config has edits not yet written to disk. Drives the
+    /// "*" marker in the tab title so unsaved changes are visible.</summary>
+    [ObservableProperty] private bool _isDirty;
+
+    partial void OnIsDirtyChanged(bool value) => UpdateTitle();
+
     // Add-shard inputs
     [ObservableProperty] private string _newShardName = "";
     [ObservableProperty] private string _newShardEndpoint = "";
@@ -101,8 +107,13 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
         OnPropertyChanged(nameof(SummaryText));
     }
 
-    private void UpdateTitle() =>
-        Title = FilePath is null ? "Cluster (unsaved)" : $"Cluster — {Path.GetFileName(FilePath)}";
+    private void UpdateTitle()
+    {
+        var baseTitle = FilePath is null ? "Cluster (unsaved)" : $"Cluster — {Path.GetFileName(FilePath)}";
+        Title = IsDirty ? $"{baseTitle} *" : baseTitle;
+    }
+
+    private void MarkDirty() => IsDirty = true;
 
     [RelayCommand]
     private void AddShard()
@@ -119,10 +130,19 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
             StatusMessage = $"A shard named '{name}' already exists.";
             return;
         }
+        if (_config.Shards.Any(s => s.LeaderEndpoint.Equals(endpoint, StringComparison.OrdinalIgnoreCase)))
+        {
+            StatusMessage = $"Shard '{_config.Shards.First(s => s.LeaderEndpoint.Equals(endpoint, StringComparison.OrdinalIgnoreCase)).Name}' " +
+                            $"already points at {endpoint}. Each shard needs a distinct endpoint.";
+            return;
+        }
         _config.Shards.Add(new ShardDescriptor { Name = name, Endpoint = endpoint });
+        if (!ShardEndpointSuggestions.Contains(endpoint, StringComparer.OrdinalIgnoreCase))
+            ShardEndpointSuggestions.Add(endpoint);
         NewShardName = "";
         NewShardEndpoint = "";
         ReloadRows();
+        MarkDirty();
         StatusMessage = $"Added shard '{name}'. Save to write cluster.json.";
     }
 
@@ -132,6 +152,7 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
         if (row is null) return;
         _config.Shards.RemoveAll(s => ReferenceEquals(s, row.Shard));
         ReloadRows();
+        MarkDirty();
         StatusMessage = $"Removed shard '{row.Name}'.";
     }
 
@@ -146,6 +167,7 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
             StatusMessage = "A hash-sharded collection needs a shard key path.";
             return;
         }
+        var isUpdate = _config.Collections.ContainsKey(name);
         _config.Collections[name] = new CollectionPolicyDescriptor
         {
             Strategy = NewCollectionStrategy,
@@ -154,7 +176,8 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
         NewCollectionName = "";
         NewCollectionShardKey = "";
         ReloadRows();
-        StatusMessage = $"Set '{name}' to {NewCollectionStrategy}. Save to write cluster.json.";
+        MarkDirty();
+        StatusMessage = $"{(isUpdate ? "Updated" : "Added")} '{name}' → {NewCollectionStrategy}. Save to write cluster.json.";
     }
 
     [RelayCommand]
@@ -163,6 +186,7 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
         if (row is null) return;
         _config.Collections.Remove(row.Name);
         ReloadRows();
+        MarkDirty();
         StatusMessage = $"Removed policy for '{row.Name}'.";
     }
 
@@ -175,6 +199,7 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
         {
             _config.Save(path);
             FilePath = path;
+            IsDirty = false;
             UpdateTitle();
             StatusMessage = $"Saved to {path}";
         }
