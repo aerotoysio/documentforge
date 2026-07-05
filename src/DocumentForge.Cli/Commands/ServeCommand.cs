@@ -475,6 +475,7 @@ public static class ServeCommand
 
         app.MapPost("/collections/{name}", async (string name, HttpRequest request) =>
         {
+            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
             using var reader = new StreamReader(request.Body);
             var json = await reader.ReadToEndAsync();
             if (string.IsNullOrWhiteSpace(json)) return Results.BadRequest(new { error = "Empty body" });
@@ -488,6 +489,7 @@ public static class ServeCommand
 
         app.MapGet("/collections/{name}", (string name, int? limit) =>
         {
+            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
             var sql = $"SELECT * FROM {name}";
             if (limit.HasValue) sql += $" LIMIT {limit.Value}";
             var result = db.Execute(sql);
@@ -571,6 +573,7 @@ public static class ServeCommand
         // sanitised the same way as the GET/DELETE by-field routes.
         app.MapPut("/collections/{name}/by/{field}/{value}", async (string name, string field, string value, HttpRequest request) =>
         {
+            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
             if (!IsValidFieldPath(field))
                 return Results.BadRequest(new { error = "Field name must match [a-zA-Z_][a-zA-Z0-9_.\\[\\]]*" });
 
@@ -627,6 +630,7 @@ public static class ServeCommand
         // the value is escaped by doubling single quotes.
         app.MapGet("/collections/{name}/by/{field}/{value}", (string name, string field, string value) =>
         {
+            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
             if (!IsValidFieldPath(field))
                 return Results.BadRequest(new { error = "Field name must match [a-zA-Z_][a-zA-Z0-9_.\\[\\]]*" });
 
@@ -652,6 +656,7 @@ public static class ServeCommand
         // Deletes at most the matching documents (no LIMIT clause means all matches).
         app.MapDelete("/collections/{name}/by/{field}/{value}", (string name, string field, string value) =>
         {
+            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
             if (!IsValidFieldPath(field))
                 return Results.BadRequest(new { error = "Field name must match [a-zA-Z_][a-zA-Z0-9_.\\[\\]]*" });
 
@@ -693,6 +698,7 @@ public static class ServeCommand
         //                      before any indexed query, or results will be wrong.
         app.MapPost("/collections/{name}/bulk", async (string name, HttpRequest request, bool? skipIndexes, bool? atomic) =>
         {
+            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
             using var reader = new StreamReader(request.Body);
             var json = await reader.ReadToEndAsync();
             if (string.IsNullOrWhiteSpace(json)) return Results.BadRequest(new { error = "Empty body" });
@@ -845,6 +851,8 @@ public static class ServeCommand
                         {
                             return Results.BadRequest(new { error = $"op[{opIndex}]: 'op' and 'collection' are required." });
                         }
+                        if (!IsValidCollectionName(collection!))
+                            return Results.BadRequest(new { error = $"op[{opIndex}]: collection name must match [a-zA-Z_][a-zA-Z0-9_]* and be at most {MaxCollectionNameLength} chars." });
 
                         switch (op)
                         {
@@ -1303,6 +1311,25 @@ public static class ServeCommand
         if (s.Length >= 2 && s[0] == '"' && s[^1] == '"') s = s[1..^1];
         return s;
     }
+
+    /// <summary>
+    /// Whitelists collection names coming from a URL path segment before they
+    /// are interpolated into SQL. Mirrors the query lexer's identifier rule
+    /// ([a-zA-Z_][a-zA-Z0-9_]*) so every accepted name is also queryable; the
+    /// length cap keeps a hostile name from bloating the single-page catalog.
+    /// </summary>
+    private static readonly System.Text.RegularExpressions.Regex _collectionNameRegex =
+        new("^[a-zA-Z_][a-zA-Z0-9_]*$", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    private const int MaxCollectionNameLength = 128;
+
+    internal static bool IsValidCollectionName(string name) =>
+        !string.IsNullOrEmpty(name)
+        && name.Length <= MaxCollectionNameLength
+        && _collectionNameRegex.IsMatch(name);
+
+    private static IResult InvalidCollectionNameResult() =>
+        Results.BadRequest(new { error = $"Collection name must match [a-zA-Z_][a-zA-Z0-9_]* and be at most {MaxCollectionNameLength} chars." });
 }
 
 // ---- DTOs ----

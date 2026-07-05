@@ -14,6 +14,10 @@
     <ProjectReference Include="..\DocumentForge.Engine\DocumentForge.Engine.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="DocumentForge.Tests" />
+  </ItemGroup>
+
   <!-- Pull in the airline seed data file so `dfdb seed` works out of the box -->
   <ItemGroup>
     <Compile Include="..\..\samples\DocumentForge.AirlineDemo\SeedData.cs" Link="SeedData.cs" />
