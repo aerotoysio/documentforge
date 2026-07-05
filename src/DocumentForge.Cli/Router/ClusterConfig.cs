@@ -33,8 +33,15 @@ public sealed class ClusterConfig
 
     /// <summary>Shard rings — each one is a leader plus zero or more
     /// followers. Hash-sharded collections distribute documents across
-    /// these rings via modular hashing of the shard key.</summary>
+    /// these rings via the engine's consistent-hash ring.</summary>
     public List<ShardConfig> Shards { get; set; } = new();
+
+    /// <summary>Virtual nodes per shard on the consistent-hash ring
+    /// (issue #100). Must match the engine cluster's
+    /// <c>virtualNodesPerShard</c> — and the shard names — or router
+    /// and engine place the same key on different shards. 150 is the
+    /// engine default.</summary>
+    public int VirtualNodesPerShard { get; set; } = 150;
 
     /// <summary>Per-collection distribution policy.</summary>
     public List<CollectionConfig> Collections { get; set; } = new();

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using DocumentForge.Engine.Cluster;
 
 namespace DocumentForge.Cli.Router;
 
@@ -12,7 +13,8 @@ namespace DocumentForge.Cli.Router;
 ///  - <c>Single</c>: every op goes to shards[0]. Default for undeclared
 ///     collections so casual workflows ("just attach this DB to the
 ///     router for now") don't trip on a missing config entry.
-///  - <c>Hash</c>: insert goes to <c>hash(doc[shardKeyPath]) % N</c>;
+///  - <c>Hash</c>: insert routes via the engine's
+///     <see cref="ConsistentHashRing"/> over <c>doc[shardKeyPath]</c>;
 ///     query fans out to every shard and merges by concatenation.
 ///  - <c>Replicated</c>: insert fans out to every shard's leader;
 ///     query reads from one shard (least-loaded heuristic = first
@@ -20,15 +22,20 @@ namespace DocumentForge.Cli.Router;
 /// </para>
 ///
 /// <para>
-/// Hashing: 32-bit FNV-1a over the UTF-8 bytes of the shard-key value.
-/// Chosen for stable distribution + zero dependencies. Stable across
-/// platforms because the bytes are produced by the same encoder.
+/// Hashing (issue #100): the router shares the engine cluster's
+/// <see cref="ConsistentHashRing"/> — same vnode construction, same
+/// FNV-1a — so a key placed through the router lands on the same
+/// shard the engine cluster would pick. The old FNV-1a-modulo-N
+/// scheme placed keys differently and silently misrouted mixed
+/// deployments. Shard NAMES and <c>virtualNodesPerShard</c> must
+/// match the engine's cluster config for placement parity.
 /// </para>
 /// </summary>
 public sealed class ClusterRouter : IDisposable
 {
     private readonly ClusterConfig _config;
     private readonly Dictionary<string, RingClient> _ringByName;
+    private readonly ConsistentHashRing _hashRing;
 
     public ClusterConfig Config => _config;
 
@@ -43,6 +50,9 @@ public sealed class ClusterRouter : IDisposable
             s => s.Name,
             s => new RingClient(s.Name, s.Leader!),
             StringComparer.OrdinalIgnoreCase);
+        _hashRing = new ConsistentHashRing(
+            config.Shards.Select(s => s.Name).ToList(),
+            config.VirtualNodesPerShard);
     }
 
     /// <summary>Public clients keyed by shard name. Useful for callers
@@ -149,11 +159,14 @@ public sealed class ClusterRouter : IDisposable
         if (keyValue is null)
             throw new InvalidOperationException(
                 $"Hash routing requires '{shardKeyPath}' in the document; not present.");
-        var hash = Fnv1a32(keyValue);
-        var index = (int)(hash % (uint)_config.Shards.Count);
-        var ringName = _config.Shards[index].Name;
-        return _ringByName[ringName];
+        return _ringByName[PickShardNameForKey(keyValue)];
     }
+
+    /// <summary>The shard a given key value routes to — placement is
+    /// identical to <see cref="DocumentForgeCluster"/>'s for the same
+    /// shard names and vnode count (issue #100).</summary>
+    public string PickShardNameForKey(string keyValue) =>
+        _config.Shards[_hashRing.PickShardIndex(keyValue)].Name;
 
     /// <summary>Pull the shard-key value out of the document. Supports
     /// simple top-level paths ("pnr") and dotted paths ("customer.id").
@@ -176,23 +189,6 @@ public sealed class ClusterRouter : IDisposable
             JsonValueKind.False => "false",
             _ => null,
         };
-    }
-
-    /// <summary>FNV-1a 32-bit hash. Cheap, stable, well-distributed
-    /// for short keys. The router uses it for shard-index selection;
-    /// the engine's index hashing is independent.</summary>
-    public static uint Fnv1a32(string s)
-    {
-        const uint offset = 2166136261u;
-        const uint prime = 16777619u;
-        var bytes = System.Text.Encoding.UTF8.GetBytes(s);
-        uint h = offset;
-        for (int i = 0; i < bytes.Length; i++)
-        {
-            h ^= bytes[i];
-            h *= prime;
-        }
-        return h;
     }
 
     public static string? TryExtractCollectionFromSql(string sql)

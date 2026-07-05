@@ -29,7 +29,7 @@ public sealed class ConsistentHashRing
             {
                 // Hash "shardname#vnodeIndex" - deterministic across all nodes
                 var key = $"{shardNames[i]}#{v}";
-                pairs.Add((Fnv1a(key), i));
+                pairs.Add((HashPoint(key), i));
             }
         }
 
@@ -46,7 +46,7 @@ public sealed class ConsistentHashRing
         if (_positions.Length == 0)
             throw new InvalidOperationException("Ring is empty.");
 
-        var keyHash = Fnv1a(keyValue);
+        var keyHash = HashPoint(keyValue);
         // Find the first position >= keyHash (wrap around if past the end)
         int lo = 0, hi = _positions.Length;
         while (lo < hi)
@@ -60,7 +60,32 @@ public sealed class ConsistentHashRing
     }
 
     /// <summary>
-    /// FNV-1a 32-bit hash. Deterministic, fast, good distribution for our purpose.
+    /// Ring-position hash: FNV-1a plus a murmur3-style avalanche finalizer.
+    /// Raw FNV-1a keeps sequential keys ("PNR-0001", "PNR-0002", …) in a
+    /// narrow numeric band, so they all fall into the same inter-vnode arc
+    /// and pile onto one shard (observed: 98/100 sequential keys on one
+    /// side of a 2-shard ring). The finalizer spreads those bands across
+    /// the full 2^32 ring. Deterministic across all nodes — changing this
+    /// is a placement-breaking change that requires a cluster rebalance.
+    /// </summary>
+    public static uint HashPoint(string s) => Mix(Fnv1a(s));
+
+    private static uint Mix(uint h)
+    {
+        unchecked
+        {
+            h ^= h >> 16;
+            h *= 0x85ebca6bu;
+            h ^= h >> 13;
+            h *= 0xc2b2ae35u;
+            h ^= h >> 16;
+            return h;
+        }
+    }
+
+    /// <summary>
+    /// FNV-1a 32-bit hash. Deterministic, fast. Kept public for callers that
+    /// want the raw hash; ring placement goes through <see cref="HashPoint"/>.
     /// </summary>
     public static uint Fnv1a(string s)
     {
