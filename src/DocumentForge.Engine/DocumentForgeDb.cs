@@ -900,6 +900,12 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             case MutationOp.Set:
                 doc[op.Field] = op.Value ?? BsonValue.Null;
                 break;
+            case MutationOp.Unset:
+                // Idempotent field removal — the identity field is never removable.
+                if (string.Equals(op.Field, "_id", StringComparison.Ordinal))
+                    throw new DocumentForgeException("Conditional update: '_id' cannot be unset.");
+                doc.Remove(op.Field);
+                break;
             case MutationOp.Inc:
             case MutationOp.Dec:
             {

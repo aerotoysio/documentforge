@@ -13,13 +13,14 @@ namespace DocumentForge.Engine;
 /// </summary>
 public enum ConditionOp { Eq, Ne, Lt, Lte, Gt, Gte, Exists, NotExists }
 
-public enum MutationOp { Set, Inc, Dec }
+public enum MutationOp { Set, Inc, Dec, Unset }
 
 /// <summary>A predicate on one top-level field of the target document.</summary>
 public sealed record UpdateCondition(string Field, ConditionOp Op, BsonValue? Value);
 
 /// <summary>A mutation of one top-level field. Inc/Dec require a numeric field
-/// (an absent field is treated as 0); Set replaces the value outright.</summary>
+/// (an absent field is treated as 0); Set replaces the value outright; Unset
+/// removes the field (a no-op if it was already absent, so PATCH is idempotent).</summary>
 public sealed record UpdateOperation(string Field, MutationOp Op, BsonValue? Value);
 
 public enum ConditionalUpdateStatus

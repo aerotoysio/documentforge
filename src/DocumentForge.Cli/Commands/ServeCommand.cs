@@ -369,8 +369,9 @@ public static class ServeCommand
         Console.WriteLine();
         Console.WriteLine("  app API:   POST /query | GET /stats | GET /collections | POST /collections/{name}");
         Console.WriteLine("             POST /collections/{name}/bulk");
-        Console.WriteLine("             GET|DELETE|PUT /collections/{name}/{id}                (by internal _id)");
-        Console.WriteLine("             GET|DELETE|PUT /collections/{name}/by/{field}/{value}  (by any field)");
+        Console.WriteLine("             GET|DELETE|PUT|PATCH /collections/{name}/{id}          (by internal _id)");
+        Console.WriteLine("             GET|DELETE|PUT|PATCH /collections/{name}/by/{field}/{value} (by any field)");
+        Console.WriteLine("             PATCH body: {field:val, x:null} merge  or  {\"$ops\":[{field,op,value}]}");
         Console.WriteLine("             DELETE /collections/{name} | GET /indexes/{collection} | POST /index");
         Console.WriteLine("             POST /tx/batch                  (atomic multi-doc transaction)");
         Console.WriteLine("             POST /seed | GET /health | GET /version");
@@ -674,6 +675,37 @@ public static class ServeCommand
         {
             if (!IsValidCollectionName(name)) return Task.FromResult(InvalidCollectionNameResult());
             return ConditionalUpdateHandler.Handle(db, name, id, request);
+        });
+
+        // Issue #70 — partial-document update (PATCH). Applies a shallow JSON
+        // merge (fields to set; null removes) or an explicit { "$ops": [...] }
+        // list, atomically under the write lock — no client read-modify-write.
+        // Optional If-Match header pins the update to a specific _etag (412 on
+        // mismatch). 200 on success, 404 not found.
+        app.MapPatch("/collections/{name}/{id}", (string name, string id, HttpRequest request) =>
+        {
+            if (!IsValidCollectionName(name)) return Task.FromResult(InvalidCollectionNameResult());
+            return PatchHandler.Handle(db, name, id, request);
+        });
+
+        // PATCH by business key — resolves {field}={value} to an _id (honouring
+        // indexes) then applies the same merge/$ops patch.
+        app.MapPatch("/collections/{name}/by/{field}/{value}", async (string name, string field, string value, HttpRequest request) =>
+        {
+            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
+            if (!IsValidFieldPath(field))
+                return Results.BadRequest(new { error = "Field name must match [a-zA-Z_][a-zA-Z0-9_.\\[\\]]*" });
+
+            var coll = db.GetCollection(name);
+            if (coll is null) return Results.NotFound();
+
+            var safeValue = value.Replace("'", "''");
+            var found = db.Execute($"SELECT * FROM {name} WHERE {field} = '{safeValue}' LIMIT 1");
+            if (!found.Success) return Results.BadRequest(new { error = found.Message, code = found.ErrorCode });
+            if (found.Documents.Count == 0) return Results.NotFound();
+
+            var docId = found.Documents[0].GetId();
+            return await PatchHandler.Handle(db, name, docId.ToString(), request);
         });
 
         // Replace by business key. Finds the first document where {field} = {value}

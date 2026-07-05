@@ -1122,6 +1122,18 @@ public static class DatabaseEndpoints
             return ConditionalUpdateHandler.Handle(db, collection, id, request);
         });
 
+        // Issue #70 — scoped partial-document update (PATCH). Shallow merge
+        // (null removes) or explicit { "$ops": [...] }, atomic under the write
+        // lock, with optional If-Match ETag concurrency (412 on mismatch).
+        app.MapPatch("/db/{name}/collections/{collection}/{id}",
+            (HttpContext ctx, string name, string collection, string id, HttpRequest request) =>
+        {
+            if (ScopeCheck.RequireDbWrite(ctx, name) is { } deny) return Task.FromResult(deny);
+            var db = registry.TryGet(name);
+            if (db is null) return Task.FromResult(Results.NotFound(new { error = $"Database '{name}' is not attached." }));
+            return PatchHandler.Handle(db, collection, id, request);
+        });
+
         // Scoped delete by internal _id.
         app.MapDelete("/db/{name}/collections/{collection}/{id}", (HttpContext ctx, string name, string collection, string id) =>
         {

@@ -223,6 +223,107 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
         Assert.Equal(HttpStatusCode.OK, ok.StatusCode);
     }
 
+    // ---- Issue #70: partial-document PATCH over the scoped data plane ----
+
+    private static async Task<HttpResponseMessage> PatchJson(string url, string json, string? ifMatch = null)
+    {
+        var req = new HttpRequestMessage(HttpMethod.Patch, url)
+        {
+            Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json")
+        };
+        if (ifMatch is not null) req.Headers.TryAddWithoutValidation("If-Match", ifMatch);
+        return await _http.SendAsync(req);
+    }
+
+    [Fact]
+    public async Task Patch_MergeBody_SetsAndUnsetsFields()
+    {
+        var (registry, baseUrl, dataDir) = BootServer();
+        registry.AttachOrCreate("shop", Path.Combine(dataDir, "shop.dfdb"));
+        var db = registry.Get("shop");
+        var id = db.Insert("orders", """{"pnr":"P1","status":"new","tmp":"scratch"}""");
+
+        var resp = await PatchJson($"{baseUrl}/db/shop/collections/orders/{id}",
+            """{"status":"shipped","tracking":"1Z999","tmp":null}""");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var doc = db.GetCollection("orders")!.FindById(id)!;
+        Assert.Equal("shipped", doc["status"].AsString);
+        Assert.Equal("1Z999", doc["tracking"].AsString);
+        Assert.False(doc.ContainsKey("tmp"));   // null in a merge removes the field
+        Assert.Equal("P1", doc["pnr"].AsString); // untouched fields survive
+    }
+
+    [Fact]
+    public async Task Patch_OpsBody_IncrementsCounterAtomically()
+    {
+        var (registry, baseUrl, dataDir) = BootServer();
+        registry.AttachOrCreate("shop", Path.Combine(dataDir, "shop.dfdb"));
+        var db = registry.Get("shop");
+        var id = db.Insert("stock", """{"sku":"A","sold":10}""");
+
+        var resp = await PatchJson($"{baseUrl}/db/shop/collections/stock/{id}",
+            """{"$ops":[{"field":"sold","op":"inc","value":5},{"field":"lastOp","op":"set","value":"sale"}]}""");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var doc = db.GetCollection("stock")!.FindById(id)!;
+        Assert.Equal(15, doc["sold"].AsInt32);
+        Assert.Equal("sale", doc["lastOp"].AsString);
+    }
+
+    [Fact]
+    public async Task Patch_IfMatch_Mismatch_Returns412_AndWritesNothing()
+    {
+        var (registry, baseUrl, dataDir) = BootServer();
+        registry.AttachOrCreate("shop", Path.Combine(dataDir, "shop.dfdb"));
+        var db = registry.Get("shop");
+        var id = db.Insert("orders", """{"pnr":"P2","status":"new"}""");
+
+        var resp = await PatchJson($"{baseUrl}/db/shop/collections/orders/{id}",
+            """{"status":"shipped"}""", ifMatch: "\"not-the-real-etag\"");
+        Assert.Equal(HttpStatusCode.PreconditionFailed, resp.StatusCode);
+
+        var doc = db.GetCollection("orders")!.FindById(id)!;
+        Assert.Equal("new", doc["status"].AsString); // guard held: nothing written
+    }
+
+    [Fact]
+    public async Task Patch_IfMatch_CurrentEtag_Succeeds()
+    {
+        var (registry, baseUrl, dataDir) = BootServer();
+        registry.AttachOrCreate("shop", Path.Combine(dataDir, "shop.dfdb"));
+        var db = registry.Get("shop");
+        var id = db.Insert("orders", """{"pnr":"P3","status":"new"}""");
+        var etag = db.GetCollection("orders")!.FindById(id)!.GetEtag();
+
+        var resp = await PatchJson($"{baseUrl}/db/shop/collections/orders/{id}",
+            """{"status":"paid"}""", ifMatch: etag);
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        Assert.Equal("paid", db.GetCollection("orders")!.FindById(id)!["status"].AsString);
+    }
+
+    [Fact]
+    public async Task Patch_MissingDocument_Returns404()
+    {
+        var (registry, baseUrl, dataDir) = BootServer();
+        registry.AttachOrCreate("shop", Path.Combine(dataDir, "shop.dfdb"));
+        var resp = await PatchJson($"{baseUrl}/db/shop/collections/orders/{Guid.NewGuid()}",
+            """{"status":"x"}""");
+        Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
+    }
+
+    [Fact]
+    public async Task Patch_ImmutableId_Rejected()
+    {
+        var (registry, baseUrl, dataDir) = BootServer();
+        registry.AttachOrCreate("shop", Path.Combine(dataDir, "shop.dfdb"));
+        var db = registry.Get("shop");
+        var id = db.Insert("orders", """{"pnr":"P4"}""");
+        var resp = await PatchJson($"{baseUrl}/db/shop/collections/orders/{id}",
+            """{"_id":"hacked"}""");
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
     [Fact]
     public async Task GetDatabases_MultipleAttached_AllReturned()
     {
