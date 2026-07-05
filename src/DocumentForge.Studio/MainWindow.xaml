@@ -178,8 +178,8 @@
                 <MenuItem Header="_Refresh All" Command="{Binding RefreshAllCommand}" InputGestureText="F5"/>
             </MenuItem>
             <MenuItem Header="_Cluster">
-                <MenuItem Header="_Open cluster.json…" Command="{Binding OpenClusterFileCommand}"/>
-                <MenuItem Header="_New cluster.json…" Command="{Binding NewClusterFileCommand}"/>
+                <MenuItem Header="_New cluster…" Command="{Binding NewClusterFileCommand}"/>
+                <MenuItem Header="_Open cluster…" Command="{Binding OpenClusterFileCommand}"/>
             </MenuItem>
             <MenuItem Header="_Help">
                 <MenuItem Header="_SQL Reference…" Command="{Binding OpenSqlReferenceCommand}"/>

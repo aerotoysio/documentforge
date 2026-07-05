@@ -11,6 +11,9 @@
         <ToolBarTray DockPanel.Dock="Top" IsLocked="True">
             <ToolBar>
                 <Button Content="💾 Save" Command="{Binding SaveCommand}" Padding="8,2"/>
+                <Button Content="⬇ Export…" Command="{Binding ExportCommand}" Padding="8,2"
+                        ToolTip="Write a copy of this cluster config to another file"/>
+                <Separator/>
                 <Button Content="🩺 Check health" Command="{Binding CheckHealthCommand}" Padding="8,2"/>
                 <Separator/>
                 <TextBlock Text="{Binding SummaryText}" VerticalAlignment="Center" Margin="4,0"/>
@@ -21,6 +24,24 @@
 
         <ScrollViewer VerticalScrollBarVisibility="Auto">
             <StackPanel Margin="14">
+                <!-- Load the live config from a running router instead of hunting for the file -->
+                <Border Background="#EEF4FF" BorderBrush="#B9D0F5" BorderThickness="1" CornerRadius="4"
+                        Padding="10,7" Margin="0,0,0,14">
+                    <StackPanel>
+                        <TextBlock Text="Load from a running cluster" FontWeight="SemiBold"/>
+                        <TextBlock Foreground="Gray" FontSize="11" Margin="0,2,0,6" TextWrapping="Wrap"
+                                   Text="Pull the live config straight from a running dfdb router (its GET /cluster/config) so you edit what the cluster is actually running. Applying edits is still file-based — save, then restart the router. Studio can't push config to a live router yet."/>
+                        <StackPanel Orientation="Horizontal">
+                            <ComboBox IsEditable="True" Width="240"
+                                      Text="{Binding RouterEndpoint, UpdateSourceTrigger=PropertyChanged}"
+                                      ItemsSource="{Binding ShardEndpointSuggestions}"
+                                      ToolTip="Endpoint of a running `dfdb router`, e.g. http://localhost:5100"/>
+                            <Button Content="⤓ Load live config" Command="{Binding LoadFromRouterCommand}"
+                                    Padding="10,2" Margin="8,0,0,0"/>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
                 <TextBlock Text="Shards" FontSize="15" FontWeight="SemiBold"/>
                 <TextBlock Foreground="Gray" FontSize="11" Margin="0,2,0,6" TextWrapping="Wrap"
                            Text="Each shard is a node (or a leader+followers replication group). Data is spread across shards by the consistent-hash ring."/>
@@ -90,10 +111,10 @@
                 <Border Background="#FFF8E6" BorderBrush="#F0E0A0" BorderThickness="1" CornerRadius="4"
                         Padding="10,7" Margin="0,20,0,0">
                     <TextBlock TextWrapping="Wrap" FontSize="11" Foreground="#665500">
-                        Studio edits this cluster.json and health-checks shards. Live rebalancing runs through the
-                        engine (issue for HTTP rebalance endpoints is tracked). Known engine caveats to keep in mind:
-                        cross-shard AVG is currently inaccurate (#99) and the CLI router uses a different hash than the
-                        engine ring (#100).
+                        Studio edits your cluster config and health-checks shards. The router reads this config at
+                        startup, so applying changes means saving the file and restarting the router (a live push
+                        endpoint is tracked). Known engine caveats: cross-shard AVG is currently inaccurate (#99) and
+                        the CLI router uses a different hash than the engine ring (#100).
                     </TextBlock>
                 </Border>
             </StackPanel>

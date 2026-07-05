@@ -1,3 +1,5 @@
+using System.Net.Http;
+using System.Net.Http.Headers;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
@@ -33,6 +35,26 @@ public sealed class ClusterConfig
 
     public static ClusterConfig Load(string path) => FromJson(File.ReadAllText(path));
     public void Save(string path) => File.WriteAllText(path, ToJson());
+
+    /// <summary>Pull the live cluster config from a running <c>dfdb router</c>'s
+    /// <c>GET /cluster/config</c> endpoint, so you can edit what the cluster is
+    /// actually running instead of hunting for the file on disk. The router owns
+    /// the config; Studio can read it but cannot (yet) push changes back — save
+    /// the result to a file and restart the router to apply.</summary>
+    public static async Task<ClusterConfig> LoadFromRouterAsync(
+        string routerEndpoint, string? apiKey = null, TimeSpan? timeout = null, CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(routerEndpoint))
+            throw new ArgumentException("Router endpoint is required.", nameof(routerEndpoint));
+
+        var baseUrl = routerEndpoint.Trim().TrimEnd('/');
+        using var http = new HttpClient { Timeout = timeout ?? TimeSpan.FromSeconds(10) };
+        if (!string.IsNullOrWhiteSpace(apiKey))
+            http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+
+        var json = await http.GetStringAsync($"{baseUrl}/cluster/config", ct);
+        return FromJson(json);
+    }
 }
 
 public sealed class ShardDescriptor
