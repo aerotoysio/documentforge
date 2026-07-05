@@ -14,13 +14,22 @@ public sealed record ApiKeyRow(string Id, string Scopes, string? Description, st
 public sealed partial class ApiKeysDocumentViewModel : DocumentViewModel
 {
     private readonly IDfConnection _connection;
+    private readonly Func<Task> _onSecure;
 
-    public ApiKeysDocumentViewModel(IDfConnection connection)
+    public ApiKeysDocumentViewModel(IDfConnection connection, Func<Task> onSecure)
     {
         _connection = connection;
+        _onSecure = onSecure;
         Title = $"API Keys — {connection.Descriptor.Name}";
         ContentId = $"keys:{connection.Descriptor.Id}";
     }
+
+    /// <summary>True when this connection has no API key — i.e. the server is
+    /// (probably) in open dev-mode. Drives the "secure this server" banner.</summary>
+    public bool IsUnsecured => _connection.Descriptor.ApiKeySecretId is null;
+
+    [RelayCommand]
+    private Task Secure() => _onSecure();
 
     public ObservableCollection<ApiKeyRow> Keys { get; } = new();
 
