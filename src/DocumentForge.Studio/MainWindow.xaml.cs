@@ -16,6 +16,7 @@ public partial class MainWindow : Window
         InitializeComponent();
         _viewModel = new MainViewModel(workspace, new DialogService(this, workspace));
         DataContext = _viewModel;
+        Loaded += async (_, _) => await _viewModel.ReconnectSavedAsync();
     }
 
     // AvalonDock owns the tab lifecycle; mirror a closed document back into the

@@ -1,3 +1,5 @@
+using System.Text.Json.Serialization;
+
 namespace DocumentForge.Studio.Core.Connections;
 
 public enum ConnectionKind
@@ -38,5 +40,6 @@ public sealed class ConnectionDescriptor
 
     public DateTime? LastConnectedUtc { get; set; }
 
+    [JsonIgnore]
     public string Target => Kind == ConnectionKind.File ? FilePath ?? "" : Url ?? "";
 }

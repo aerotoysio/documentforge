@@ -91,6 +91,44 @@ public sealed partial class MainViewModel : ObservableObject
         StatusText = $"Disconnected from {server.Connection.Descriptor.Name}";
     }
 
+    /// <summary>On startup, quietly reconnect saved connections so the Object
+    /// Explorer isn't empty after a relaunch. Failures are non-fatal (a down
+    /// service is skipped with a status note, no error dialog).</summary>
+    public async Task ReconnectSavedAsync()
+    {
+        if (!_workspace.Settings.ReconnectOnStartup || _workspace.Connections.Count == 0) return;
+
+        var ordered = _workspace.Connections.OrderByDescending(c => c.LastConnectedUtc).ToList();
+        var reconnected = 0;
+        var failed = 0;
+        StatusText = "Reconnecting saved connections…";
+
+        foreach (var descriptor in ordered)
+        {
+            if (Servers.Any(s => s.Connection.Descriptor.Id == descriptor.Id)) continue;
+            IDfConnection? connection = null;
+            try
+            {
+                connection = _workspace.CreateConnection(descriptor);
+                await connection.ConnectAsync();
+                var node = new ServerNodeViewModel(this, connection);
+                Servers.Add(node);
+                node.IsExpanded = true;
+                reconnected++;
+            }
+            catch
+            {
+                if (connection is not null) await connection.DisposeAsync();
+                failed++;
+            }
+        }
+
+        StatusText = reconnected == 0 && failed == 0
+            ? "Ready"
+            : $"Reconnected {reconnected} saved connection(s)" +
+              (failed > 0 ? $"; {failed} unavailable (use Connect to retry)" : "");
+    }
+
     [RelayCommand]
     private async Task NewDatabaseAsync()
     {
