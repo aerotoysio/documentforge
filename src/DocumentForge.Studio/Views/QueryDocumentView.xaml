@@ -18,7 +18,8 @@
         <!-- Toolbar -->
         <ToolBarTray Grid.Row="0" IsLocked="True">
             <ToolBar>
-                <Button x:Name="RunButton" Click="OnRun" ToolTip="Execute (F5)" Padding="8,2">▶ Run</Button>
+                <Button x:Name="RunButton" Click="OnRun" Padding="8,2"
+                        ToolTip="Execute (F5). Runs the selected text if any, otherwise the whole editor.">▶ Run</Button>
                 <Button Command="{Binding CancelCommand}" ToolTip="Cancel" Padding="8,2">■ Cancel</Button>
                 <Separator/>
                 <TextBlock Text="Database:" VerticalAlignment="Center" Margin="4,0,4,0"/>
@@ -28,9 +29,18 @@
                 <TextBox Text="{Binding RowLimit}" Width="56" Margin="4,0,0,0" VerticalAlignment="Center"
                          ToolTip="Auto-append LIMIT to unbounded SELECTs"/>
                 <Separator/>
+                <TextBlock Text="Timeout (s):" VerticalAlignment="Center" Margin="4,0,4,0"/>
+                <TextBox Text="{Binding TimeoutSeconds}" Width="44" VerticalAlignment="Center"
+                         ToolTip="Auto-cancel the query after N seconds (0 = no timeout)"/>
+                <Separator/>
                 <TextBlock Text="History:" VerticalAlignment="Center" Margin="4,0,4,0"/>
                 <ComboBox x:Name="HistoryCombo" Width="240" ItemsSource="{Binding History}"
                           SelectionChanged="OnHistorySelected" ToolTip="Re-run a previous query"/>
+                <Separator/>
+                <Button Content="❔ SQL Help" Padding="8,2"
+                        Command="{Binding DataContext.OpenSqlReferenceCommand,
+                            RelativeSource={RelativeSource AncestorType=Window}}"
+                        ToolTip="Open the DocumentForge SQL reference"/>
             </ToolBar>
         </ToolBarTray>
 
@@ -55,13 +65,32 @@
             </StatusBar>
             <TabControl SelectedIndex="{Binding SelectedResultTab}">
                 <TabItem Header="Results">
-                    <DataGrid ItemsSource="{Binding ResultView}"
-                              IsReadOnly="True" AutoGenerateColumns="True"
-                              CanUserSortColumns="True" CanUserResizeColumns="True"
-                              SelectionMode="Extended" SelectionUnit="CellOrRowHeader"
-                              EnableRowVirtualization="True" EnableColumnVirtualization="True"
-                              HeadersVisibility="All" GridLinesVisibility="All"
-                              FontFamily="Consolas" FontSize="12"/>
+                    <DockPanel>
+                        <Border DockPanel.Dock="Top" Background="#FFFDE7" Padding="8,4"
+                                BorderBrush="#F0E0A0" BorderThickness="0,0,0,1"
+                                Visibility="{Binding IsGridEditable, Converter={StaticResource BoolToVis}}">
+                            <TextBlock TextWrapping="Wrap" FontSize="11" Foreground="#665500">
+                                ✎ Editing enabled — edit a cell and press Enter to save (ETag-guarded);
+                                right-click a row to delete. <Run FontStyle="Italic" Text="_id and _etag are read-only."/>
+                            </TextBlock>
+                        </Border>
+                        <DataGrid x:Name="ResultsGrid" ItemsSource="{Binding ResultView}"
+                                  IsReadOnly="{Binding IsGridReadOnly}" AutoGenerateColumns="True"
+                                  AutoGeneratingColumn="OnAutoGeneratingColumn"
+                                  CellEditEnding="OnCellEditEnding"
+                                  CanUserSortColumns="True" CanUserResizeColumns="True"
+                                  CanUserAddRows="False" CanUserDeleteRows="False"
+                                  SelectionMode="Extended" SelectionUnit="CellOrRowHeader"
+                                  EnableRowVirtualization="True" EnableColumnVirtualization="True"
+                                  HeadersVisibility="All" GridLinesVisibility="All"
+                                  FontFamily="Consolas" FontSize="12">
+                            <DataGrid.ContextMenu>
+                                <ContextMenu>
+                                    <MenuItem Header="Delete Row…" Click="OnDeleteRow"/>
+                                </ContextMenu>
+                            </DataGrid.ContextMenu>
+                        </DataGrid>
+                    </DockPanel>
                 </TabItem>
                 <TabItem Header="JSON">
                     <TextBox Text="{Binding JsonText, Mode=OneWay}" IsReadOnly="True"

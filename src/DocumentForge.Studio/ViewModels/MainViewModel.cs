@@ -3,6 +3,7 @@ using System.IO;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using DocumentForge.Studio.Core.Connections;
+using DocumentForge.Studio.Core.Query;
 using DocumentForge.Studio.Services;
 using DocumentForge.Studio.Core.Settings;
 
@@ -28,6 +29,15 @@ public sealed partial class MainViewModel : ObservableObject
 
     [ObservableProperty]
     private DocumentViewModel? _activeDocument;
+
+    // Remembers the last query tab the user worked in, so the SQL Reference can
+    // insert into it even while the reference tab itself is focused.
+    private QueryDocumentViewModel? _lastActiveQuery;
+
+    partial void OnActiveDocumentChanged(DocumentViewModel? value)
+    {
+        if (value is QueryDocumentViewModel q) _lastActiveQuery = q;
+    }
 
     [ObservableProperty]
     private string _statusText = "Ready";
@@ -83,11 +93,62 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
+    /// <summary>Opens a direct-file connection to a .dfdb path (used by the
+    /// file association / "Open with"). Not saved — it's an ad-hoc open.</summary>
+    public async Task OpenFileConnectionAsync(string filePath)
+    {
+        var descriptor = new ConnectionDescriptor
+        {
+            Name = System.IO.Path.GetFileNameWithoutExtension(filePath),
+            Kind = ConnectionKind.File,
+            FilePath = filePath,
+        };
+        await OpenConnectionAsync(descriptor, apiKey: null, save: false);
+    }
+
     public async Task DisconnectAsync(ServerNodeViewModel server)
     {
         Servers.Remove(server);
         await server.Connection.DisposeAsync();
         StatusText = $"Disconnected from {server.Connection.Descriptor.Name}";
+    }
+
+    /// <summary>On startup, quietly reconnect saved connections so the Object
+    /// Explorer isn't empty after a relaunch. Failures are non-fatal (a down
+    /// service is skipped with a status note, no error dialog).</summary>
+    public async Task ReconnectSavedAsync()
+    {
+        if (!_workspace.Settings.ReconnectOnStartup || _workspace.Connections.Count == 0) return;
+
+        var ordered = _workspace.Connections.OrderByDescending(c => c.LastConnectedUtc).ToList();
+        var reconnected = 0;
+        var failed = 0;
+        StatusText = "Reconnecting saved connections…";
+
+        foreach (var descriptor in ordered)
+        {
+            if (Servers.Any(s => s.Connection.Descriptor.Id == descriptor.Id)) continue;
+            IDfConnection? connection = null;
+            try
+            {
+                connection = _workspace.CreateConnection(descriptor);
+                await connection.ConnectAsync();
+                var node = new ServerNodeViewModel(this, connection);
+                Servers.Add(node);
+                node.IsExpanded = true;
+                reconnected++;
+            }
+            catch
+            {
+                if (connection is not null) await connection.DisposeAsync();
+                failed++;
+            }
+        }
+
+        StatusText = reconnected == 0 && failed == 0
+            ? "Ready"
+            : $"Reconnected {reconnected} saved connection(s)" +
+              (failed > 0 ? $"; {failed} unavailable (use Connect to retry)" : "");
     }
 
     [RelayCommand]
@@ -171,6 +232,121 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
+    /// <summary>Prompts for and creates an index on a collection, then refreshes
+    /// the collection node so the new index appears in the tree. Index DDL runs
+    /// as SQL, so it works identically over HTTP and direct-file connections.</summary>
+    public async Task CreateIndexAsync(CollectionNodeViewModel collection)
+    {
+        var request = _dialogs.ShowNewIndexDialog(collection.Name);
+        if (request is null) return;
+
+        var sql = SqlText.BuildCreateIndex(request.Collection, request.Name, request.Paths, request.Unique);
+        try
+        {
+            var result = await collection.Database.Server.Connection.ExecuteAsync(collection.Database.Info.Name, sql);
+            if (!result.Success)
+            {
+                _dialogs.ShowError("Create index failed", result.Message ?? "Unknown error.");
+                return;
+            }
+            await collection.RefreshAsync();
+            StatusText = $"Index '{request.Name}' created on {request.Collection}";
+        }
+        catch (Exception ex)
+        {
+            _dialogs.ShowError("Create index failed", ex.Message);
+        }
+    }
+
+    /// <summary>Inserts a new document into a collection. Seeds the editor with a
+    /// template derived from an existing document (minus _id/_etag) so the user
+    /// starts from the collection's real shape.</summary>
+    public async Task InsertDocumentAsync(CollectionNodeViewModel collection)
+    {
+        var connection = collection.Database.Server.Connection;
+        var database = collection.Database.Info.Name;
+
+        string template;
+        try
+        {
+            var sample = await connection.ExecuteAsync(database, $"SELECT * FROM {collection.Name} LIMIT 1");
+            template = JsonDocumentTools.TemplateFromSample(sample.Documents.FirstOrDefault());
+        }
+        catch
+        {
+            template = JsonDocumentTools.TemplateFromSample(null);
+        }
+
+        var json = _dialogs.ShowInsertDocumentDialog(collection.Name, template);
+        if (json is null) return;
+
+        try
+        {
+            var id = await connection.InsertDocumentAsync(database, collection.Name, json);
+            StatusText = $"Inserted document {id} into {collection.Name}";
+        }
+        catch (Exception ex)
+        {
+            _dialogs.ShowError("Insert failed", ex.Message);
+        }
+    }
+
+    public async Task DropCollectionAsync(CollectionNodeViewModel collection)
+    {
+        if (!_dialogs.Confirm("Drop collection",
+                $"Drop collection '{collection.Name}' and all its documents and indexes?\n\nThis cannot be undone."))
+            return;
+        try
+        {
+            var dropped = await collection.Database.Server.Connection.DropCollectionAsync(
+                collection.Database.Info.Name, collection.Name);
+            await collection.Database.RefreshAsync();
+            StatusText = dropped ? $"Collection '{collection.Name}' dropped" : $"Collection '{collection.Name}' not found";
+        }
+        catch (Exception ex)
+        {
+            _dialogs.ShowError("Drop collection failed", ex.Message);
+        }
+    }
+
+    public async Task CompactCollectionAsync(CollectionNodeViewModel collection)
+    {
+        try
+        {
+            var result = await collection.Database.Server.Connection.CompactCollectionAsync(
+                collection.Database.Info.Name, collection.Name);
+            StatusText = $"Compacted '{collection.Name}': {result.BytesReclaimed:N0} bytes reclaimed " +
+                         $"({result.PagesCompacted:N0} pages, {result.TimeMs:F0} ms)";
+        }
+        catch (Exception ex)
+        {
+            _dialogs.ShowError("Compact failed", ex.Message);
+        }
+    }
+
+    public async Task DropIndexAsync(IndexNodeViewModel index, CollectionNodeViewModel owner)
+    {
+        if (!_dialogs.Confirm("Drop index", $"Drop index '{index.Info.Name}' on {owner.Name}?"))
+            return;
+
+        try
+        {
+            var result = await owner.Database.Server.Connection.ExecuteAsync(
+                owner.Database.Info.Name, SqlText.BuildDropIndex(index.Info.Name));
+            if (!result.Success)
+            {
+                _dialogs.ShowError("Drop index failed", result.Message ?? "Unknown error.");
+                return;
+            }
+            await owner.RefreshAsync();
+            StatusText = $"Index '{index.Info.Name}' dropped";
+        }
+        catch (Exception ex)
+        {
+            _dialogs.ShowError("Drop index failed", ex.Message);
+        }
+    }
+
     [RelayCommand]
     private async Task RefreshAllAsync()
     {
@@ -227,6 +403,66 @@ public sealed partial class MainViewModel : ObservableObject
     }
 
     [RelayCommand]
+    private void OpenClusterFile()
+    {
+        var path = _dialogs.PickOpenFile("Cluster config (*.json)|*.json|All files (*.*)|*.*");
+        if (path is null) return;
+        try
+        {
+            var config = Core.Cluster.ClusterConfig.Load(path);
+            OpenCluster(config, path);
+        }
+        catch (Exception ex)
+        {
+            _dialogs.ShowError("Open cluster config failed", ex.Message);
+        }
+    }
+
+    [RelayCommand]
+    private void NewClusterFile() => OpenCluster(new Core.Cluster.ClusterConfig(), null);
+
+    private void OpenCluster(Core.Cluster.ClusterConfig config, string? path)
+    {
+        var contentId = path is null ? null : $"cluster:{path}";
+        if (contentId is not null)
+        {
+            var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
+            if (existing is not null) { ActiveDocument = existing; return; }
+        }
+        var document = new ClusterDocumentViewModel(config, path, _dialogs);
+        Documents.Add(document);
+        ActiveDocument = document;
+        StatusText = path is null ? "New cluster config" : $"Cluster — {System.IO.Path.GetFileName(path)}";
+    }
+
+    [RelayCommand]
+    private void OpenSqlReference()
+    {
+        var existing = Documents.FirstOrDefault(d => d.ContentId == "sqlref");
+        if (existing is not null) { ActiveDocument = existing; return; }
+        Documents.Add(new SqlReferenceDocumentViewModel(InsertSqlSnippet));
+        ActiveDocument = Documents[^1];
+    }
+
+    /// <summary>Inserts a reference snippet into the most-recently-used query tab,
+    /// or falls back to the clipboard when none is open.</summary>
+    private void InsertSqlSnippet(string snippet)
+    {
+        if (_lastActiveQuery is not null && Documents.Contains(_lastActiveQuery))
+        {
+            _lastActiveQuery.RequestInsert(snippet);
+            ActiveDocument = _lastActiveQuery;
+            StatusText = "Inserted snippet into query.";
+        }
+        else
+        {
+            try { System.Windows.Clipboard.SetText(snippet); } catch { }
+            _dialogs.ShowInfo("No query tab open",
+                "There's no query tab to insert into, so the snippet was copied to the clipboard. Open a query (right-click a database → New Query) and paste it.");
+        }
+    }
+
+    [RelayCommand]
     private void About() => _dialogs.ShowInfo(
         "About DocumentForge Studio",
         $"{VersionText}\n\nSSMS-style management for DocumentForge — the SQL-queryable JSON document database.\n" +
@@ -245,6 +481,71 @@ public sealed partial class MainViewModel : ObservableObject
         Documents.Add(document);
         ActiveDocument = document;
         StatusText = $"New query on {database}";
+    }
+
+    /// <summary>Opens (or re-focuses) the backups panel for a server.</summary>
+    public void OpenBackups(ServerNodeViewModel server)
+    {
+        var contentId = $"backups:{server.Connection.Descriptor.Id}";
+        var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
+        if (existing is not null) { ActiveDocument = existing; return; }
+
+        var document = new BackupsDocumentViewModel(server.Connection);
+        Documents.Add(document);
+        ActiveDocument = document;
+        StatusText = $"Backups — {server.Connection.Descriptor.Name}";
+    }
+
+    /// <summary>Opens (or re-focuses) the API key manager for a server.</summary>
+    public void OpenApiKeys(ServerNodeViewModel server)
+    {
+        var contentId = $"keys:{server.Connection.Descriptor.Id}";
+        var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
+        if (existing is not null) { ActiveDocument = existing; return; }
+
+        var document = new ApiKeysDocumentViewModel(server.Connection);
+        Documents.Add(document);
+        ActiveDocument = document;
+        StatusText = $"API Keys — {server.Connection.Descriptor.Name}";
+    }
+
+    /// <summary>Opens (or re-focuses) the replication topology graph for a server.</summary>
+    public void OpenTopology(ServerNodeViewModel server)
+    {
+        var contentId = $"topo:{server.Connection.Descriptor.Id}";
+        var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
+        if (existing is not null) { ActiveDocument = existing; return; }
+
+        var document = new TopologyDocumentViewModel(server.Connection);
+        Documents.Add(document);
+        ActiveDocument = document;
+        StatusText = $"Topology — {server.Connection.Descriptor.Name}";
+    }
+
+    /// <summary>Opens (or re-focuses) the dashboard for a database.</summary>
+    public void OpenDashboard(DatabaseNodeViewModel database)
+    {
+        var contentId = $"dash:{database.Server.Connection.Descriptor.Id}:{database.Info.Name}";
+        var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
+        if (existing is not null) { ActiveDocument = existing; return; }
+
+        var document = new DashboardDocumentViewModel(database.Server.Connection, database.Info.Name);
+        Documents.Add(document);
+        ActiveDocument = document;
+        StatusText = $"Dashboard — {database.Info.Name}";
+    }
+
+    /// <summary>Opens (or re-focuses) the replication panel for a database.</summary>
+    public void OpenReplication(DatabaseNodeViewModel database)
+    {
+        var contentId = $"repl:{database.Server.Connection.Descriptor.Id}:{database.Info.Name}";
+        var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
+        if (existing is not null) { ActiveDocument = existing; return; }
+
+        var document = new ReplicationDocumentViewModel(database.Server.Connection, database.Info.Name);
+        Documents.Add(document);
+        ActiveDocument = document;
+        StatusText = $"Replication — {database.Info.Name}";
     }
 
     /// <summary>Opens a query tab against a server's default database (or its

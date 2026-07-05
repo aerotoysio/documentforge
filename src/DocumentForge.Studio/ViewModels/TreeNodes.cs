@@ -112,6 +112,8 @@ public sealed partial class ServerNodeViewModel : TreeNodeViewModel
 
     public IDfConnection Connection { get; }
 
+    public bool CanManageServer => Connection.Capabilities.HasFlag(ConnectionCapabilities.ServerAdmin);
+
     protected override async Task<IReadOnlyList<TreeNodeViewModel>> LoadChildrenAsync()
     {
         var databases = await Connection.GetDatabasesAsync();
@@ -123,6 +125,15 @@ public sealed partial class ServerNodeViewModel : TreeNodeViewModel
 
     [RelayCommand]
     private Task NewQuery() => _main.OpenQueryOnServerAsync(this);
+
+    [RelayCommand]
+    private void Topology() => _main.OpenTopology(this);
+
+    [RelayCommand]
+    private void ApiKeys() => _main.OpenApiKeys(this);
+
+    [RelayCommand]
+    private void Backups() => _main.OpenBackups(this);
 }
 
 public sealed partial class DatabaseNodeViewModel : TreeNodeViewModel
@@ -147,6 +158,9 @@ public sealed partial class DatabaseNodeViewModel : TreeNodeViewModel
 
     public bool CanDrop => Server.Connection.Capabilities.HasFlag(ConnectionCapabilities.DropDatabase);
 
+    /// <summary>Server-only features (replication, admin) are hidden for direct-file connections.</summary>
+    public bool CanManageServer => Server.Connection.Capabilities.HasFlag(ConnectionCapabilities.ServerAdmin);
+
     protected override async Task<IReadOnlyList<TreeNodeViewModel>> LoadChildrenAsync()
     {
         var collections = await Server.Connection.GetCollectionNamesAsync(Info.Name);
@@ -158,6 +172,12 @@ public sealed partial class DatabaseNodeViewModel : TreeNodeViewModel
 
     [RelayCommand]
     private void NewQuery() => _main.OpenQuery(Server.Connection, Info.Name);
+
+    [RelayCommand]
+    private void Dashboard() => _main.OpenDashboard(this);
+
+    [RelayCommand]
+    private void Replication() => _main.OpenReplication(this);
 
     [RelayCommand]
     private Task PropertiesAsync() => _main.ShowDatabasePropertiesAsync(this);
@@ -185,7 +205,7 @@ public sealed partial class CollectionNodeViewModel : TreeNodeViewModel
     protected override async Task<IReadOnlyList<TreeNodeViewModel>> LoadChildrenAsync()
     {
         var indexes = await Database.Server.Connection.GetIndexesAsync(Database.Info.Name, Name);
-        var nodes = indexes.Select(i => (TreeNodeViewModel)new IndexNodeViewModel(i)).ToList();
+        var nodes = indexes.Select(i => (TreeNodeViewModel)new IndexNodeViewModel(this, _main, i)).ToList();
         return [new FolderNodeViewModel($"Indexes ({nodes.Count})", nodes)];
     }
 
@@ -197,16 +217,36 @@ public sealed partial class CollectionNodeViewModel : TreeNodeViewModel
 
     [RelayCommand]
     private void NewQuery() => _main.OpenQuery(Database.Server.Connection, Database.Info.Name);
+
+    [RelayCommand]
+    private Task InsertDocument() => _main.InsertDocumentAsync(this);
+
+    [RelayCommand]
+    private Task NewIndex() => _main.CreateIndexAsync(this);
+
+    [RelayCommand]
+    private Task Compact() => _main.CompactCollectionAsync(this);
+
+    [RelayCommand]
+    private Task DropCollection() => _main.DropCollectionAsync(this);
 }
 
-public sealed class IndexNodeViewModel : TreeNodeViewModel
+public sealed partial class IndexNodeViewModel : TreeNodeViewModel
 {
-    public IndexNodeViewModel(IndexInfo info)
+    private readonly CollectionNodeViewModel _collection;
+    private readonly MainViewModel _main;
+
+    public IndexNodeViewModel(CollectionNodeViewModel collection, MainViewModel main, IndexInfo info)
     {
+        _collection = collection;
+        _main = main;
         Info = info;
         Name = $"{info.Name}  ({info.JsonPath}){(info.IsUnique ? "  [unique]" : "")}";
         Glyph = "🔑";
     }
 
     public IndexInfo Info { get; }
+
+    [RelayCommand]
+    private Task Drop() => _main.DropIndexAsync(this, _collection);
 }

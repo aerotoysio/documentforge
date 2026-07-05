@@ -1,0 +1,91 @@
+<UserControl x:Class="DocumentForge.Studio.Views.DashboardView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="clr-namespace:DocumentForge.Studio.ViewModels"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             mc:Ignorable="d"
+             d:DataContext="{d:DesignInstance vm:DashboardDocumentViewModel}">
+    <UserControl.Resources>
+        <Style x:Key="Card" TargetType="Border">
+            <Setter Property="Background" Value="#F7F8FA"/>
+            <Setter Property="BorderBrush" Value="#E4E4E4"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="CornerRadius" Value="6"/>
+            <Setter Property="Padding" Value="14,10"/>
+            <Setter Property="Margin" Value="0,0,10,10"/>
+            <Setter Property="MinWidth" Value="150"/>
+        </Style>
+        <Style x:Key="CardLabel" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="Gray"/>
+            <Setter Property="FontSize" Value="11"/>
+        </Style>
+        <Style x:Key="CardValue" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="20"/>
+            <Setter Property="FontWeight" Value="Light"/>
+            <Setter Property="Margin" Value="0,2,0,0"/>
+        </Style>
+    </UserControl.Resources>
+
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="16">
+            <DockPanel>
+                <Button DockPanel.Dock="Right" Content="🔄 Refresh" Padding="10,4" Command="{Binding RefreshCommand}"/>
+                <StackPanel>
+                    <TextBlock Text="{Binding Database}" FontSize="22" FontWeight="Light"/>
+                    <TextBlock Text="{Binding HealthLine}" Foreground="Gray" Margin="0,2,0,0"/>
+                </StackPanel>
+            </DockPanel>
+
+            <!-- Health banner -->
+            <Border Background="{Binding HealthFill}" BorderBrush="{Binding HealthStroke}" BorderThickness="1"
+                    CornerRadius="6" Padding="12,9" Margin="0,14,0,14">
+                <StackPanel>
+                    <TextBlock Text="{Binding Recommendation}" FontWeight="SemiBold"/>
+                    <TextBlock Text="{Binding RecommendationDetail}" TextWrapping="Wrap" Margin="0,4,0,0"
+                               Visibility="{Binding RecommendationDetail, Converter={StaticResource NonEmptyToVis}}"/>
+                    <TextBlock Text="{Binding LockHolder}" Foreground="#555" FontSize="11" Margin="0,4,0,0"
+                               Visibility="{Binding LockHolder, Converter={StaticResource NonEmptyToVis}}"/>
+                </StackPanel>
+            </Border>
+
+            <!-- Stat cards -->
+            <WrapPanel>
+                <Border Style="{StaticResource Card}">
+                    <StackPanel><TextBlock Text="File size" Style="{StaticResource CardLabel}"/>
+                        <TextBlock Text="{Binding FileSizeText}" Style="{StaticResource CardValue}"/></StackPanel>
+                </Border>
+                <Border Style="{StaticResource Card}">
+                    <StackPanel><TextBlock Text="Pages" Style="{StaticResource CardLabel}"/>
+                        <TextBlock Text="{Binding PagesText}" Style="{StaticResource CardValue}"/></StackPanel>
+                </Border>
+                <Border Style="{StaticResource Card}">
+                    <StackPanel><TextBlock Text="Collections" Style="{StaticResource CardLabel}"/>
+                        <TextBlock Text="{Binding CollectionsText}" Style="{StaticResource CardValue}"/></StackPanel>
+                </Border>
+                <Border Style="{StaticResource Card}">
+                    <StackPanel><TextBlock Text="Documents" Style="{StaticResource CardLabel}"/>
+                        <TextBlock Text="{Binding DocumentsText}" Style="{StaticResource CardValue}"/></StackPanel>
+                </Border>
+                <Border Style="{StaticResource Card}">
+                    <StackPanel><TextBlock Text="Page cache" Style="{StaticResource CardLabel}"/>
+                        <TextBlock Text="{Binding CacheText}" FontSize="13" Margin="0,4,0,0"/></StackPanel>
+                </Border>
+            </WrapPanel>
+
+            <TextBlock Text="{Binding FilesBreakdown}" Foreground="#555" FontSize="11" Margin="0,2,0,0"/>
+
+            <!-- Collections -->
+            <TextBlock Text="Collections" FontWeight="SemiBold" Margin="0,16,0,4"/>
+            <DataGrid ItemsSource="{Binding Collections}" AutoGenerateColumns="False" IsReadOnly="True"
+                      HeadersVisibility="Column" CanUserAddRows="False" GridLinesVisibility="Horizontal"
+                      MaxHeight="320" FontSize="12">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="Name" Binding="{Binding Name}" Width="*"/>
+                    <DataGridTextColumn Header="Documents" Binding="{Binding DocumentCount, StringFormat=N0}" Width="140"/>
+                    <DataGridTextColumn Header="Indexes" Binding="{Binding IndexCount}" Width="100"/>
+                </DataGrid.Columns>
+            </DataGrid>
+        </StackPanel>
+    </ScrollViewer>
+</UserControl>

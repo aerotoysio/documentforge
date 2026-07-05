@@ -98,6 +98,8 @@ The skeleton everything else hangs off.
 - WAL archiving: enable/disable per DB, status + segment list.
 - API key manager: list/create (scopes picker `db:name`, `admin`)/revoke; created key shown once with copy button.
 - Maintenance actions: flush/checkpoint, rebuild indexes, seed sample data (dev convenience).
+- **Service settings editor** (Andrew request, 2026-07-04): view/edit the node's `node.json` from Studio — port, data dir, security (api key / TLS / scoped keys), replication role, backup config. Live-editable subset (backup config) uses `PUT /admin/backup/config`; restart-required fields (port, data dir) need a new engine settings GET/PUT API + a "restart service to apply" prompt (only when Studio manages a local bundled service — see Phase 6). Tracked as engine issue for the settings API.
+- **Local service lifecycle** (pairs with the bundled `dfdb.exe` from Phase 6): start/stop/restart a local DF service from Studio, pre-filled to the standard DF port.
 
 ### Phase 5 — Replication & cluster
 - Replication panel per DB: role, seq/lag, followers; actions: start leader (port), start follower (leader host/port), promote (with force confirm), read-only/read-write toggle, auto-failover enable/disable.

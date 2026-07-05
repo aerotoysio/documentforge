@@ -1,0 +1,45 @@
+<Window x:Class="DocumentForge.Studio.Views.NewIndexDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="New Index"
+        Width="480" SizeToContent="Height"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize" ShowInTaskbar="False">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <DockPanel Grid.Row="0" Margin="0,0,0,10">
+            <TextBlock Text="Collection:" VerticalAlignment="Center" Width="90"/>
+            <TextBlock x:Name="CollectionText" VerticalAlignment="Center" FontWeight="SemiBold"/>
+        </DockPanel>
+
+        <DockPanel Grid.Row="1" Margin="0,0,0,4">
+            <TextBlock Text="Path(s):" VerticalAlignment="Center" Width="90"/>
+            <TextBox x:Name="PathBox" TextChanged="OnPathChanged"/>
+        </DockPanel>
+        <TextBlock Grid.Row="2" Foreground="Gray" FontSize="11" Margin="90,0,0,10" TextWrapping="Wrap"
+                   Text="JSON path, e.g. pnr or passenger.lastName. Comma-separate for a composite index (e.g. status, createdAt)."/>
+
+        <DockPanel Grid.Row="3" Margin="0,0,0,10">
+            <TextBlock Text="Name:" VerticalAlignment="Center" Width="90"/>
+            <CheckBox x:Name="UniqueCheck" DockPanel.Dock="Right" Content="Unique" VerticalAlignment="Center"
+                      Margin="12,0,0,0"/>
+            <TextBox x:Name="NameBox"/>
+        </DockPanel>
+
+        <TextBlock Grid.Row="4" x:Name="PreviewText" Foreground="#267F99" FontFamily="Consolas" FontSize="12"
+                   Margin="90,0,0,12" TextWrapping="Wrap"/>
+
+        <StackPanel Grid.Row="5" Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button Content="Create" Width="80" Margin="0,0,8,0" IsDefault="True" Click="OnCreate"/>
+            <Button Content="Cancel" Width="80" IsCancel="True"/>
+        </StackPanel>
+    </Grid>
+</Window>

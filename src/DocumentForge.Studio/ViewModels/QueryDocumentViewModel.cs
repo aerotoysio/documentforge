@@ -24,11 +24,18 @@ public sealed partial class QueryDocumentViewModel : DocumentViewModel
         Title = $"Query — {database}";
         LimitRows = true;
         RowLimit = workspace.Settings.DefaultQueryLimit;
+        TimeoutSeconds = workspace.Settings.DefaultQueryTimeoutSeconds;
         ReloadHistory();
     }
 
     public string Database { get; }
     public string ConnectionName => _connection.Descriptor.Name;
+
+    /// <summary>Raised when something (e.g. the SQL Reference panel) wants to
+    /// drop text into this tab's editor. The view inserts it at the caret.</summary>
+    public event Action<string>? InsertTextRequested;
+
+    public void RequestInsert(string text) => InsertTextRequested?.Invoke(text);
 
     /// <summary>Seed text the view drops into the editor on load.</summary>
     public string InitialSql { get; }
@@ -41,11 +48,37 @@ public sealed partial class QueryDocumentViewModel : DocumentViewModel
     [ObservableProperty]
     private int _rowLimit;
 
+    /// <summary>Auto-cancel the query after this many seconds (0 = no timeout).</summary>
+    [ObservableProperty]
+    private int _timeoutSeconds;
+
     [ObservableProperty]
     private bool _isBusy;
 
     [ObservableProperty]
     private DataView? _resultView;
+
+    // Backing table + the original JSON per row, kept in lockstep so an edited
+    // cell can be written back to the right document by _id/_etag.
+    private DataTable? _resultTable;
+    private List<string> _documents = new();
+
+    /// <summary>Non-null when the result is a single-collection SELECT whose rows
+    /// carry _id + _etag — i.e. the grid can write edits back.</summary>
+    [ObservableProperty]
+    private string? _editableCollection;
+
+    /// <summary>Bound to DataGrid.IsReadOnly (true = read-only).</summary>
+    public bool IsGridReadOnly => EditableCollection is null;
+
+    /// <summary>True when the grid is editable — drives the "editing on" banner.</summary>
+    public bool IsGridEditable => EditableCollection is not null;
+
+    partial void OnEditableCollectionChanged(string? value)
+    {
+        OnPropertyChanged(nameof(IsGridReadOnly));
+        OnPropertyChanged(nameof(IsGridEditable));
+    }
 
     [ObservableProperty]
     private string _jsonText = "";
@@ -83,6 +116,8 @@ public sealed partial class QueryDocumentViewModel : DocumentViewModel
         Messages = "Executing…";
         StatusSummary = "Executing…";
         _cts = new CancellationTokenSource();
+        if (TimeoutSeconds > 0) _cts.CancelAfter(TimeSpan.FromSeconds(TimeoutSeconds));
+        var started = Environment.TickCount64;
         try
         {
             var result = await _connection.ExecuteAsync(Database, effective, _cts.Token);
@@ -103,13 +138,27 @@ public sealed partial class QueryDocumentViewModel : DocumentViewModel
             var verb = SqlText.LeadingKeyword(sql);
             if (result.Documents.Count > 0 || verb == "SELECT")
             {
-                ResultView = ResultTable.Build(result.Documents).DefaultView;
+                _documents = result.Documents.ToList();
+                _resultTable = ResultTable.Build(result.Documents);
+                ResultView = _resultTable.DefaultView;
                 JsonText = ResultTable.PrettyJson(result.Documents);
                 SelectedResultTab = 0;
+
+                // Editable only when the rows are addressable documents: a
+                // single-collection SELECT whose rows carry _id and _etag.
+                EditableCollection =
+                    SqlText.TrySelectSingleCollection(sql, out var coll)
+                    && _resultTable.Columns.Contains("_id")
+                    && _resultTable.Columns.Contains("_etag")
+                        ? coll
+                        : null;
             }
             else
             {
+                _documents = new();
+                _resultTable = null;
                 ResultView = null;
+                EditableCollection = null;
                 JsonText = "";
                 SelectedResultTab = 2;
             }
@@ -127,8 +176,12 @@ public sealed partial class QueryDocumentViewModel : DocumentViewModel
         }
         catch (OperationCanceledException)
         {
-            Messages = "Query canceled.";
-            StatusSummary = "Canceled";
+            var elapsedSec = (Environment.TickCount64 - started) / 1000.0;
+            var timedOut = TimeoutSeconds > 0 && elapsedSec >= TimeoutSeconds - 0.5;
+            Messages = timedOut
+                ? $"Query canceled after the {TimeoutSeconds}s timeout. Increase \"Timeout (s)\" or add a tighter WHERE/LIMIT."
+                : "Query canceled.";
+            StatusSummary = timedOut ? $"Timed out ({TimeoutSeconds}s)" : "Canceled";
             SelectedResultTab = 2;
         }
         catch (Exception ex)
@@ -148,6 +201,89 @@ public sealed partial class QueryDocumentViewModel : DocumentViewModel
 
     [RelayCommand(CanExecute = nameof(CanCancel))]
     private void Cancel() => _cts?.Cancel();
+
+    /// <summary>Writes a single edited cell back to its document via an
+    /// ETag-guarded update. Called by the view after a grid cell commits.
+    /// Reverts the cell and reports the reason if anything goes wrong.</summary>
+    public async Task CommitCellEditAsync(DataRow row, string field)
+    {
+        if (_resultTable is null || EditableCollection is not { } collection) return;
+
+        var rowIndex = _resultTable.Rows.IndexOf(row);
+        if (rowIndex < 0 || rowIndex >= _documents.Count) return;
+
+        var originalJson = _documents[rowIndex];
+        var id = DocumentEdit.ReadField(originalJson, "_id");
+        var etag = DocumentEdit.ReadField(originalJson, "_etag");
+
+        var newCell = row[field] == DBNull.Value ? null : row[field]?.ToString();
+        var oldCell = ResultTable.RenderField(originalJson, field);
+        if (string.Equals(newCell, oldCell, StringComparison.Ordinal)) return; // no-op
+
+        if (id is null || etag is null)
+        {
+            RevertCell(row, field, originalJson);
+            SetEditMessage("This row can't be edited (no _id/_etag).");
+            return;
+        }
+
+        string updatedJson;
+        try { updatedJson = DocumentEdit.ApplyCellEdit(originalJson, field, newCell); }
+        catch (Exception ex) { RevertCell(row, field, originalJson); SetEditMessage(ex.Message); return; }
+
+        try
+        {
+            var newEtag = await _connection.UpdateDocumentAsync(Database, collection, id, updatedJson, etag);
+            _documents[rowIndex] = DocumentEdit.ApplyCellEdit(updatedJson, "_etag", newEtag);
+            row["_etag"] = newEtag; // reflect the fresh token so the next edit succeeds
+            SetEditMessage($"Updated {collection} document {id} ({field}).");
+        }
+        catch (EtagConflictException)
+        {
+            RevertCell(row, field, originalJson);
+            SetEditMessage($"Conflict: {collection} document {id} changed since it was read. Re-run the query and try again.");
+        }
+        catch (Exception ex)
+        {
+            RevertCell(row, field, originalJson);
+            SetEditMessage($"Update failed: {ex.Message}");
+        }
+    }
+
+    /// <summary>Deletes the document behind a grid row. The view confirms first.</summary>
+    public async Task DeleteRowAsync(DataRow row)
+    {
+        if (_resultTable is null || EditableCollection is not { } collection) return;
+        var rowIndex = _resultTable.Rows.IndexOf(row);
+        if (rowIndex < 0 || rowIndex >= _documents.Count) return;
+
+        var id = DocumentEdit.ReadField(_documents[rowIndex], "_id");
+        if (id is null) { SetEditMessage("This row can't be deleted (no _id)."); return; }
+
+        try
+        {
+            await _connection.DeleteDocumentAsync(Database, collection, id);
+            _resultTable.Rows.Remove(row);
+            _documents.RemoveAt(rowIndex);
+            SetEditMessage($"Deleted {collection} document {id}.");
+        }
+        catch (Exception ex)
+        {
+            SetEditMessage($"Delete failed: {ex.Message}");
+        }
+    }
+
+    private void RevertCell(DataRow row, string field, string originalJson)
+    {
+        var original = ResultTable.RenderField(originalJson, field);
+        row[field] = (object?)original ?? DBNull.Value;
+    }
+
+    private void SetEditMessage(string message)
+    {
+        Messages = message;
+        StatusSummary = message;
+    }
 
     private void ReloadHistory()
     {

@@ -1,0 +1,72 @@
+<UserControl x:Class="DocumentForge.Studio.Views.ApiKeysView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="clr-namespace:DocumentForge.Studio.ViewModels"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             mc:Ignorable="d"
+             d:DataContext="{d:DesignInstance vm:ApiKeysDocumentViewModel}">
+    <DockPanel Margin="14">
+        <TextBlock DockPanel.Dock="Top" Text="API Keys" FontSize="18" FontWeight="Light"/>
+        <TextBlock DockPanel.Dock="Bottom" Text="{Binding StatusMessage}" Margin="0,8,0,0" TextWrapping="Wrap"/>
+
+        <!-- One-time secret banner -->
+        <Border DockPanel.Dock="Top" Background="#E6F7EC" BorderBrush="#2E8B57" BorderThickness="1"
+                CornerRadius="5" Padding="12,8" Margin="0,10,0,0"
+                Visibility="{Binding CreatedSecret, Converter={StaticResource NonEmptyToVis}}">
+            <StackPanel>
+                <TextBlock Text="New key secret — copy it now, it cannot be retrieved again:" FontWeight="SemiBold"/>
+                <DockPanel Margin="0,6,0,0">
+                    <Button DockPanel.Dock="Right" Content="Copy" Padding="10,2" Margin="8,0,0,0" Command="{Binding CopySecretCommand}"/>
+                    <Button DockPanel.Dock="Right" Content="Dismiss" Padding="10,2" Margin="8,0,0,0" Command="{Binding DismissSecretCommand}"/>
+                    <TextBox Text="{Binding CreatedSecret, Mode=OneWay}" IsReadOnly="True" FontFamily="Consolas"
+                             VerticalContentAlignment="Center"/>
+                </DockPanel>
+            </StackPanel>
+        </Border>
+
+        <!-- Create -->
+        <Border DockPanel.Dock="Top" BorderBrush="#E4E4E4" BorderThickness="1" CornerRadius="5" Padding="12" Margin="0,10,0,10">
+            <StackPanel>
+                <TextBlock Text="Create a key" FontWeight="SemiBold"/>
+                <TextBlock Foreground="Gray" FontSize="11" Margin="0,2,0,2" TextWrapping="Wrap"
+                           Text="Scopes (comma-separated): admin (full access), db:&lt;name&gt; (read+write one DB), db:&lt;name&gt;:read (read-only)."/>
+                <TextBlock Foreground="#B00" FontSize="11" Margin="0,0,0,6" TextWrapping="Wrap"
+                           Text="⚠ On a dev-mode server (no auth yet), creating the FIRST key immediately locks the server down. Include an 'admin' scope (or reconnect with the new key) or you'll lose admin access."/>
+                <DockPanel>
+                    <Button DockPanel.Dock="Right" Content="Create key" Padding="12,3" Margin="8,0,0,0"
+                            Command="{Binding CreateCommand}"/>
+                    <TextBox Text="{Binding NewDescription, UpdateSourceTrigger=PropertyChanged}" Width="180"
+                             ToolTip="Description (optional)"/>
+                    <TextBox Text="{Binding NewScopes, UpdateSourceTrigger=PropertyChanged}" Margin="8,0,0,0"
+                             ToolTip="Scopes, e.g. db:orders, db:crm:read"/>
+                </DockPanel>
+            </StackPanel>
+        </Border>
+
+        <!-- Existing keys -->
+        <DockPanel>
+            <Button DockPanel.Dock="Top" HorizontalAlignment="Left" Content="🔄 Refresh" Padding="8,2" Margin="0,0,0,6"
+                    Command="{Binding RefreshCommand}"/>
+            <DataGrid ItemsSource="{Binding Keys}" AutoGenerateColumns="False" IsReadOnly="True"
+                      HeadersVisibility="Column" CanUserAddRows="False" GridLinesVisibility="Horizontal" FontSize="12">
+                <DataGrid.Columns>
+                    <DataGridTextColumn Header="Id" Binding="{Binding Id}" Width="220" FontFamily="Consolas"/>
+                    <DataGridTextColumn Header="Scopes" Binding="{Binding Scopes}" Width="*"/>
+                    <DataGridTextColumn Header="Description" Binding="{Binding Description}" Width="180"/>
+                    <DataGridTextColumn Header="Created" Binding="{Binding CreatedAt}" Width="Auto"/>
+                    <DataGridTemplateColumn Width="80">
+                        <DataGridTemplateColumn.CellTemplate>
+                            <DataTemplate>
+                                <Button Content="Revoke" Padding="4,0" Margin="2"
+                                        Command="{Binding DataContext.RevokeCommand,
+                                            RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                        CommandParameter="{Binding}"/>
+                            </DataTemplate>
+                        </DataGridTemplateColumn.CellTemplate>
+                    </DataGridTemplateColumn>
+                </DataGrid.Columns>
+            </DataGrid>
+        </DockPanel>
+    </DockPanel>
+</UserControl>

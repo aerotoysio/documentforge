@@ -23,6 +23,50 @@ public interface IDfConnection : IAsyncDisposable
     Task<DatabaseStats> GetStatsAsync(string database, CancellationToken ct = default);
     Task<ServerHealth> GetHealthAsync(CancellationToken ct = default);
 
+    /// <summary>Per-database health + diagnostics (recommendation states, file
+    /// sizes, lock holder).</summary>
+    Task<DatabaseHealthReport> GetDatabaseHealthAsync(string database, CancellationToken ct = default);
+
+    /// <summary>Replaces a document by its internal <c>_id</c>, guarded by its
+    /// <c>_etag</c> (optimistic concurrency). Returns the new ETag. Throws
+    /// <see cref="EtagConflictException"/> if the document changed since it was
+    /// read, or <see cref="KeyNotFoundException"/> if it no longer exists.</summary>
+    Task<string> UpdateDocumentAsync(string database, string collection, string id, string json, string expectedEtag, CancellationToken ct = default);
+
+    /// <summary>Deletes a document by its internal <c>_id</c>.</summary>
+    Task DeleteDocumentAsync(string database, string collection, string id, CancellationToken ct = default);
+
+    /// <summary>Inserts a new document (raw JSON) into a collection, returning its
+    /// assigned internal <c>_id</c>. The collection is created if it doesn't exist.</summary>
+    Task<string> InsertDocumentAsync(string database, string collection, string json, CancellationToken ct = default);
+
+    /// <summary>Drops a collection and its indexes. Returns false if it didn't exist.</summary>
+    Task<bool> DropCollectionAsync(string database, string collection, CancellationToken ct = default);
+
+    /// <summary>Defragments a collection, reclaiming space from deleted documents.</summary>
+    Task<CompactionInfo> CompactCollectionAsync(string database, string collection, CancellationToken ct = default);
+
+    // --- Backups (server connections only; requires ServerAdmin) ---
+
+    Task<IReadOnlyList<BackupInfo>> GetBackupsAsync(CancellationToken ct = default);
+    Task<BackupInfo> TakeBackupAsync(string database, CancellationToken ct = default);
+    Task DeleteBackupAsync(string backupId, CancellationToken ct = default);
+    /// <summary>Restores a backup as a new database. Returns the new database's file path.</summary>
+    Task<string> RestoreBackupAsync(string backupId, string newDatabaseName, CancellationToken ct = default);
+
+    // --- API keys (server connections only; requires ServerAdmin) ---
+
+    Task<IReadOnlyList<ApiKeyInfo>> GetApiKeysAsync(CancellationToken ct = default);
+    Task<CreatedApiKey> CreateApiKeyAsync(string? description, IReadOnlyList<string> scopes, CancellationToken ct = default);
+    Task RevokeApiKeyAsync(string id, CancellationToken ct = default);
+
+    // --- Replication (server connections only; requires ServerAdmin) ---
+
+    Task<ReplicationStatus> GetReplicationStatusAsync(string database, CancellationToken ct = default);
+    Task StartReplicationLeaderAsync(string database, int port, CancellationToken ct = default);
+    Task StartReplicationFollowerAsync(string database, string leaderHost, int leaderPort, CancellationToken ct = default);
+    Task PromoteReplicaAsync(string database, int port, CancellationToken ct = default);
+
     /// <summary>Requires <see cref="ConnectionCapabilities.CreateDatabase"/>.</summary>
     Task<DatabaseInfo> CreateDatabaseAsync(string name, CancellationToken ct = default);
 

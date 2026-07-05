@@ -20,6 +20,56 @@ public sealed record DatabaseStats(
 
 public sealed record ServerHealth(bool Healthy, string Status, string? Version, string? Detail);
 
+public sealed record ApiKeyInfo(string Id, IReadOnlyList<string> Scopes, string? Description, string? CreatedAt);
+
+/// <summary>A freshly-minted key. <see cref="Secret"/> is shown once and never
+/// retrievable again.</summary>
+public sealed record CreatedApiKey(string Id, string Secret, IReadOnlyList<string> Scopes, string? Description);
+
+public sealed record CompactionInfo(long PagesCompacted, long BytesReclaimed, double TimeMs);
+
+public sealed record BackupInfo(string Id, string Database, string? Path, long SizeBytes, string? CreatedAtUtc, string? Kind);
+
+/// <summary>Per-database health + diagnostics. Recommendation is one of
+/// "healthy" / "rebuild-catalog" / "recovery-pending" / "engine-degraded".</summary>
+public sealed record DatabaseHealthReport(
+    string HealthStatus,
+    bool ReadOnly,
+    int CollectionCount,
+    long TotalDocuments,
+    long DataSizeBytes,
+    long RecoveryLogBytes,
+    long WalBytes,
+    bool SnapshotMarkerPresent,
+    string? LockHolder,
+    string Recommendation,
+    string? RecommendationDetail);
+
+/// <summary>A follower peer as seen from a leader.</summary>
+public sealed record ReplicationFollowerInfo(string Endpoint, string? HttpEndpoint, long LagSeq, string? ConnectedAtUtc = null)
+{
+    /// <summary>Caught up with the leader (no known lag).</summary>
+    public bool InSync => LagSeq == 0;
+
+    public string StatusText => LagSeq == 0 ? "in sync" : $"lagging ({LagSeq:N0} behind)";
+}
+
+/// <summary>Per-database replication state. Role is "leader", "follower", or
+/// "none". Leader fields populate when this DB leads; follower fields when it
+/// follows.</summary>
+public sealed record ReplicationStatus(
+    string Role,
+    bool ReadOnly,
+    long CurrentSeq,
+    int LeaderPort,
+    int FollowerCount,
+    IReadOnlyList<ReplicationFollowerInfo> Followers,
+    long FollowerLastAppliedSeq,
+    long OpsApplied,
+    bool GapsDetected,
+    bool AutoFailoverPromoted,
+    string? FollowerLeaderEndpoint);
+
 /// <summary>Transport-neutral query result. Documents are raw JSON strings so
 /// the UI can render them without another round-trip through a BSON type.</summary>
 public sealed record StudioQueryResult(

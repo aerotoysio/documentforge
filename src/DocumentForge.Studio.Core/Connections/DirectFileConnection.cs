@@ -101,6 +101,95 @@ public sealed class DirectFileConnection : IDfConnection
             Detail: db.LastHealthFailure?.Message));
     }
 
+    public Task<DatabaseHealthReport> GetDatabaseHealthAsync(string database, CancellationToken ct = default) =>
+        Task.Run(() =>
+        {
+            var db = EnsureConnected();
+            var stats = db.GetStatistics();
+            long totalDocs = stats.Collections.Sum(c => c.DocumentCount);
+            var healthy = db.HealthStatus == DatabaseHealthStatus.Healthy;
+            long RecoverySize(string suffix)
+            {
+                var fi = new FileInfo(db.FilePath + suffix);
+                return fi.Exists ? fi.Length : 0;
+            }
+            return new DatabaseHealthReport(
+                HealthStatus: db.HealthStatus.ToString(),
+                ReadOnly: db.IsReadOnly,
+                CollectionCount: stats.Collections.Count,
+                TotalDocuments: totalDocs,
+                DataSizeBytes: stats.FileSize,
+                RecoveryLogBytes: RecoverySize(".recovery"),
+                WalBytes: RecoverySize(".wal"),
+                SnapshotMarkerPresent: File.Exists(db.FilePath + ".snapshot.incoming.seq"),
+                LockHolder: "this Studio (direct-file)",
+                Recommendation: healthy ? "healthy" : "engine-degraded",
+                RecommendationDetail: healthy ? null : db.LastHealthFailure?.Message);
+        }, ct);
+
+    public Task<string> UpdateDocumentAsync(string database, string collection, string id, string json, string expectedEtag, CancellationToken ct = default) =>
+        Task.Run(() =>
+        {
+            var db = EnsureConnected();
+            var docId = new DocumentId(Guid.Parse(id));
+            try
+            {
+                var newEtag = db.ReplaceIfEtag(collection, docId, json, expectedEtag);
+                if (newEtag is null) throw new KeyNotFoundException($"Document '{id}' not found in '{collection}'.");
+                return newEtag;
+            }
+            catch (EtagMismatchException ex)
+            {
+                throw new EtagConflictException(ex.ExpectedEtag, ex.ActualEtag, ex.Message);
+            }
+        }, ct);
+
+    public Task DeleteDocumentAsync(string database, string collection, string id, CancellationToken ct = default) =>
+        Task.Run(() =>
+        {
+            var db = EnsureConnected();
+            var coll = db.GetCollection(collection)
+                       ?? throw new KeyNotFoundException($"Collection '{collection}' not found.");
+            var docId = new DocumentId(Guid.Parse(id));
+            var doc = coll.FindById(docId) ?? throw new KeyNotFoundException($"Document '{id}' not found.");
+            if (coll.Delete(docId)) db.NotifyDocDeleted(collection, docId, doc);
+        }, ct);
+
+    public Task<string> InsertDocumentAsync(string database, string collection, string json, CancellationToken ct = default) =>
+        Task.Run(() => EnsureConnected().Insert(collection, json).ToString(), ct);
+
+    public Task<bool> DropCollectionAsync(string database, string collection, CancellationToken ct = default) =>
+        Task.Run(() => EnsureConnected().DropCollection(collection), ct);
+
+    public Task<CompactionInfo> CompactCollectionAsync(string database, string collection, CancellationToken ct = default) =>
+        Task.Run(() =>
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var result = EnsureConnected().Compact(collection);
+            sw.Stop();
+            return new CompactionInfo(result.PagesCompacted, result.BytesReclaimed, sw.Elapsed.TotalMilliseconds);
+        }, ct);
+
+    private const string ServerOnly = "This is only available through a DocumentForge service, not a direct-file connection.";
+
+    public Task<IReadOnlyList<BackupInfo>> GetBackupsAsync(CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task<BackupInfo> TakeBackupAsync(string database, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task DeleteBackupAsync(string backupId, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task<string> RestoreBackupAsync(string backupId, string newDatabaseName, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+
+    public Task<IReadOnlyList<ApiKeyInfo>> GetApiKeysAsync(CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task<CreatedApiKey> CreateApiKeyAsync(string? description, IReadOnlyList<string> scopes, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task RevokeApiKeyAsync(string id, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+
+    private static Task ReplicationNotSupported() =>
+        throw new NotSupportedException("Replication is only available through a DocumentForge service, not a direct-file connection.");
+
+    public Task<ReplicationStatus> GetReplicationStatusAsync(string database, CancellationToken ct = default) =>
+        throw new NotSupportedException("Replication is only available through a DocumentForge service, not a direct-file connection.");
+    public Task StartReplicationLeaderAsync(string database, int port, CancellationToken ct = default) => ReplicationNotSupported();
+    public Task StartReplicationFollowerAsync(string database, string leaderHost, int leaderPort, CancellationToken ct = default) => ReplicationNotSupported();
+    public Task PromoteReplicaAsync(string database, int port, CancellationToken ct = default) => ReplicationNotSupported();
+
     public Task<DatabaseInfo> CreateDatabaseAsync(string name, CancellationToken ct = default) =>
         throw new NotSupportedException("A direct-file connection is a single database. Use File > New Database to create a new file.");
 

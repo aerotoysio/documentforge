@@ -1,7 +1,9 @@
+using System.Data;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Threading;
 using System.Xml;
 using DocumentForge.Studio.ViewModels;
 using ICSharpCode.AvalonEdit.Highlighting;
@@ -28,9 +30,19 @@ public partial class QueryDocumentView : UserControl
         // Seed once; re-entrant Loaded (tab re-selection) must not clobber edits.
         if (_editorSeeded || ViewModel is null) return;
         _editorSeeded = true;
+        ViewModel.InsertTextRequested += OnInsertTextRequested;
+        Unloaded += (_, _) => ViewModel.InsertTextRequested -= OnInsertTextRequested;
         Editor.Text = ViewModel.InitialSql;
         Editor.Focus();
         Editor.CaretOffset = Editor.Text.Length;
+    }
+
+    private void OnInsertTextRequested(string text)
+    {
+        var offset = Editor.CaretOffset;
+        Editor.Document.Insert(offset, text);
+        Editor.CaretOffset = offset + text.Length;
+        Editor.Focus();
     }
 
     private void OnEditorKeyDown(object? sender, KeyEventArgs e)
@@ -46,7 +58,45 @@ public partial class QueryDocumentView : UserControl
 
     private async Task RunAsync()
     {
-        if (ViewModel is { } vm) await vm.ExecuteAsync(Editor.Text);
+        if (ViewModel is not { } vm) return;
+        // SSMS behaviour: run the selection if there is one, else the whole editor.
+        var selection = Editor.SelectedText;
+        var sql = string.IsNullOrWhiteSpace(selection) ? Editor.Text : selection;
+        await vm.ExecuteAsync(sql);
+    }
+
+    // Keep the engine's own _id / _etag columns read-only even when the grid
+    // is editable — they're identity/concurrency tokens, not user data.
+    private void OnAutoGeneratingColumn(object? sender, DataGridAutoGeneratingColumnEventArgs e)
+    {
+        if (e.PropertyName is "_id" or "_etag")
+            e.Column.IsReadOnly = true;
+    }
+
+    private void OnCellEditEnding(object? sender, DataGridCellEditEndingEventArgs e)
+    {
+        if (e.EditAction != DataGridEditAction.Commit) return;
+        if (ViewModel is not { IsGridReadOnly: false } vm) return;
+        if (e.Row.Item is not DataRowView rowView) return;
+        var field = e.Column.Header?.ToString();
+        if (string.IsNullOrEmpty(field)) return;
+
+        var row = rowView.Row;
+        // Defer so the edited value is committed into the DataRow before we read it.
+        Dispatcher.BeginInvoke(
+            new Action(async () => await vm.CommitCellEditAsync(row, field)),
+            DispatcherPriority.Background);
+    }
+
+    private async void OnDeleteRow(object sender, RoutedEventArgs e)
+    {
+        if (ViewModel is not { IsGridReadOnly: false } vm) return;
+        if (ResultsGrid.CurrentItem is not DataRowView rowView) return;
+        if (MessageBox.Show(Window.GetWindow(this)!,
+                "Delete this document? This cannot be undone.",
+                "Delete document", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
+            return;
+        await vm.DeleteRowAsync(rowView.Row);
     }
 
     private void OnHistorySelected(object sender, SelectionChangedEventArgs e)
