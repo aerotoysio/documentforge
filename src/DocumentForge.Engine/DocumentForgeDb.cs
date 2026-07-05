@@ -19,8 +19,8 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     private readonly IndexManager _indexManager;
     private readonly QueryExecutor _queryExecutor;
     private readonly TransactionManager _transactionManager;
-    private readonly WalWriter? _walWriter;
     private readonly RecoveryLog? _recoveryLog;
+    private readonly bool _durableCommits;
     private ReplicationServer? _replicationServer;
     private ReplicationFollower? _replicationFollower;
     private LogicalReplicationServer? _logicalServer;
@@ -58,17 +58,21 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
 
         if (options.EnableWal)
         {
-            var walPath = filePath + ".wal";
-            _walWriter = new WalWriter(walPath);
+            // Recovery log = the engine's real write-ahead log (issues
+            // #89/#90): commit paths append page images + a fsync'd commit
+            // marker; Open replays sealed batches. The old ".wal"
+            // (WalWriter) logged payload-free markers nothing ever read —
+            // deleted as dead code; clean up its stale sidecar.
+            try { File.Delete(filePath + ".wal"); } catch { }
 
-            // Recovery log: logs page writes before they hit the data file
             var recoveryPath = filePath + ".recovery";
             _recoveryLog = new RecoveryLog(recoveryPath);
             _combinedHook = new CombinedPreFlushHook(new RecoveryLogHook(_recoveryLog));
             _pageCache.SetPreFlushHook(_combinedHook);
         }
+        _durableCommits = options.DurableCommits && options.EnableWal;
 
-        _transactionManager = new TransactionManager(_walWriter);
+        _transactionManager = new TransactionManager();
         _queryExecutor = new QueryExecutor(_catalog, _indexManager);
     }
 
@@ -85,6 +89,10 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         // evicted page if the data-file write was lost. Don't truncate —
         // we still need the entries for the next FlushAll's truncate cycle.
         public void EnsureLogDurable() => _log.Flush();
+        // Issues #89/#90: seal the pages logged since the last marker as one
+        // committed batch and fsync. This is the durability point of every
+        // acknowledged write.
+        public void OnCommitDurable() => _log.Commit();
     }
 
     /// <summary>
@@ -109,6 +117,10 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         {
             foreach (var h in _hooks) h.EnsureLogDurable();
         }
+        public void OnCommitDurable()
+        {
+            foreach (var h in _hooks) h.OnCommitDurable();
+        }
     }
 
     /// <summary>
@@ -123,6 +135,9 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         // Replication has no durability concept — broadcast is fire-and-forget;
         // followers reconnect on disconnect. Nothing to fsync here.
         public void EnsureLogDurable() { }
+        // Side benefit of commit-time capture: followers now receive pages at
+        // commit rather than at the next flush, shrinking replication lag.
+        public void OnCommitDurable() { }
     }
 
     public static DocumentForgeDb Create(string filePath, DatabaseOptions? options = null)
@@ -303,7 +318,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     {
         if (!File.Exists(recoveryPath)) return 0;
         var info = new FileInfo(recoveryPath);
-        if (info.Length == 0)
+        if (info.Length <= 8) // empty, or just the v2 file header
         {
             try { File.Delete(recoveryPath); } catch { }
             return 0;
@@ -312,7 +327,12 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         int recovered = 0;
         using (var dataStream = new FileStream(dataFilePath, FileMode.Open, FileAccess.Write, FileShare.None))
         {
-            foreach (var (pageId, pageData) in RecoveryLog.ReadAllRecords(recoveryPath))
+            // Issues #89/#90/#91: v2 logs replay only marker-sealed commit
+            // batches — a trailing unsealed batch is a crash mid-commit and
+            // is discarded, so partially-logged operations never surface.
+            // Legacy logs (incl. PITR-synthesized ones) replay every valid
+            // record, the pre-#89 behaviour.
+            foreach (var (pageId, pageData) in RecoveryLog.ReplayRecords(recoveryPath))
             {
                 dataStream.Seek(pageId.FileOffset, SeekOrigin.Begin);
                 dataStream.Write(pageData, 0, Constants.PageSize);
@@ -363,7 +383,9 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             // collection. Both halves run inside the same write lock so
             // concurrent readers never see the partial state.
             _indexManager.DropAllIndexesForCollection(name);
-            return _catalog.DropCollection(name);
+            var dropped = _catalog.DropCollection(name);
+            CommitDurableLocked();
+            return dropped;
         }
         finally
         {
@@ -481,6 +503,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                     var bytes = BsonSerializer.Serialize(doc);
                     _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, bytes);
                 }
+                CommitDurableLocked();
                 return id;
             });
         }
@@ -513,6 +536,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                 collection.Insert(doc);
                 count++;
             }
+            CommitDurableLocked();
             return count;
         }
         finally
@@ -587,11 +611,16 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                                 }
                             }
                         }
+                        // Seal the reverse-applied pages too: the rollback's
+                        // net-zero state must be what survives a crash, not
+                        // whatever an unrelated later commit happens to seal.
+                        CommitDurableLocked();
                         return new BulkInsertResult(Array.Empty<DocumentId>(), errors, RolledBack: true);
                     }
                 }
             }
 
+            CommitDurableLocked();
             return new BulkInsertResult(insertedIds, errors, RolledBack: false);
         }
         finally
@@ -648,6 +677,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                     var newBytes = BsonSerializer.Serialize(newDoc);
                     _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, newBytes);
                 }
+                CommitDurableLocked();
                 return true;
             });
         }
@@ -707,6 +737,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                 var newBytes = BsonSerializer.Serialize(newDoc);
                 _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, newBytes);
             }
+            CommitDurableLocked();
             return newDoc.GetEtag();
         }
         finally
@@ -771,6 +802,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                     updated++;
                 }
             }
+            CommitDurableLocked();
             return updated;
         }
         finally
@@ -902,7 +934,15 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             ThrowIfReadOnly();
             EnsureHealthy();
             _transactionManager.AcquireWriteLock();
-            try { return TrackHealth(() => _queryExecutor.Execute(query)); }
+            try
+            {
+                return TrackHealth(() =>
+                {
+                    var result = _queryExecutor.Execute(query);
+                    if (result.Success) CommitDurableLocked();
+                    return result;
+                });
+            }
             finally { _transactionManager.ReleaseWriteLock(); }
         }
         else
@@ -919,34 +959,47 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     {
         indexName ??= $"idx_{collectionName}_{jsonPath.Replace('.', '_').Replace('[', '_').Replace("]", "")}";
 
-        // Auto-create the collection if it doesn't exist yet — matches Insert /
-        // BulkInsert / BulkInsertTracked, which all go through GetOrCreateCollection.
-        // Issue #59: pre-fix CreateIndex was the odd one out, forcing the bootstrap
-        // pattern to call GetOrCreateCollection on every collection just to satisfy
-        // the index DDL that follows.
-        var collection = _catalog.GetOrCreateCollection(collectionName);
-
-        var definition = new IndexDefinition
+        // Issues #89/#90 brought this under the write lock: index DDL dirties
+        // catalog + index pages and must be sealed as its own WAL commit, not
+        // interleaved with a concurrent writer's pages. (It was previously the
+        // only mutating public API that ran unlocked.)
+        _transactionManager.AcquireWriteLock();
+        try
         {
-            Name = indexName,
-            CollectionName = new CollectionName(collectionName),
-            JsonPath = jsonPath,
-            IsUnique = unique
-        };
+            // Auto-create the collection if it doesn't exist yet — matches Insert /
+            // BulkInsert / BulkInsertTracked, which all go through GetOrCreateCollection.
+            // Issue #59: pre-fix CreateIndex was the odd one out, forcing the bootstrap
+            // pattern to call GetOrCreateCollection on every collection just to satisfy
+            // the index DDL that follows.
+            var collection = _catalog.GetOrCreateCollection(collectionName);
 
-        var index = _indexManager.CreateIndex(definition);
-        _indexManager.RebuildIndex(index, collection);
+            var definition = new IndexDefinition
+            {
+                Name = indexName,
+                CollectionName = new CollectionName(collectionName),
+                JsonPath = jsonPath,
+                IsUnique = unique
+            };
 
-        if (_indexCatalog.CatalogPage.IsValid)
-        {
-            _dataFile.SetIndexCatalogPage(_indexCatalog.CatalogPage);
+            var index = _indexManager.CreateIndex(definition);
+            _indexManager.RebuildIndex(index, collection);
+
+            if (_indexCatalog.CatalogPage.IsValid)
+            {
+                _dataFile.SetIndexCatalogPage(_indexCatalog.CatalogPage);
+            }
+
+            // Replicate index creation to read-only followers
+            if (_logicalServer is not null)
+            {
+                var data = SerializeIndexDefinition(indexName, jsonPath, unique);
+                _logicalServer.BroadcastNewOp(LogicalOpType.CreateIndex, collectionName, data);
+            }
+            CommitDurableLocked();
         }
-
-        // Replicate index creation to read-only followers
-        if (_logicalServer is not null)
+        finally
         {
-            var data = SerializeIndexDefinition(indexName, jsonPath, unique);
-            _logicalServer.BroadcastNewOp(LogicalOpType.CreateIndex, collectionName, data);
+            _transactionManager.ReleaseWriteLock();
         }
     }
 
@@ -985,7 +1038,6 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     {
         ThrowIfReadOnly();
         var id = _transactionManager.NextTransactionId();
-        _transactionManager.WriteBegin(id);
         return new Transaction(id, _transactionManager, this);
     }
 
@@ -1221,6 +1273,10 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         try
         {
             ApplyTransactionLocked(tx);
+            // Issue #91 — the whole working set was applied above; sealing it
+            // as ONE marker-delimited batch makes the transaction crash-atomic:
+            // replay either applies every page of the tx or none of them.
+            CommitDurableLocked();
         }
         finally
         {
@@ -1724,6 +1780,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                     // dispatch is here for future symmetry.
                 }
             }
+            CommitDurableLocked();
         }
         finally
         {
@@ -1886,6 +1943,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             var id = collection.Insert(doc);
             _indexManager.OnDocumentInserted(collectionName, id, doc);
             // DO NOT re-broadcast - followers don't replicate to other followers
+            CommitDurableLocked();
         }
         finally { _transactionManager.ReleaseWriteLock(); }
     }
@@ -1910,6 +1968,7 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             if (doc is null) return;
             collection.Delete(docId);
             _indexManager.OnDocumentDeleted(collectionName, docId, doc);
+            CommitDurableLocked();
         }
         finally { _transactionManager.ReleaseWriteLock(); }
     }
@@ -1958,7 +2017,6 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         try
         {
             _pageCache.FlushAll();
-            _walWriter?.Truncate();
         }
         finally
         {
@@ -1973,7 +2031,46 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         // to Healthy, but until then a manual Flush attempt is allowed and
         // simply re-throws if the underlying I/O is still broken). Wrap in
         // TrackHealth so a fresh failure flips the state.
-        TrackHealth(() => _pageCache.FlushAll());
+        //
+        // Issues #89/#90: taken under the write lock — FlushAll truncates the
+        // recovery log, and a concurrent commit appending records across that
+        // truncation would lose its durability record.
+        _transactionManager.AcquireWriteLock();
+        try
+        {
+            TrackHealth(() => _pageCache.FlushAll());
+        }
+        finally
+        {
+            _transactionManager.ReleaseWriteLock();
+        }
+    }
+
+    /// <summary>
+    /// Issues #89/#90 — the commit point of every write path. Seals the
+    /// pages the operation dirtied into the recovery log with a fsync'd
+    /// commit marker; on return the operation survives power loss (replay
+    /// on the next Open applies it). Called as the LAST step of each write
+    /// operation's success path, while the write lock is still held, so an
+    /// operation is never acknowledged before it is durable. No-op when
+    /// DurableCommits or EnableWal is off.
+    /// </summary>
+    // When the WAL passes this size, the next commit checkpoints (FlushAll)
+    // to fold its records into the data file and truncate it. Without this a
+    // low-write server with no manual Flush would grow the .recovery file
+    // forever — the flip side of making every commit append to it (#89).
+    private const long WalCheckpointThresholdBytes = 64L * 1024 * 1024;
+
+    internal void CommitDurableLocked()
+    {
+        if (!_durableCommits) return;
+        _pageCache.FlushCommit();
+        // Bound WAL growth. FlushAll runs under the write lock we already
+        // hold, writes dirty pages to the data file, fsyncs, and truncates
+        // the log — a self-checkpoint that keeps recovery-replay time and
+        // disk use bounded regardless of flush cadence.
+        if ((_recoveryLog?.Length ?? 0) > WalCheckpointThresholdBytes)
+            _pageCache.FlushAll();
     }
 
     /// <summary>
@@ -2056,7 +2153,6 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             try { _coordinatorTxLog?.Dispose(); } catch { }
             try { _pageCache.FlushAll(); } // also truncates the recovery log
             catch (Exception ex) { deferredFlushError = ex; }
-            try { _walWriter?.Dispose(); } catch { }
             try { _recoveryLog?.Dispose(); } catch { }
         }
         finally
@@ -2065,7 +2161,8 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             // close them, even when something earlier threw.
             try { _dataFile.Dispose(); } catch { }
             var recoveryPath = FilePath + ".recovery";
-            try { if (File.Exists(recoveryPath) && new FileInfo(recoveryPath).Length == 0) File.Delete(recoveryPath); } catch { }
+            // <= 8 bytes = just the v2 file header, i.e. no records — semantically empty.
+            try { if (File.Exists(recoveryPath) && new FileInfo(recoveryPath).Length <= 8) File.Delete(recoveryPath); } catch { }
             // Release the on-disk lock LAST so a clean shutdown still has
             // the file visible up through the data-file close. Releasing
             // earlier would briefly let a second opener race in while we're

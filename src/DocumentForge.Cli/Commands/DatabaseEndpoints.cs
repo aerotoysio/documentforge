@@ -618,13 +618,6 @@ public static class DatabaseEndpoints
                     "in the file the catalog doesn't point at — the catalog page that names them is " +
                     "probably zeroed. Use the Rebuild catalog flow to scan data pages and reconstruct it.";
             }
-            else if (recoveryInfo.Exists && recoveryInfo.Length > 0)
-            {
-                recommendation = "recovery-pending";
-                recommendationDetail =
-                    $"Recovery log has {recoveryInfo.Length:N0} bytes of un-replayed page writes. " +
-                    "These get applied automatically on the next service restart.";
-            }
             else if (db.HealthStatus != Core.DatabaseHealthStatus.Healthy)
             {
                 recommendation = "engine-degraded";
@@ -652,7 +645,12 @@ public static class DatabaseEndpoints
                 files = new
                 {
                     dataSizeBytes = dataInfo.Length,
-                    recoveryLogBytes = recoveryInfo.Exists ? recoveryInfo.Length : 0L,
+                    // Payload bytes only: a live WAL always carries an 8-byte
+                    // format header, and holding committed-but-not-checkpointed
+                    // records is the normal healthy state under fsync-on-commit
+                    // (issues #89/#90) — not "pending recovery". Header-only
+                    // reads as 0.
+                    recoveryLogBytes = recoveryInfo.Exists && recoveryInfo.Length > 8 ? recoveryInfo.Length - 8 : 0L,
                     walBytes = walInfo.Exists ? walInfo.Length : 0L,
                     snapshotMarkerPresent = snapshotMarker.Exists,
                 },

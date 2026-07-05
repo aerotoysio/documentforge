@@ -62,6 +62,15 @@ internal sealed class FaultyDataFile : IDataFile
     public bool ThrowOnNextFlush { get; set; }
 
     /// <summary>
+    /// Throw on EVERY <see cref="WritePage"/> from the moment it's set —
+    /// the "disk died / power loss" stand-in for the WAL durability tests
+    /// (issues #89–#91): nothing can reach the data file any more, so the
+    /// only bytes that survive are whatever the recovery log already
+    /// fsynced.
+    /// </summary>
+    public bool FailAllWrites { get; set; }
+
+    /// <summary>
     /// Throw on the next call to <see cref="SetIndexCatalogPage"/>. The
     /// failure mode for the original #24 fsync gap: header pointer in the
     /// OS write cache when power dies.
@@ -83,6 +92,8 @@ internal sealed class FaultyDataFile : IDataFile
     public void WritePage(PageId pageId, byte[] data)
     {
         _writeCount++;
+        if (FailAllWrites)
+            throw Inject($"injected: all writes failing (pageId {pageId})");
         if (ThrowOnNthWrite > 0 && _writeCount == ThrowOnNthWrite)
             throw Inject($"injected: write #{_writeCount} (pageId {pageId})");
         if (ThrowAtPageId.IsValid && pageId.Value == ThrowAtPageId.Value)

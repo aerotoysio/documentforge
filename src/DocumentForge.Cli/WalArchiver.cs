@@ -326,6 +326,14 @@ public sealed class WalArchiver : IDisposable
         public void EnsureLogDurable() { /* nothing to do — segments
             are durable via WriteAllBytes which fsyncs on close. */ }
 
+        // Issue #89 fsync-on-commit fires this per commit. Pages captured
+        // via OnBeforeFlush keep accumulating in _pending and still ship as
+        // one segment at the next flush/checkpoint boundary — archived
+        // segments stay page-records-only (no commit markers), which PITR
+        // replays with the legacy apply-all path. Shipping a segment per
+        // commit would explode the segment count for no recovery benefit.
+        public void OnCommitDurable() { }
+
         private void ShipBatch(List<(PageId PageId, byte[] PageData)> batch)
         {
             // Encode in the SAME on-wire format as RecoveryLog so

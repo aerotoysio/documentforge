@@ -285,6 +285,10 @@ internal sealed class PreparedTxCoordinator : IDisposable
             if (cmd.Commit)
             {
                 _db.ApplyWorkingSetsLocked(_active.WorkingSets);
+                // Issues #89/#91 — seal the applied working set in the WAL
+                // before acknowledging the coordinator; a participant must
+                // not report "committed" for state that could evaporate.
+                _db.CommitDurableLocked();
                 Interlocked.Increment(ref _stats.CommittedTotal);
             }
             else

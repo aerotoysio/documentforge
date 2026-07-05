@@ -3,7 +3,23 @@ namespace DocumentForge.Engine;
 public sealed class DatabaseOptions
 {
     public int CacheSizeInPages { get; set; } = 1000; // 8MB default
+
+    /// <summary>
+    /// Maintain the physical recovery log (write-ahead log). Required for
+    /// crash recovery, replication page capture, and WAL archiving/PITR.
+    /// </summary>
     public bool EnableWal { get; set; } = true;
+
+    /// <summary>
+    /// Issues #89/#90 — fsync-on-commit. When true (default), every write
+    /// operation appends its dirty pages plus a commit marker to the
+    /// recovery log and fsyncs BEFORE the write lock is released; an
+    /// acknowledged write survives power loss. When false, writes are
+    /// durable only at Flush/Checkpoint/eviction (the pre-#89 behaviour) —
+    /// only appropriate for bulk loads and throwaway data. No effect when
+    /// <see cref="EnableWal"/> is false.
+    /// </summary>
+    public bool DurableCommits { get; set; } = true;
 
     /// <summary>
     /// Reclaim the on-disk lock even if the prior holder may still be alive.

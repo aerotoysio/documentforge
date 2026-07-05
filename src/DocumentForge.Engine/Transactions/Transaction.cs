@@ -227,8 +227,10 @@ public sealed class Transaction : IDisposable
         EnsureActive();
         try
         {
+            // ApplyCommit applies the working set AND seals it in the
+            // recovery log with a fsync'd commit marker (issues #89/#91) —
+            // when it returns, the transaction is durable and crash-atomic.
             _scope.ApplyCommit(this);
-            _manager.WriteCommit(Id);
             State = TransactionState.Committed;
         }
         catch
@@ -236,7 +238,6 @@ public sealed class Transaction : IDisposable
             // Apply may throw mid-validation. Nothing has been written yet
             // (validation runs before any storage mutation), so the txn just
             // becomes RolledBack and the caller retries.
-            _manager.WriteRollback(Id);
             State = TransactionState.RolledBack;
             throw;
         }
@@ -246,7 +247,6 @@ public sealed class Transaction : IDisposable
     {
         if (State != TransactionState.Active)
             throw new TransactionException($"Cannot rollback transaction {Id}: state is {State}");
-        _manager.WriteRollback(Id);
         State = TransactionState.RolledBack;
     }
 
