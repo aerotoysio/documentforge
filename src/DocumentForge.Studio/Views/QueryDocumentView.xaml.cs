@@ -30,9 +30,19 @@ public partial class QueryDocumentView : UserControl
         // Seed once; re-entrant Loaded (tab re-selection) must not clobber edits.
         if (_editorSeeded || ViewModel is null) return;
         _editorSeeded = true;
+        ViewModel.InsertTextRequested += OnInsertTextRequested;
+        Unloaded += (_, _) => ViewModel.InsertTextRequested -= OnInsertTextRequested;
         Editor.Text = ViewModel.InitialSql;
         Editor.Focus();
         Editor.CaretOffset = Editor.Text.Length;
+    }
+
+    private void OnInsertTextRequested(string text)
+    {
+        var offset = Editor.CaretOffset;
+        Editor.Document.Insert(offset, text);
+        Editor.CaretOffset = offset + text.Length;
+        Editor.Focus();
     }
 
     private void OnEditorKeyDown(object? sender, KeyEventArgs e)

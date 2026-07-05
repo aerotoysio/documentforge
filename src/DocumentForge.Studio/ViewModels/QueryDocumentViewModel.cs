@@ -31,6 +31,12 @@ public sealed partial class QueryDocumentViewModel : DocumentViewModel
     public string Database { get; }
     public string ConnectionName => _connection.Descriptor.Name;
 
+    /// <summary>Raised when something (e.g. the SQL Reference panel) wants to
+    /// drop text into this tab's editor. The view inserts it at the caret.</summary>
+    public event Action<string>? InsertTextRequested;
+
+    public void RequestInsert(string text) => InsertTextRequested?.Invoke(text);
+
     /// <summary>Seed text the view drops into the editor on load.</summary>
     public string InitialSql { get; }
 

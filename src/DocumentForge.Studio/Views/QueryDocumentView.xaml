@@ -36,6 +36,11 @@
                 <TextBlock Text="History:" VerticalAlignment="Center" Margin="4,0,4,0"/>
                 <ComboBox x:Name="HistoryCombo" Width="240" ItemsSource="{Binding History}"
                           SelectionChanged="OnHistorySelected" ToolTip="Re-run a previous query"/>
+                <Separator/>
+                <Button Content="❔ SQL Help" Padding="8,2"
+                        Command="{Binding DataContext.OpenSqlReferenceCommand,
+                            RelativeSource={RelativeSource AncestorType=Window}}"
+                        ToolTip="Open the DocumentForge SQL reference"/>
             </ToolBar>
         </ToolBarTray>
 

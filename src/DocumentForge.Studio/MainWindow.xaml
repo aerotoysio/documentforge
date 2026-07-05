@@ -114,6 +114,10 @@
             <views:TopologyView/>
         </DataTemplate>
 
+        <DataTemplate DataType="{x:Type vm:SqlReferenceDocumentViewModel}">
+            <views:SqlReferenceView/>
+        </DataTemplate>
+
         <DataTemplate DataType="{x:Type vm:WelcomeDocumentViewModel}">
             <ScrollViewer>
                 <StackPanel Margin="40" MaxWidth="620" HorizontalAlignment="Left">
@@ -153,6 +157,8 @@
                 <MenuItem Header="_Refresh All" Command="{Binding RefreshAllCommand}" InputGestureText="F5"/>
             </MenuItem>
             <MenuItem Header="_Help">
+                <MenuItem Header="_SQL Reference…" Command="{Binding OpenSqlReferenceCommand}"/>
+                <Separator/>
                 <MenuItem Header="_About DocumentForge Studio" Command="{Binding AboutCommand}"/>
             </MenuItem>
         </Menu>

@@ -153,6 +153,46 @@ public sealed class JsonDocumentToolsTests
     }
 }
 
+public sealed class SqlReferenceTests
+{
+    [Fact]
+    public void Entries_Are_Populated_And_Well_Formed()
+    {
+        Assert.NotEmpty(SqlReference.Entries);
+        Assert.All(SqlReference.Entries, e =>
+        {
+            Assert.False(string.IsNullOrWhiteSpace(e.Title));
+            Assert.False(string.IsNullOrWhiteSpace(e.Category));
+            Assert.False(string.IsNullOrWhiteSpace(e.Example));
+        });
+    }
+
+    [Fact]
+    public void Search_Empty_Returns_All()
+    {
+        Assert.Equal(SqlReference.Entries.Count, SqlReference.Search("").Count);
+        Assert.Equal(SqlReference.Entries.Count, SqlReference.Search(null).Count);
+    }
+
+    [Theory]
+    [InlineData("join")]
+    [InlineData("BETWEEN")]
+    [InlineData("index")]
+    public void Search_Finds_Relevant_Entries(string term)
+    {
+        var results = SqlReference.Search(term);
+        Assert.NotEmpty(results);
+        Assert.True(results.Count < SqlReference.Entries.Count);
+    }
+
+    [Fact]
+    public void Search_Is_CaseInsensitive_And_Covers_Gotchas()
+    {
+        Assert.NotEmpty(SqlReference.Search("between"));   // the "not supported" gotcha
+        Assert.Contains(SqlReference.Entries, e => e.Category == "Gotchas");
+    }
+}
+
 public sealed class ResultTableTests
 {
     [Fact]

@@ -30,6 +30,15 @@ public sealed partial class MainViewModel : ObservableObject
     [ObservableProperty]
     private DocumentViewModel? _activeDocument;
 
+    // Remembers the last query tab the user worked in, so the SQL Reference can
+    // insert into it even while the reference tab itself is focused.
+    private QueryDocumentViewModel? _lastActiveQuery;
+
+    partial void OnActiveDocumentChanged(DocumentViewModel? value)
+    {
+        if (value is QueryDocumentViewModel q) _lastActiveQuery = q;
+    }
+
     [ObservableProperty]
     private string _statusText = "Ready";
 
@@ -377,6 +386,33 @@ public sealed partial class MainViewModel : ObservableObject
         catch (Exception ex)
         {
             _dialogs.ShowError("Import failed", ex.Message);
+        }
+    }
+
+    [RelayCommand]
+    private void OpenSqlReference()
+    {
+        var existing = Documents.FirstOrDefault(d => d.ContentId == "sqlref");
+        if (existing is not null) { ActiveDocument = existing; return; }
+        Documents.Add(new SqlReferenceDocumentViewModel(InsertSqlSnippet));
+        ActiveDocument = Documents[^1];
+    }
+
+    /// <summary>Inserts a reference snippet into the most-recently-used query tab,
+    /// or falls back to the clipboard when none is open.</summary>
+    private void InsertSqlSnippet(string snippet)
+    {
+        if (_lastActiveQuery is not null && Documents.Contains(_lastActiveQuery))
+        {
+            _lastActiveQuery.RequestInsert(snippet);
+            ActiveDocument = _lastActiveQuery;
+            StatusText = "Inserted snippet into query.";
+        }
+        else
+        {
+            try { System.Windows.Clipboard.SetText(snippet); } catch { }
+            _dialogs.ShowInfo("No query tab open",
+                "There's no query tab to insert into, so the snippet was copied to the clipboard. Open a query (right-click a database → New Query) and paste it.");
         }
     }
 
