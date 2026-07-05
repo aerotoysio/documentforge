@@ -24,10 +24,12 @@ $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
 $dist = Join-Path $repo "dist"
 $studioOut = Join-Path $dist "studio"
-$serviceOut = Join-Path $studioOut "service"
+$serviceOut = Join-Path $dist "service"
 
-Write-Host "==> Cleaning dist\studio" -ForegroundColor Cyan
+Write-Host "==> Cleaning staging folders" -ForegroundColor Cyan
 if (Test-Path $studioOut) { Remove-Item -Recurse -Force $studioOut }
+if (Test-Path $serviceOut) { Remove-Item -Recurse -Force $serviceOut }
+New-Item -ItemType Directory -Force $studioOut | Out-Null
 New-Item -ItemType Directory -Force $serviceOut | Out-Null
 
 Write-Host "==> Publishing DocumentForge Studio ($Runtime, self-contained)" -ForegroundColor Cyan

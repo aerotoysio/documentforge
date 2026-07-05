@@ -1,6 +1,8 @@
-; Inno Setup script for DocumentForge Studio.
+; Inno Setup script for DocumentForge Studio + service.
 ; Compiled by scripts/build-studio-installer.ps1 after the self-contained
-; publishes have staged files into dist\studio (Studio + dfdb service).
+; publishes stage files into dist\studio (client) and dist\service (dfdb).
+;
+; Component-selectable: install the Studio client, the dfdb service, or both.
 
 #define AppName "DocumentForge Studio"
 #ifndef AppVersion
@@ -8,7 +10,7 @@
 #endif
 #define Publisher "DocumentForge"
 #define ExeName "DocumentForgeStudio.exe"
-#define ServiceExe "service\dfdb.exe"
+#define DataDir "C:\data\documentForge"
 
 [Setup]
 ; Stable AppId so upgrades replace in place rather than installing side-by-side.
@@ -32,23 +34,43 @@ ChangesAssociations=yes
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
+[Types]
+Name: "full";   Description: "Full — Studio client + service"
+Name: "client"; Description: "Studio client only"
+Name: "server"; Description: "Service (dfdb) only"
+Name: "custom"; Description: "Custom"; Flags: iscustom
+
+[Components]
+Name: "studio";  Description: "DocumentForge Studio (desktop client)"; Types: full client custom
+Name: "service"; Description: "DocumentForge service (dfdb) — a local database engine you can connect to"; Types: full server custom
+
 [Files]
-; Everything the self-contained publishes produced (Studio + service subfolder).
-Source: "..\dist\studio\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion createallsubdirs
+Source: "..\dist\studio\*";  DestDir: "{app}";          Components: studio;  Flags: recursesubdirs ignoreversion createallsubdirs
+Source: "..\dist\service\*"; DestDir: "{app}\service";  Components: service; Flags: recursesubdirs ignoreversion createallsubdirs
+
+[Dirs]
+; Default data directory for the service. Best-effort — the app/service also
+; create it on first run. Never removed on uninstall (it holds your databases).
+Name: "{#DataDir}"; Components: service; Flags: uninsneveruninstall
 
 [Icons]
-Name: "{group}\DocumentForge Studio"; Filename: "{app}\{#ExeName}"
-Name: "{userdesktop}\DocumentForge Studio"; Filename: "{app}\{#ExeName}"; Tasks: desktopicon
+Name: "{group}\DocumentForge Studio"; Filename: "{app}\{#ExeName}"; Components: studio
+Name: "{userdesktop}\DocumentForge Studio"; Filename: "{app}\{#ExeName}"; Components: studio; Tasks: desktopicon
+Name: "{group}\Start DocumentForge Service"; Filename: "{app}\service\dfdb.exe"; \
+    Parameters: "serve --port 5001 --data-dir ""{#DataDir}"""; Components: service
+Name: "{group}\Uninstall DocumentForge Studio"; Filename: "{uninstallexe}"
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"; Components: studio; Flags: unchecked
 
 [Registry]
-; Per-user .dfdb file association -> opens Studio.
-Root: HKCU; Subkey: "Software\Classes\.dfdb"; ValueType: string; ValueName: ""; ValueData: "DocumentForge.Database"; Flags: uninsdeletevalue
-Root: HKCU; Subkey: "Software\Classes\DocumentForge.Database"; ValueType: string; ValueName: ""; ValueData: "DocumentForge Database"; Flags: uninsdeletekey
-Root: HKCU; Subkey: "Software\Classes\DocumentForge.Database\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#ExeName},0"
-Root: HKCU; Subkey: "Software\Classes\DocumentForge.Database\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#ExeName}"" ""%1"""
+; Per-user .dfdb file association -> opens Studio (only if the client is installed).
+Root: HKCU; Subkey: "Software\Classes\.dfdb"; ValueType: string; ValueName: ""; ValueData: "DocumentForge.Database"; Components: studio; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\DocumentForge.Database"; ValueType: string; ValueName: ""; ValueData: "DocumentForge Database"; Components: studio; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\DocumentForge.Database\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#ExeName},0"; Components: studio
+Root: HKCU; Subkey: "Software\Classes\DocumentForge.Database\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#ExeName}"" ""%1"""; Components: studio
 
 [Run]
-Filename: "{app}\{#ExeName}"; Description: "Launch DocumentForge Studio"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#ExeName}"; Description: "Launch DocumentForge Studio"; Components: studio; Flags: nowait postinstall skipifsilent
+Filename: "{app}\service\dfdb.exe"; Parameters: "serve --port 5001 --data-dir ""{#DataDir}"""; \
+    Description: "Start the DocumentForge service now (port 5001)"; Components: service; Flags: nowait postinstall skipifsilent unchecked
