@@ -26,6 +26,17 @@ public interface IDataFile : IDisposable
     /// and fsync. Decorators (e.g. the crash-injection harness) can intercept
     /// this for fault testing.</summary>
     void SetIndexCatalogPage(PageId pageId);
+
+    /// <summary>Read the persisted free-list chain head from the file header
+    /// (issue #94). <see cref="PageId.Invalid"/> when the free list is empty.</summary>
+    PageId GetFreeListHead();
+
+    /// <summary>Write the free-list chain head into the file header. Buffered,
+    /// NOT fsync'd per call — a per-alloc/free fsync would dominate churny
+    /// workloads. It becomes durable at the next <see cref="Flush"/> (which
+    /// fsyncs the whole file); a crash between flushes only leaks reclaimable
+    /// pages, never double-allocates (the loader validates the chain).</summary>
+    void SetFreeListHead(PageId pageId);
 }
 
 public sealed class DataFile : IDataFile
@@ -298,6 +309,34 @@ public sealed class DataFile : IDataFile
             // used by Flush() on line 136 — every header-mutating write must
             // hit disk before we return.
             _stream.Flush(true);
+        }
+    }
+
+    // Free-list chain head lives in the header page's reserved bytes 28-31
+    // (issue #94). Page 0 is the file header, not a checksummed/cached page,
+    // and 28-31 are otherwise unused there.
+    public PageId GetFreeListHead()
+    {
+        lock (_lock)
+        {
+            _stream.Seek(28, SeekOrigin.Begin);
+            var buf = new byte[4];
+            int read = _stream.Read(buf, 0, 4);
+            if (read != 4) return PageId.Invalid;
+            var val = BitConverter.ToUInt32(buf);
+            return val == 0 ? PageId.Invalid : new PageId(val);
+        }
+    }
+
+    public void SetFreeListHead(PageId pageId)
+    {
+        lock (_lock)
+        {
+            _stream.Seek(28, SeekOrigin.Begin);
+            // PageId.Invalid persists as 0 = "empty free list".
+            var val = pageId.IsValid ? pageId.Value : 0u;
+            _stream.Write(BitConverter.GetBytes(val), 0, 4);
+            // Buffered on purpose (see interface doc) — durable at the next Flush().
         }
     }
 

@@ -89,6 +89,8 @@ internal sealed class FaultyDataFile : IDataFile
     public uint PageCount => _inner.PageCount;
     public PageId AllocateNewPage() => _inner.AllocateNewPage();
     public PageId GetIndexCatalogPage() => _inner.GetIndexCatalogPage();
+    public PageId GetFreeListHead() => _inner.GetFreeListHead();
+    public void SetFreeListHead(PageId pageId) => _inner.SetFreeListHead(pageId);
 
     public void WritePage(PageId pageId, byte[] data)
     {
