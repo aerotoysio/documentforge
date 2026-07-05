@@ -716,22 +716,111 @@ public sealed class DocumentForgeCluster : IDisposable
     internal void RollbackOnShardForTx(int shardIndex, string txId) =>
         _shards[shardIndex].RollbackPrepared(txId);
 
-    // Phase C.1 — coordinator-decision-log calls. Always issued against the
-    // shard chosen as coordinator for this tx (lowest participant index).
-    internal void RecordCoordinatorDecisionForTx(int coordinatorShardIndex, string txId, bool commit) =>
-        _shards[coordinatorShardIndex].RecordCoordinatorDecision(txId, commit);
-    internal void RecordCoordinatorDoneForTx(int coordinatorShardIndex, string txId) =>
-        _shards[coordinatorShardIndex].RecordCoordinatorDone(txId);
+    // ---- Issue #98 — quorum-durable coordinator decision ----
+    //
+    // The 2PC commit decision used to live on exactly one shard's local disk
+    // (the lowest-index participant). Losing that one disk erased the decision,
+    // and recovery then rolled back transactions that had actually committed —
+    // the precise node-failure the cluster is meant to survive.
+    //
+    // Fix: the decision is written to a MAJORITY of ALL cluster shards before it
+    // becomes the point of no return, and recovery resolves an in-doubt tx by
+    // reading a MAJORITY. Any two majorities of the same N shards intersect in
+    // at least one shard, so a recovery read is guaranteed to observe any
+    // decision that was ever made quorum-durable — no single (or minority) disk
+    // loss can hide it. If the coordinator cannot reach a write majority it does
+    // NOT commit; the decision was never made and the tx aborts.
+
+    /// <summary>Majority (strict) of <paramref name="n"/> nodes: ⌊n/2⌋ + 1.</summary>
+    internal static int Majority(int n) => n / 2 + 1;
+
+    /// <summary>Outcome of a quorum decision write.</summary>
+    internal readonly record struct DecisionQuorumResult(int Acks, int Total)
+    {
+        /// <summary>True once a strict majority of shards have durably (fsync)
+        /// recorded the decision — the point of no return.</summary>
+        public bool Durable => Acks >= Majority(Total);
+    }
 
     /// <summary>
-    /// Result of a <see cref="Recover"/> sweep. <c>Committed</c> is the
-    /// count of in-flight prepared tx slices that the coordinator decided
-    /// COMMIT for and we successfully applied; <c>Aborted</c> is the count
-    /// we rolled back (coordinator either didn't decide or never saw the
-    /// tx). <c>Skipped</c> is the count we couldn't resolve because the
-    /// coordinator shard isn't in the current cluster (stale shard
-    /// configuration after a rebalance, say) — operator intervention
-    /// needed for those.
+    /// Issue #98 — durably record COMMIT_DECISION on every reachable shard and
+    /// report whether a majority acknowledged. Each shard's
+    /// <c>RecordCoordinatorDecision</c> fsyncs before returning, so an ack means
+    /// that shard has the decision on stable storage. A shard that throws
+    /// (unreachable / disk error / HTTP-not-supported) simply doesn't ack.
+    /// </summary>
+    internal DecisionQuorumResult RecordCommitDecisionQuorum(string txId)
+    {
+        int acks = 0;
+        foreach (var shard in _shards)
+        {
+            try { shard.RecordCoordinatorDecision(txId, commit: true); acks++; }
+            catch { /* this shard doesn't count toward the quorum */ }
+        }
+        return new DecisionQuorumResult(acks, _shards.Count);
+    }
+
+    /// <summary>Best-effort DONE marker across the cluster — a recovery
+    /// optimization, not a correctness requirement.</summary>
+    internal void RecordDoneQuorum(string txId)
+    {
+        foreach (var shard in _shards)
+        {
+            try { shard.RecordCoordinatorDone(txId); } catch { /* best effort */ }
+        }
+    }
+
+    /// <summary>How a recovery sweep resolved an in-doubt tx by polling the
+    /// decision quorum.</summary>
+    private enum QuorumDecision { Commit, Abort, Indeterminate }
+
+    /// <summary>
+    /// Issue #98 — resolve a prepared-but-undecided tx by reading the decision
+    /// quorum.
+    /// <list type="bullet">
+    ///   <item><b>Commit</b> if ANY reachable shard recorded the decision. Quorum
+    ///   intersection guarantees a decision written to a majority is visible in
+    ///   any majority we read, so this survives the loss of the original
+    ///   coordinator's disk — the whole point of the fix. This direction does
+    ///   not depend on the coordinator being present.</item>
+    ///   <item><b>Abort</b> only when no reachable shard has the decision AND we
+    ///   are confident our cluster view is complete: a majority of shards are
+    ///   reachable and the tx's named coordinator shard is one of them. The
+    ///   coordinator-presence check guards against a partial membership view
+    ///   (mid-rebalance / misconfiguration) where a real majority elsewhere
+    ///   could still hold a COMMIT we can't see — in that case we must not
+    ///   arbitrarily roll back.</item>
+    ///   <item><b>Indeterminate</b> otherwise — leave the tx in-doubt for a
+    ///   later sweep once connectivity / membership is restored.</item>
+    /// </list>
+    /// </summary>
+    private QuorumDecision ResolveDecisionAcrossQuorum(string txId, string namedCoordinator)
+    {
+        int reachable = 0;
+        bool coordinatorReachable = false;
+        foreach (var shard in _shards)
+        {
+            CoordinatorTxState? state;
+            try { state = shard.GetCoordinatorTxState(txId); }
+            catch { continue; } // unreachable / not-supported: doesn't count as reachable
+            reachable++;
+            if (string.Equals(shard.ShardName, namedCoordinator, StringComparison.OrdinalIgnoreCase))
+                coordinatorReachable = true;
+            if (state?.Decided == true) return QuorumDecision.Commit;
+        }
+        return reachable >= Majority(_shards.Count) && coordinatorReachable
+            ? QuorumDecision.Abort
+            : QuorumDecision.Indeterminate;
+    }
+
+    /// <summary>
+    /// Result of a <see cref="Recover"/> sweep. <c>Committed</c> is the count of
+    /// in-flight prepared tx slices that the decision quorum resolved to COMMIT
+    /// and we applied; <c>Aborted</c> is the count a reachable majority resolved
+    /// to ROLLBACK (no shard in the majority held a decision, so none was ever
+    /// made durable); <c>Skipped</c> is the count left in-doubt because too few
+    /// shards were reachable to read a majority — a later sweep retries once
+    /// connectivity returns, rather than risk an unsafe rollback (issue #98).
     /// </summary>
     public sealed record RecoverySummary(int Committed, int Aborted, int Skipped);
 
@@ -777,30 +866,24 @@ public sealed class DocumentForgeCluster : IDisposable
 
             foreach (var rec in inFlight)
             {
-                int coordIdx = FindShardIndexByName(rec.CoordinatorShardId);
-                if (coordIdx < 0)
+                // Issue #98 — resolve against the decision QUORUM, not a single
+                // coordinator shard. Reading a majority is guaranteed to observe
+                // any decision that was written to a majority (quorum
+                // intersection), so a lost coordinator disk can no longer turn a
+                // committed tx into a rollback.
+                switch (ResolveDecisionAcrossQuorum(rec.TxId, rec.CoordinatorShardId))
                 {
-                    skipped++;
-                    continue;
-                }
-
-                CoordinatorTxState? state;
-                try { state = _shards[coordIdx].GetCoordinatorTxState(rec.TxId); }
-                catch (NotSupportedException)
-                {
-                    skipped++;
-                    continue;
-                }
-
-                if (state?.Decided == true)
-                {
-                    _shards[shardIdx].CommitPrepared(rec.TxId);
-                    committed++;
-                }
-                else
-                {
-                    _shards[shardIdx].RollbackPrepared(rec.TxId);
-                    aborted++;
+                    case QuorumDecision.Commit:
+                        _shards[shardIdx].CommitPrepared(rec.TxId);
+                        committed++;
+                        break;
+                    case QuorumDecision.Abort:
+                        _shards[shardIdx].RollbackPrepared(rec.TxId);
+                        aborted++;
+                        break;
+                    default: // Indeterminate — too few shards reachable to decide safely
+                        skipped++;
+                        break;
                 }
             }
         }
@@ -808,13 +891,6 @@ public sealed class DocumentForgeCluster : IDisposable
         return new RecoverySummary(committed, aborted, skipped);
     }
 
-    private int FindShardIndexByName(string name)
-    {
-        for (int i = 0; i < _shardNames.Count; i++)
-            if (string.Equals(_shardNames[i], name, StringComparison.OrdinalIgnoreCase))
-                return i;
-        return -1;
-    }
 
     private System.Threading.Timer? _recoverySweeper;
 

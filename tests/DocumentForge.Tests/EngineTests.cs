@@ -2630,9 +2630,10 @@ public class EngineTests : IDisposable
     [Fact]
     public void ClusterTx_MultiShard_Commit_RecordsCoordinatorDecisionAndDone()
     {
-        // Phase C.1: COMMIT_DECISION goes to the coordinator shard's coord.log
-        // before the COMMIT broadcast (point of no return); DONE goes after
-        // every participant ACK'd. Recovery (Phase C.2) reads this log.
+        // Issue #98: COMMIT_DECISION is made QUORUM-durable — written to a
+        // majority of ALL cluster shards before the COMMIT broadcast (point of
+        // no return); DONE follows once every participant ACK'd. Recovery reads
+        // a majority, so no single lost disk can erase the decision.
         var (dbs, paths, cluster) = BuildClusterForTx(3, "orders", "pnr");
         try
         {
@@ -2648,21 +2649,28 @@ public class EngineTests : IDisposable
                 tx.Commit();
             }
 
-            // Coordinator is the lowest-index participant. Verify on whichever
-            // shard that turned out to be (depends on the consistent hash).
+            // The decision+DONE must be durable on a MAJORITY of the 3 shards —
+            // that is the SPOF fix. (In practice every reachable shard records
+            // it, but correctness only requires a strict majority.)
+            int decided = 0, done = 0;
+            foreach (var d in dbs)
+            {
+                var states = d.ScanCoordinatorTransactions();
+                if (states.TryGetValue(txIdSeen, out var s))
+                {
+                    if (s.Decided) decided++;
+                    if (s.Done) done++;
+                }
+            }
+            int majority = dbs.Length / 2 + 1; // = 2 of 3
+            Assert.True(decided >= majority, $"decision only durable on {decided}/{dbs.Length} shards; need >= {majority}");
+            Assert.True(done >= majority, $"DONE only on {done}/{dbs.Length} shards; need >= {majority}");
+
+            // The original coordinator (lowest-index participant) is one of them.
             int coordIdx = Math.Min(shardA, shardB);
             var coordStates = dbs[coordIdx].ScanCoordinatorTransactions();
-            Assert.True(coordStates.ContainsKey(txIdSeen),
-                $"Coordinator log on shard {coordIdx} missing tx {txIdSeen}; saw [{string.Join(",", coordStates.Keys)}]");
-            var state = coordStates[txIdSeen];
-            Assert.True(state.Decided);
-            Assert.True(state.Done);
-
-            // The OTHER participant must NOT have a coord-log record for this tx
-            // (it isn't the coordinator; it's only PREPARED-then-COMMITTED).
-            int otherIdx = Math.Max(shardA, shardB);
-            var otherStates = dbs[otherIdx].ScanCoordinatorTransactions();
-            Assert.False(otherStates.ContainsKey(txIdSeen));
+            Assert.True(coordStates.TryGetValue(txIdSeen, out var coordState) && coordState.Decided,
+                $"Coordinator log on shard {coordIdx} missing decision for tx {txIdSeen}");
 
             cluster.Dispose();
         }

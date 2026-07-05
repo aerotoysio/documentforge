@@ -244,11 +244,12 @@ public sealed class ClusterTransaction : IDisposable
     /// </para>
     ///
     /// <para>
-    /// Coordinator shard selection: the participant with the lowest shard
-    /// index. Phase C will use this to pick where the persisted decision
-    /// log lives. For B.2 we just record the name in the PREPARE message
-    /// so participants can later (Phase C) ask the coordinator shard for
-    /// the decision on restart.
+    /// Coordinator role (issue #98): the client driving the commit is the
+    /// coordinator; the lowest-index participant name is still stamped into each
+    /// PREPARE message for diagnostics, but the commit DECISION is no longer
+    /// tied to that one shard's disk. It is written to a majority of the
+    /// cluster's shards before the point of no return, so recovery can read the
+    /// decision from any surviving majority — a single lost node can't erase it.
     /// </para>
     /// </summary>
     private void CommitMultiShard()
@@ -296,31 +297,43 @@ public sealed class ClusterTransaction : IDisposable
                 $"ClusterTransaction {Id} aborted on shard '{_cluster.GetShardNameForTx(abortShardIdx)}': {abortReason}");
         }
 
-        // The point of no return: durably record COMMIT_DECISION on the
-        // coordinator shard BEFORE broadcasting COMMIT. If we crash here
-        // without the record, recovery (Phase C.2) will see PREPARED txns
-        // on the participants and no decision in the coordinator log,
-        // and treat them as aborted. If we crash AFTER the record but
-        // before broadcasting, recovery replays the COMMIT broadcast.
-        var coordinatorShardIdx = shardIndices[0];
-        _cluster.RecordCoordinatorDecisionForTx(coordinatorShardIdx, txId, commit: true);
+        // The point of no return: durably record COMMIT_DECISION on a MAJORITY
+        // of the cluster's shards BEFORE broadcasting COMMIT (issue #98). This
+        // is what makes the decision survive the loss of any single node — the
+        // old design wrote it to one shard's disk, so losing that disk erased a
+        // committed transaction. If we can't reach a write majority the decision
+        // is NOT made: we roll the prepared participants back and abort, exactly
+        // as if a participant had voted NO. Recovery reads a majority and, by
+        // quorum intersection, is guaranteed to see any durable decision.
+        var decision = _cluster.RecordCommitDecisionQuorum(txId);
+        if (!decision.Durable)
+        {
+            foreach (var preparedIdx in preparedShards)
+            {
+                try { _cluster.RollbackOnShardForTx(preparedIdx, txId); }
+                catch { /* best effort during abort */ }
+            }
+            State = TransactionState.RolledBack;
+            throw new TransactionException(
+                $"ClusterTransaction {Id} aborted: the commit decision could not be made durable on a " +
+                $"majority of shards (only {decision.Acks}/{decision.Total} acknowledged). No participant committed.");
+        }
 
-        // All voted PREPARED — commit each one. After this loop returns the
-        // tx is applied on every participant. If the coordinator dies in
-        // the middle of this loop (between two CommitPrepared calls), some
-        // participants are committed and some still PREPARED — Phase C.2's
-        // recovery sees the COMMIT_DECISION and replays the broadcast.
+        // All voted PREPARED and the decision is quorum-durable — commit each
+        // one. If the coordinator dies in the middle of this loop (between two
+        // CommitPrepared calls), some participants are committed and some still
+        // PREPARED — recovery reads the quorum, sees COMMIT, and finalizes them.
         foreach (var preparedIdx in preparedShards)
         {
             _cluster.CommitOnShardForTx(preparedIdx, txId);
         }
 
-        // All participants ACK'd COMMIT — record DONE so recovery doesn't
-        // bother replaying the broadcast on a future restart. (DONE is an
-        // optimization, not a correctness requirement: replaying COMMIT
-        // for an already-committed tx is a no-op on each participant
-        // since the prepared.log RESOLVED record makes it not in-flight.)
-        _cluster.RecordCoordinatorDoneForTx(coordinatorShardIdx, txId);
+        // All participants ACK'd COMMIT — record DONE across the cluster so
+        // recovery doesn't bother re-resolving on a future restart. (DONE is an
+        // optimization, not a correctness requirement: re-committing an
+        // already-committed tx is a no-op — the prepared.log RESOLVED record
+        // makes it not in-flight.)
+        _cluster.RecordDoneQuorum(txId);
     }
 
     public void Rollback()
