@@ -235,7 +235,7 @@ public sealed class DocumentForgeCluster : IDisposable
         if (policy.Strategy == ShardingStrategy.Replicated)
             return _shards[0].Execute(sql);
 
-        // Hash: try to route to a single shard if WHERE has shardKey = value
+        // Hash: try to route to a single shard if WHERE has shardKey = value.
         var targetShard = TryRouteByShardKey(policy, stmt.Where);
         if (targetShard.HasValue)
         {
@@ -256,11 +256,43 @@ public sealed class DocumentForgeCluster : IDisposable
             return r with { QueryPlan = $"SINGLE_SHARD({_shards[targetShard.Value].ShardName}) + {r.QueryPlan}" };
         }
 
+        // Issue #99: IN / OR on the shard key used to scatter to EVERY shard.
+        // If the WHERE restricts the shard key to a finite set (e.g.
+        // `key IN (A,B)` or `key=A OR key=B`), route to just the owning shards.
+        // Only in steady state — during migration we keep the scatter+fallback
+        // path so docs mid-move aren't missed.
+        var subset = _previousShards is null ? TryRouteToShardSubset(policy, stmt.Where) : null;
+        bool spansMultipleShards = subset is null || subset.Count > 1;
+
+        // Issue #99: cross-shard shapes that scatter-gather can't compute
+        // correctly are rejected with a clear error instead of returning
+        // silently-wrong data.
+        if (spansMultipleShards)
+        {
+            if (stmt.Joins.Count > 0)
+                return QueryResult.Error(
+                    "Cross-shard JOIN is not supported: the query spans multiple shards. " +
+                    "Filter by the shard key so it routes to one shard, or replicate the joined collection.");
+            if (stmt.IsDistinct)
+                return QueryResult.Error(
+                    "Cross-shard SELECT DISTINCT is not supported: the query spans multiple shards. " +
+                    "Filter by the shard key so it routes to one shard, or dedupe client-side.");
+        }
+
+        if (subset is not null)
+        {
+            var picked = subset.Select(i => _shards[i]).ToList();
+            return ScatterGather(stmt, sql, picked,
+                subset.Count == 1
+                    ? $"SINGLE_SHARD({_shards[subset[0]].ShardName})"
+                    : $"MULTI_SHARD({subset.Count} of {_shards.Count})");
+        }
+
         // Scatter-gather: run on every shard and merge. During migration we also query
         // the previous shards to catch docs not yet migrated.
         if (_previousShards is not null)
             return ScatterGatherWithFallback(stmt, sql);
-        return ScatterGather(stmt, sql);
+        return ScatterGather(stmt, sql, _shards, $"SCATTER_GATHER({_shards.Count} shards)");
     }
 
     private string? GetShardKeyFromWhere(CollectionShardingPolicy policy, Expression? where)
@@ -339,12 +371,72 @@ public sealed class DocumentForgeCluster : IDisposable
         return null;
     }
 
-    private QueryResult ScatterGather(SelectStatement stmt, string sql)
+    /// <summary>
+    /// Issue #99 — route an <c>IN</c> / <c>OR</c> on the shard key to just the
+    /// owning shards instead of scattering to all. Returns the distinct set of
+    /// shard indices that could hold a matching document, or null when the
+    /// WHERE can't restrict the shard key (then the caller scatters).
+    ///
+    /// <para>Correctness rule: split the WHERE into top-level OR branches; the
+    /// set is safe iff EVERY branch pins the shard key to a value (directly or
+    /// within its AND-tree). If one branch doesn't (e.g. <c>key=A OR city=X</c>),
+    /// matching docs could be on any shard, so we return null. A pure
+    /// <c>key IN (A,B,C)</c> lowers to <c>key=A OR key=B OR key=C</c> and routes
+    /// to exactly those shards.</para>
+    /// </summary>
+    private List<int>? TryRouteToShardSubset(CollectionShardingPolicy policy, Expression? where)
     {
-        // Run the same SQL on every shard
-        var shardResults = new List<QueryResult>(_shards.Count);
-        foreach (var shard in _shards)
-            shardResults.Add(shard.Execute(sql));
+        if (where is null || policy.ShardKeyPath is null) return null;
+
+        var branches = new List<Expression>();
+        CollectOrBranches(where, branches);
+        // A single branch with no OR is the single-shard case (handled earlier);
+        // only bother here when there's a genuine disjunction.
+        if (branches.Count < 2) return null;
+
+        var indices = new List<int>();
+        var seen = new HashSet<int>();
+        foreach (var branch in branches)
+        {
+            var found = FindEqualityOnPath(branch, policy.ShardKeyPath);
+            if (found is null) return null; // this branch doesn't pin the shard key → must scatter
+            var bsonVal = found switch
+            {
+                string s => BsonValue.FromString(s),
+                double d => BsonValue.FromDouble(d),
+                int i => BsonValue.FromInt32(i),
+                bool b => BsonValue.FromBool(b),
+                _ => BsonValue.Null
+            };
+            if (bsonVal.IsNull) return null;
+            var idx = PickShard(bsonVal);
+            if (seen.Add(idx)) indices.Add(idx);
+        }
+        indices.Sort();
+        return indices.Count > 0 ? indices : null;
+    }
+
+    private static void CollectOrBranches(Expression expr, List<Expression> branches)
+    {
+        if (expr is LogicalExpression l && l.Operator == TokenType.Or)
+        {
+            CollectOrBranches(l.Left, branches);
+            CollectOrBranches(l.Right, branches);
+        }
+        else branches.Add(expr);
+    }
+
+    private QueryResult ScatterGather(SelectStatement stmt, string sql,
+        IReadOnlyList<IShardTransport> shards, string planLabel)
+    {
+        // Aggregate queries push a REWRITTEN statement to each shard: every
+        // AVG(x) becomes SUM(x)+COUNT(x) so the merge can compute an exact
+        // global average (issue #99). Non-aggregate queries run verbatim.
+        var shardSql = stmt.HasAggregates ? BuildAggregateShardSql(stmt, sql) : sql;
+
+        var shardResults = new List<QueryResult>(shards.Count);
+        foreach (var shard in shards)
+            shardResults.Add(shard.Execute(shardSql));
 
         // Non-aggregated: concat + apply ORDER BY / LIMIT / OFFSET globally
         if (!stmt.HasAggregates && stmt.GroupByPaths.Count == 0)
@@ -365,17 +457,86 @@ public sealed class DocumentForgeCluster : IDisposable
             if (stmt.Offset.HasValue) merged = merged.Skip(stmt.Offset.Value).ToList();
             if (stmt.Limit.HasValue) merged = merged.Take(stmt.Limit.Value).ToList();
 
-            return QueryResult.Ok(merged, $"SCATTER_GATHER({_shards.Count} shards)");
+            return QueryResult.Ok(merged, planLabel);
         }
 
         // Aggregated: merge per-shard aggregates into a global result
-        return MergeAggregates(stmt, shardResults);
+        return MergeAggregates(stmt, shardResults, planLabel);
     }
 
-    private QueryResult MergeAggregates(SelectStatement stmt, List<QueryResult> shardResults)
+    // AVG helper column names in the rewritten per-shard aggregate query. The
+    // query dialect auto-aliases an aggregate as "FUNC(path)" (there is no AS),
+    // so the pushed-down SUM/COUNT land under exactly these keys.
+    private static string AvgSumCol(string path) => $"SUM({path})";
+    private static string AvgCntCol(string path) => $"COUNT({path})";
+
+    /// <summary>
+    /// Rebuild the SELECT list of an aggregate query so each AVG(x) is pushed
+    /// down as SUM(x) + COUNT(x) (exact cross-shard AVG, issue #99). GROUP BY
+    /// columns and all other aggregates pass through unchanged; everything from
+    /// FROM onward (WHERE / GROUP BY / ORDER BY) is preserved verbatim. No AS
+    /// aliases are emitted — the dialect auto-aliases each aggregate as
+    /// "FUNC(path)", which is exactly what the merge reads back.
+    /// </summary>
+    private static string BuildAggregateShardSql(SelectStatement stmt, string originalSql)
+    {
+        int fromIdx = IndexOfKeyword(originalSql, "FROM");
+        if (fromIdx < 0) return originalSql; // shouldn't happen for a SELECT; be safe
+        var tail = originalSql.Substring(fromIdx); // "FROM ... [WHERE ...] [GROUP BY ...]"
+
+        var items = new List<string>();
+        foreach (var gb in stmt.GroupByPaths) items.Add(gb);
+        foreach (var agg in stmt.Aggregates)
+        {
+            switch (agg.Function)
+            {
+                case AggregateFunction.Avg:
+                    items.Add($"SUM({agg.Path})");
+                    items.Add($"COUNT({agg.Path})");
+                    break;
+                case AggregateFunction.Count: items.Add($"COUNT({agg.Path})"); break;
+                case AggregateFunction.Sum: items.Add($"SUM({agg.Path})"); break;
+                case AggregateFunction.Min: items.Add($"MIN({agg.Path})"); break;
+                case AggregateFunction.Max: items.Add($"MAX({agg.Path})"); break;
+            }
+        }
+        return "SELECT " + string.Join(", ", items) + " " + tail;
+    }
+
+    /// <summary>Index of a top-level SQL keyword, matched case-insensitively on
+    /// word boundaries (no subqueries exist in this dialect, so the first hit is
+    /// the top-level one).</summary>
+    private static int IndexOfKeyword(string sql, string keyword)
+    {
+        int i = 0;
+        while (true)
+        {
+            int idx = sql.IndexOf(keyword, i, StringComparison.OrdinalIgnoreCase);
+            if (idx < 0) return -1;
+            bool leftOk = idx == 0 || !char.IsLetterOrDigit(sql[idx - 1]);
+            int after = idx + keyword.Length;
+            bool rightOk = after >= sql.Length || !char.IsLetterOrDigit(sql[after]);
+            if (leftOk && rightOk) return idx;
+            i = idx + 1;
+        }
+    }
+
+    // Per-(group, aggregate) accumulator. AVG carries its own true sum+count
+    // (from the pushed-down SUM/COUNT columns) so the global average is exact.
+    private sealed class AggAccum
+    {
+        public double Sum;
+        public double Min = double.MaxValue;
+        public double Max = double.MinValue;
+        public double AvgSum;
+        public long AvgCount;
+        public bool Seen;
+    }
+
+    private QueryResult MergeAggregates(SelectStatement stmt, List<QueryResult> shardResults, string planLabel)
     {
         // Group results across shards. For each group-key combination, merge aggregate values.
-        var buckets = new Dictionary<string, (Dictionary<string, BsonValue> Keys, Dictionary<string, (double Sum, long Count, double Min, double Max)> Stats)>();
+        var buckets = new Dictionary<string, (Dictionary<string, BsonValue> Keys, Dictionary<string, AggAccum> Stats)>();
 
         foreach (var shardResult in shardResults)
         {
@@ -394,29 +555,44 @@ public sealed class DocumentForgeCluster : IDisposable
 
                 if (!buckets.TryGetValue(groupKey, out var bucket))
                 {
-                    bucket = (keyValues, new Dictionary<string, (double, long, double, double)>());
+                    bucket = (keyValues, new Dictionary<string, AggAccum>());
                     buckets[groupKey] = bucket;
                 }
 
                 foreach (var agg in stmt.Aggregates)
                 {
+                    if (!bucket.Stats.TryGetValue(agg.Alias, out var s))
+                    {
+                        s = new AggAccum();
+                        bucket.Stats[agg.Alias] = s;
+                    }
+
+                    if (agg.Function == AggregateFunction.Avg)
+                    {
+                        // Read the pushed-down SUM(x) + COUNT(x) helper columns so
+                        // the global average = total_sum / total_count (issue #99).
+                        var sumV = row[AvgSumCol(agg.Path)];
+                        var cntV = row[AvgCntCol(agg.Path)];
+                        if (cntV.IsNumeric && cntV.ToDouble() > 0)
+                        {
+                            s.AvgSum += sumV.IsNumeric ? sumV.ToDouble() : 0;
+                            s.AvgCount += (long)cntV.ToDouble();
+                            s.Seen = true;
+                        }
+                        continue;
+                    }
+
                     var val = row[agg.Alias];
                     if (val.IsNull) continue;
                     var n = val.IsNumeric ? val.ToDouble() : 0;
-                    if (!bucket.Stats.TryGetValue(agg.Alias, out var s))
-                        s = (0, 0, double.MaxValue, double.MinValue);
-                    s = agg.Function switch
+                    s.Seen = true;
+                    switch (agg.Function)
                     {
-                        AggregateFunction.Count => (s.Sum + n, s.Count + 1, s.Min, s.Max),
-                        AggregateFunction.Sum => (s.Sum + n, s.Count + 1, s.Min, s.Max),
-                        AggregateFunction.Min => (s.Sum, s.Count + 1, Math.Min(s.Min, n), s.Max),
-                        AggregateFunction.Max => (s.Sum, s.Count + 1, s.Min, Math.Max(s.Max, n)),
-                        // AVG: accumulate sum across shards, we'll divide by count below.
-                        // But note: shard-level AVG loses the per-shard count. This is a known limit.
-                        AggregateFunction.Avg => (s.Sum + n, s.Count + 1, s.Min, s.Max),
-                        _ => s
-                    };
-                    bucket.Stats[agg.Alias] = s;
+                        case AggregateFunction.Count:
+                        case AggregateFunction.Sum: s.Sum += n; break;
+                        case AggregateFunction.Min: s.Min = Math.Min(s.Min, n); break;
+                        case AggregateFunction.Max: s.Max = Math.Max(s.Max, n); break;
+                    }
                 }
             }
         }
@@ -429,20 +605,26 @@ public sealed class DocumentForgeCluster : IDisposable
             foreach (var (path, value) in bucket.Keys) row[path] = value;
             foreach (var agg in stmt.Aggregates)
             {
-                if (!bucket.Stats.TryGetValue(agg.Alias, out var s)) { row[agg.Alias] = BsonValue.Null; continue; }
+                if (!bucket.Stats.TryGetValue(agg.Alias, out var s) || !s.Seen)
+                {
+                    // COUNT over an all-empty group is 0; other aggregates null.
+                    row[agg.Alias] = agg.Function == AggregateFunction.Count
+                        ? BsonValue.FromInt64(0) : BsonValue.Null;
+                    continue;
+                }
                 row[agg.Alias] = agg.Function switch
                 {
                     AggregateFunction.Count => BsonValue.FromInt64((long)s.Sum),
                     AggregateFunction.Sum => BsonValue.FromDouble(s.Sum),
                     AggregateFunction.Min => BsonValue.FromDouble(s.Min),
                     AggregateFunction.Max => BsonValue.FromDouble(s.Max),
-                    AggregateFunction.Avg => BsonValue.FromDouble(s.Count == 0 ? 0 : s.Sum / s.Count),
+                    AggregateFunction.Avg => BsonValue.FromDouble(s.AvgCount == 0 ? 0 : s.AvgSum / s.AvgCount),
                     _ => BsonValue.Null
                 };
             }
             results.Add(row);
         }
-        return QueryResult.Ok(results, $"SCATTER_GATHER_AGGREGATE({_shards.Count} shards)");
+        return QueryResult.Ok(results, planLabel);
     }
 
     private QueryResult ExecuteCount(CountStatement stmt, string sql)
