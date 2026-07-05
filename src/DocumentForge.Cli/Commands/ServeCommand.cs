@@ -454,7 +454,11 @@ public static class ServeCommand
                 || httpReq.Headers.Accept.ToString().Contains("application/x-ndjson", StringComparison.OrdinalIgnoreCase);
 
             var result = db.Execute(request.Sql);
-            if (!result.Success) return Results.BadRequest(new { error = result.Message });
+            // `code` is a stable machine-readable identifier (issue #69) —
+            // e.g. "collectionNotFound" when reading a collection that has
+            // not been lazily created yet. Clients branch on it instead of
+            // string-matching the human message.
+            if (!result.Success) return Results.BadRequest(new { error = result.Message, code = result.ErrorCode });
 
             if (!wantsStream)
             {
@@ -623,11 +627,17 @@ public static class ServeCommand
             var json = await reader.ReadToEndAsync();
             if (string.IsNullOrWhiteSpace(json)) return Results.BadRequest(new { error = "Empty body" });
 
+            // Missing collection → 404, matching the GET/DELETE by-field
+            // routes (issue #69: this used to surface as a 400 from the
+            // SQL lookup below).
+            var coll = db.GetCollection(name);
+            if (coll is null) return Results.NotFound();
+
             // Look up the doc id via SQL so indexes are honoured.
             var safeValue = value.Replace("'", "''");
             var lookupSql = $"SELECT * FROM {name} WHERE {field} = '{safeValue}' LIMIT 1";
             var found = db.Execute(lookupSql);
-            if (!found.Success) return Results.BadRequest(new { error = found.Message });
+            if (!found.Success) return Results.BadRequest(new { error = found.Message, code = found.ErrorCode });
             if (found.Documents.Count == 0) return Results.NotFound();
 
             try
@@ -682,7 +692,7 @@ public static class ServeCommand
             var safeValue = value.Replace("'", "''");
             var sql = $"SELECT * FROM {name} WHERE {field} = '{safeValue}' LIMIT 1";
             var r = db.Execute(sql);
-            if (!r.Success) return Results.BadRequest(new { error = r.Message });
+            if (!r.Success) return Results.BadRequest(new { error = r.Message, code = r.ErrorCode });
             if (r.Documents.Count == 0) return Results.NotFound();
 
             return Results.Ok(new
@@ -708,7 +718,7 @@ public static class ServeCommand
             var safeValue = value.Replace("'", "''");
             var sql = $"DELETE FROM {name} WHERE {field} = '{safeValue}'";
             var r = db.Execute(sql);
-            if (!r.Success) return Results.BadRequest(new { error = r.Message });
+            if (!r.Success) return Results.BadRequest(new { error = r.Message, code = r.ErrorCode });
 
             return Results.Ok(new
             {

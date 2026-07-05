@@ -52,7 +52,7 @@ public sealed class QueryExecutor
     {
         var collection = _catalog.GetCollection(stmt.Collection);
         if (collection is null)
-            return QueryResult.Error(BuildUnknownCollectionMessage(stmt.Collection));
+            return QueryResult.Error(BuildUnknownCollectionMessage(stmt.Collection), QueryResult.Codes.CollectionNotFound);
 
         // Can we push LIMIT down? Only if we don't need to sort afterward,
         // join, aggregate/group, or dedupe. Each of those operations needs
@@ -1010,7 +1010,7 @@ public sealed class QueryExecutor
     {
         var collection = _catalog.GetCollection(stmt.Collection);
         if (collection is null)
-            return QueryResult.Error($"Collection '{stmt.Collection}' not found. Insert data first.");
+            return QueryResult.Error($"Collection '{stmt.Collection}' not found. Insert data first.", QueryResult.Codes.CollectionNotFound);
 
         var definition = new IndexDefinition
         {

@@ -933,7 +933,7 @@ public static class DatabaseEndpoints
 
             var result = db.Execute(body.Sql);
             if (!result.Success)
-                return Results.BadRequest(new { error = result.Message });
+                return Results.BadRequest(new { error = result.Message, code = result.ErrorCode });
 
             var docs = result.Documents
                 .Select(d => JsonDocument.Parse(d.ToJson()).RootElement)
