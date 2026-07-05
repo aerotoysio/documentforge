@@ -69,9 +69,12 @@ public class Program
         Console.WriteLine();
         Console.WriteLine("  RUN A NODE");
         Console.WriteLine("    serve [--config node.json | --port N --data-dir DIR | --api-key KEY]");
+        Console.WriteLine("          [--insecure-dev-mode]  [--bind-all]");
         Console.WriteLine("          [--replication-role leader|follower --replication-port N");
         Console.WriteLine("           --leader-host H --leader-port N --auto-failover-seconds N]");
         Console.WriteLine("        Start the REST API for one node. Pairs with the admin UI.");
+        Console.WriteLine("        An API key (or scoped keys) is required; --insecure-dev-mode runs");
+        Console.WriteLine("        without auth for local development (loopback only, full admin).");
         Console.WriteLine("        Optional replication flags stand up a leader listener or follower loop.");
         Console.WriteLine();
         Console.WriteLine("  RUN AS A WINDOWS SERVICE (needs admin)");

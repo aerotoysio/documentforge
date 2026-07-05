@@ -53,8 +53,19 @@ public static class ServeCommand
             });
         }
 
+        // Issue #101 — CORS is scoped by auth state. With no keys anywhere
+        // (dev mode) every request is implicitly admin, so an allow-any
+        // policy would let any website script admin actions against a
+        // local node from the victim's browser. Dev mode therefore only
+        // accepts loopback origins; once auth is on, bearer tokens make
+        // cross-origin requests safe (browsers never attach them
+        // implicitly) and any origin is accepted. The probe is assigned
+        // after the key store exists; until then we stay restrictive.
+        Func<bool>? devModeProbe = null;
         builder.Services.AddCors(opts => opts.AddDefaultPolicy(p =>
-            p.AllowAnyOrigin().AllowAnyHeader().AllowAnyMethod()));
+            p.SetIsOriginAllowed(origin =>
+                    !(devModeProbe?.Invoke() ?? true) || IsLoopbackOrigin(origin))
+             .AllowAnyHeader().AllowAnyMethod()));
         var app = builder.Build();
         app.UseCors();
 
@@ -78,6 +89,26 @@ public static class ServeCommand
         registry.AttachOrCreate("_system", systemDbPath);
         var keyStore = new Auth.KeyStore(registry);
         keyStore.Reload();
+
+        // Issue #101 — deny by default. A node with no authentication
+        // anywhere refuses to start unless the operator explicitly opts
+        // in with --insecure-dev-mode, and even then only on loopback.
+        // Binding all interfaces without auth is never allowed.
+        var startupSecurityError = ValidateStartupSecurity(config, keyStore.Count);
+        if (startupSecurityError is not null)
+        {
+            Console.Error.WriteLine();
+            Console.Error.WriteLine($"  \x1b[31mERROR:\x1b[0m {startupSecurityError}");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("  To start this node, do one of the following:");
+            Console.Error.WriteLine("    --api-key <key>          set an admin key (or DFDB_API_KEY, or security.apiKey in node.json)");
+            Console.Error.WriteLine("    security.scopedKeys      define scoped keys in node.json");
+            Console.Error.WriteLine("    --insecure-dev-mode      run WITHOUT auth — local development only, loopback only");
+            Console.Error.WriteLine();
+            Console.Error.WriteLine("  Generate a key with: openssl rand -hex 24");
+            Console.Error.WriteLine();
+            return 1;
+        }
 
         // Issue #82 — persistent attach registry. Before this, any DB
         // attached via POST /databases lived in process memory only;
@@ -144,6 +175,7 @@ public static class ServeCommand
         // tipping into real auth the moment a sa login exists.)
         Func<bool> isDevMode = () =>
             string.IsNullOrEmpty(adminKey) && scopedKeys.Count == 0 && keyStore.Count == 0;
+        devModeProbe = isDevMode;
         app.Use(async (ctx, next) =>
         {
             if (ctx.Request.Method == "OPTIONS") { await next(); return; }
@@ -292,7 +324,7 @@ public static class ServeCommand
         // the foundation for the "create a local cluster in one click"
         // UX. Children are tracked, reaped on parent shutdown.
         var serviceManager = new ServiceManager();
-        ServiceEndpoints.Map(app, serviceManager, config.DataDir);
+        ServiceEndpoints.Map(app, serviceManager, config.DataDir, config);
 
         // Issue #73: managed (persisted) API keys. CRUD endpoints under
         // /admin/keys — all admin-scoped, backed by _system._keys via
@@ -322,6 +354,11 @@ public static class ServeCommand
         Console.WriteLine($"  security:   API key {(string.IsNullOrEmpty(config.Security?.ApiKey) ? "\x1b[90mOFF (dev mode)\x1b[0m" : "\x1b[32mON\x1b[0m")}" +
                           $"  |  TLS {(config.Security?.Tls is null ? "\x1b[90mOFF\x1b[0m" : "\x1b[32mON\x1b[0m")}" +
                           $"  |  replication-secret {(string.IsNullOrEmpty(config.Security?.ReplicationSecret) ? "\x1b[90mOFF\x1b[0m" : "\x1b[32mON\x1b[0m")}");
+        if (config.InsecureDevMode)
+        {
+            Console.WriteLine("  \x1b[31mWARNING:    --insecure-dev-mode — every request has FULL ADMIN access until a key is added.\x1b[0m");
+            Console.WriteLine("  \x1b[31m            Loopback only. Never use this outside local development.\x1b[0m");
+        }
         Console.WriteLine($"  replication: {replicationSummary}");
         Console.WriteLine();
         Console.WriteLine("  app API:   POST /query | GET /stats | GET /collections | POST /collections/{name}");
@@ -1335,6 +1372,50 @@ public static class ServeCommand
 
     private static IResult InvalidCollectionNameResult() =>
         Results.BadRequest(new { error = $"Collection name must match [a-zA-Z_][a-zA-Z0-9_]* and be at most {MaxCollectionNameLength} chars." });
+
+    /// <summary>
+    /// Issue #101 — the deny-by-default startup gate. Returns null when the
+    /// node is allowed to start, otherwise a human-readable refusal reason.
+    /// Rules, in order:
+    ///   <list type="bullet">
+    ///     <item>Any configured auth (admin key, scoped keys in node.json,
+    ///           or persisted keys in _system) → allowed.</item>
+    ///     <item>No auth + all-interfaces bind → refused, no override.</item>
+    ///     <item>No auth + loopback → refused unless
+    ///           <see cref="NodeConfig.InsecureDevMode"/> is set.</item>
+    ///   </list>
+    /// </summary>
+    internal static string? ValidateStartupSecurity(NodeConfig config, int persistedKeyCount)
+    {
+        var authConfigured =
+            !string.IsNullOrEmpty(config.Security?.ApiKey)
+            || (config.Security?.ScopedKeys?.Count ?? 0) > 0
+            || persistedKeyCount > 0;
+        if (authConfigured) return null;
+
+        if (config.BindAllInterfaces)
+            return "refusing to bind all interfaces (--bind-all) with no authentication configured. " +
+                   "This would expose an anonymous-admin database to the network. Set an API key first.";
+
+        if (!config.InsecureDevMode)
+            return "no authentication configured. Without a key every request has full admin access, " +
+                   "so the server refuses to start by default.";
+
+        return null; // loopback + explicit opt-in
+    }
+
+    /// <summary>
+    /// True when a CORS Origin header points at this machine (localhost,
+    /// 127.0.0.0/8, or [::1]) on any port/scheme. Used to pin dev-mode CORS
+    /// to same-machine browsers only.
+    /// </summary>
+    internal static bool IsLoopbackOrigin(string origin)
+    {
+        if (string.IsNullOrEmpty(origin)) return false;
+        if (!Uri.TryCreate(origin, UriKind.Absolute, out var uri)) return false;
+        if (uri.IsLoopback) return true;
+        return string.Equals(uri.Host, "localhost", StringComparison.OrdinalIgnoreCase);
+    }
 }
 
 // ---- DTOs ----

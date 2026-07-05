@@ -17,7 +17,7 @@ namespace DocumentForge.Cli.Commands;
 /// Endpoints:
 /// <code>
 ///   GET    /services                 — list managed children
-///   POST   /services { dataDir?, port?, nodeName? } — spawn
+///   POST   /services { dataDir?, port?, nodeName?, apiKey? } — spawn
 ///   DELETE /services/{port}          — stop + reap
 ///   GET    /services/{port}/logs     — tail the child's combined stdout/stderr
 /// </code>
@@ -32,7 +32,7 @@ namespace DocumentForge.Cli.Commands;
 /// </summary>
 public static class ServiceEndpoints
 {
-    public static void Map(IEndpointRouteBuilder app, ServiceManager manager, string defaultDataDirRoot)
+    public static void Map(IEndpointRouteBuilder app, ServiceManager manager, string defaultDataDirRoot, NodeConfig parentConfig)
     {
         // All /services + /routers verbs are admin-only — spawning a
         // child process is way more privileged than data-plane access.
@@ -64,11 +64,27 @@ public static class ServiceEndpoints
                     dataDir = Path.Combine(defaultDataDirRoot, "services", label);
                 }
 
+                // Issue #101 — children are deny-by-default like any serve.
+                // The child's admin key is the request's, falling back to
+                // the parent's; a parent that itself runs with
+                // --insecure-dev-mode spawns insecure (loopback) children.
+                var childKey = !string.IsNullOrEmpty(req.ApiKey)
+                    ? req.ApiKey
+                    : parentConfig.Security?.ApiKey;
+                if (string.IsNullOrEmpty(childKey) && !parentConfig.InsecureDevMode)
+                    return Results.BadRequest(new
+                    {
+                        error = "No API key for the child service. Pass 'apiKey' in the request body " +
+                                "(the parent has no admin key to inherit and was not started with --insecure-dev-mode)."
+                    });
+
                 var service = manager.Spawn(new SpawnOptions
                 {
                     DataDir = dataDir,
                     Port = req.Port ?? 0,
                     NodeName = req.NodeName,
+                    ApiKey = childKey,
+                    InsecureDevMode = string.IsNullOrEmpty(childKey) && parentConfig.InsecureDevMode,
                 });
 
                 return Results.Created($"/services/{service.Port}", new
@@ -159,4 +175,4 @@ public record SpawnRouterRequest(string ClusterConfigJson, int? Port = null, str
 
 // Phase 5 spawn payload. All optional — POST /services with {} is valid
 // and gives you a child on a free port with a derived data dir.
-public record SpawnServiceRequest(string? DataDir = null, int? Port = null, string? NodeName = null);
+public record SpawnServiceRequest(string? DataDir = null, int? Port = null, string? NodeName = null, string? ApiKey = null);

@@ -67,6 +67,7 @@ public sealed class ServiceManagerTests : IDisposable
         {
             DataDir = dir,
             BinaryPath = ResolveBinary(),
+            InsecureDevMode = true,
         });
 
         Assert.True(svc.Port > 0, "spawn must allocate a port");
@@ -80,10 +81,47 @@ public sealed class ServiceManagerTests : IDisposable
     }
 
     [Fact]
+    public void Spawn_WithoutAuthOrOptIn_ChildRefusesToStart()
+    {
+        // Issue #101 — serve is deny-by-default. A child spawned with no
+        // ApiKey and no InsecureDevMode must exit instead of coming up open.
+        var dir = FreshDir("noauth");
+        var svc = _manager.Spawn(new SpawnOptions { DataDir = dir, BinaryPath = ResolveBinary() });
+
+        Assert.False(svc.Ready, "an unauthenticated child must not become ready");
+        Assert.Contains("no authentication configured", _manager.ReadLog(svc.Port));
+    }
+
+    [Fact]
+    public void Spawn_WithApiKey_ChildStartsAndRequiresBearer()
+    {
+        var dir = FreshDir("withkey");
+        var svc = _manager.Spawn(new SpawnOptions
+        {
+            DataDir = dir,
+            BinaryPath = ResolveBinary(),
+            ApiKey = "test-child-key",
+        });
+
+        Assert.True(svc.Ready, $"child did not become ready within timeout. Log:\n{_manager.ReadLog(svc.Port)}");
+
+        using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(3) };
+        // Unauthenticated data-plane request → 401.
+        var anon = http.GetAsync($"{svc.BaseUrl}/collections").GetAwaiter().GetResult();
+        Assert.Equal(System.Net.HttpStatusCode.Unauthorized, anon.StatusCode);
+
+        // Correct bearer → 200.
+        using var req = new HttpRequestMessage(HttpMethod.Get, $"{svc.BaseUrl}/collections");
+        req.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", "test-child-key");
+        var authed = http.SendAsync(req).GetAwaiter().GetResult();
+        Assert.True(authed.IsSuccessStatusCode);
+    }
+
+    [Fact]
     public void List_ReflectsRunningChildren()
     {
         var dir = FreshDir("list");
-        var svc = _manager.Spawn(new SpawnOptions { DataDir = dir, BinaryPath = ResolveBinary() });
+        var svc = _manager.Spawn(new SpawnOptions { DataDir = dir, BinaryPath = ResolveBinary(), InsecureDevMode = true });
 
         var entries = _manager.List();
         Assert.Contains(entries, e => e.Port == svc.Port && e.Running);
@@ -93,7 +131,7 @@ public sealed class ServiceManagerTests : IDisposable
     public void Stop_TerminatesAndReaps()
     {
         var dir = FreshDir("stop");
-        var svc = _manager.Spawn(new SpawnOptions { DataDir = dir, BinaryPath = ResolveBinary() });
+        var svc = _manager.Spawn(new SpawnOptions { DataDir = dir, BinaryPath = ResolveBinary(), InsecureDevMode = true });
 
         Assert.True(_manager.Stop(svc.Port));
         Assert.DoesNotContain(_manager.List(), e => e.Port == svc.Port);
@@ -118,12 +156,12 @@ public sealed class ServiceManagerTests : IDisposable
     public void Spawn_RejectsDuplicatePort()
     {
         var dir = FreshDir("dupport");
-        var svc = _manager.Spawn(new SpawnOptions { DataDir = dir, BinaryPath = ResolveBinary() });
+        var svc = _manager.Spawn(new SpawnOptions { DataDir = dir, BinaryPath = ResolveBinary(), InsecureDevMode = true });
 
         // Same explicit port → ServiceManager refuses to track a second.
         var dir2 = FreshDir("dupport2");
         var ex = Assert.Throws<InvalidOperationException>(() =>
-            _manager.Spawn(new SpawnOptions { DataDir = dir2, Port = svc.Port, BinaryPath = ResolveBinary() }));
+            _manager.Spawn(new SpawnOptions { DataDir = dir2, Port = svc.Port, BinaryPath = ResolveBinary(), InsecureDevMode = true }));
         Assert.Contains("already managed", ex.Message);
     }
 
@@ -134,7 +172,7 @@ public sealed class ServiceManagerTests : IDisposable
         // stdout right after Kestrel starts. The manager tees output to a
         // per-child log; ReadLog should surface those lines.
         var dir = FreshDir("logs");
-        var svc = _manager.Spawn(new SpawnOptions { DataDir = dir, BinaryPath = ResolveBinary() });
+        var svc = _manager.Spawn(new SpawnOptions { DataDir = dir, BinaryPath = ResolveBinary(), InsecureDevMode = true });
 
         // Give the log writer a moment to flush — the redirected pipe
         // event handlers are best-effort.

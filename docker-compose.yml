@@ -5,13 +5,14 @@
 # if you'd rather pull our published images.
 #
 # Quickstart:
-#   cp .env.example .env          # then edit .env
+#   cp .env.example .env          # then set DFDB_API_KEY (required)
 #   docker compose up -d
 #   open http://localhost:3000     (admin UI)
 #   curl http://localhost:5000/health   (engine API)
 #
 # Production tweaks worth knowing about:
-#   - Set DFDB_API_KEY in .env (any non-empty value enables auth on the engine)
+#   - DFDB_API_KEY in .env is REQUIRED — the engine refuses to start with
+#     no key configured (deny-by-default, issue #101)
 #   - Set DFDB_REPLICATION_SECRET if you'll add follower nodes
 #   - Bind ports to 127.0.0.1 (default) — only flip to "0.0.0.0:5000:5000"
 #     if you understand your network

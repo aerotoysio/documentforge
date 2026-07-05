@@ -6,11 +6,11 @@ namespace DocumentForge.Cli;
 /// Per-node configuration. Loaded in this priority order:
 ///   1. --config node.json
 ///   2. CLI flags (--port, --data-dir, --node-name, --api-key, --replication-secret, --bind-all,
-///                 --replication-role, --replication-port, --leader-host, --leader-port,
-///                 --auto-failover-seconds)
+///                 --insecure-dev-mode, --replication-role, --replication-port, --leader-host,
+///                 --leader-port, --auto-failover-seconds)
 ///   3. Env vars (DFDB_PORT, DFDB_DATA_DIR, DFDB_NODE_NAME, DFDB_API_KEY, DFDB_REPLICATION_SECRET,
-///                DFDB_REPLICATION_ROLE, DFDB_REPLICATION_PORT, DFDB_LEADER_HOST, DFDB_LEADER_PORT,
-///                DFDB_AUTO_FAILOVER_SECONDS)
+///                DFDB_INSECURE_DEV_MODE, DFDB_REPLICATION_ROLE, DFDB_REPLICATION_PORT,
+///                DFDB_LEADER_HOST, DFDB_LEADER_PORT, DFDB_AUTO_FAILOVER_SECONDS)
 ///   4. Defaults (single-node localhost:5000 with CWD/data, no replication)
 /// </summary>
 public sealed class NodeConfig
@@ -19,6 +19,15 @@ public sealed class NodeConfig
     public int Port { get; set; } = 5000;
     public string DataDir { get; set; } = Path.Combine(Directory.GetCurrentDirectory(), "data");
     public bool BindAllInterfaces { get; set; } = false;
+
+    /// <summary>
+    /// Issue #101 — explicit opt-in to run WITHOUT any authentication.
+    /// Off by default: a node with no admin key, no scoped keys and no
+    /// persisted keys refuses to start unless this is set. Only honoured
+    /// on loopback; combining it with <see cref="BindAllInterfaces"/> is
+    /// always a startup error.
+    /// </summary>
+    public bool InsecureDevMode { get; set; } = false;
     public SecurityConfig? Security { get; set; }
     public ReplicationConfig? Replication { get; set; }
     public NetworkConfig? Network { get; set; }
@@ -101,6 +110,7 @@ public sealed class NodeConfig
             }
         }
         if (args.Contains("--bind-all")) c.BindAllInterfaces = true;
+        if (args.Contains("--insecure-dev-mode")) c.InsecureDevMode = true;
 
         var envName = Environment.GetEnvironmentVariable("DFDB_NODE_NAME");
         var envPort = Environment.GetEnvironmentVariable("DFDB_PORT");
@@ -119,6 +129,13 @@ public sealed class NodeConfig
         {
             c.Security ??= new SecurityConfig();
             c.Security.ReplicationSecret ??= envRep;
+        }
+
+        var envInsecure = Environment.GetEnvironmentVariable("DFDB_INSECURE_DEV_MODE");
+        if (!string.IsNullOrEmpty(envInsecure) &&
+            (envInsecure == "1" || envInsecure.Equals("true", StringComparison.OrdinalIgnoreCase)))
+        {
+            c.InsecureDevMode = true;
         }
 
         // Replication env vars

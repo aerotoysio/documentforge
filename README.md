@@ -6,7 +6,8 @@ replication, sharding — in ~6,000 lines with zero external dependencies.**
 **One binary does it all:**
 
 ```bash
-dfdb serve    --port 5000 --data-dir ./data       # run a node
+dfdb serve    --port 5000 --api-key <key>         # run a node (auth is required;
+                                                  #  --insecure-dev-mode for local-only tinkering)
 dfdb repl     ./data/data.dfdb                    # interactive SQL
 dfdb query    ./data/data.dfdb "SELECT * FROM o"  # one-shot query
 dfdb seed     ./data/data.dfdb 10000              # demo data
@@ -77,8 +78,10 @@ Build once, ship anywhere — self-contained, no runtime needed on the target ma
 Produces `dist/win-x64/dfdb.exe` (and friends) — drop on any server:
 
 ```bash
-# Serve a node
-./dfdb serve --port 5000 --data-dir ./data
+# Serve a node — an API key is required (deny-by-default).
+# For throwaway local tinkering you can pass --insecure-dev-mode instead
+# (loopback only; every request is admin until a key is added).
+./dfdb serve --port 5000 --data-dir ./data --api-key "$(openssl rand -hex 24)"
 
 # Seed + query
 ./dfdb seed  ./data/data.dfdb 10000

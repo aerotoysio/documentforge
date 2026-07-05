@@ -184,6 +184,13 @@ public sealed class ServiceManager : IDisposable
         if (!string.IsNullOrEmpty(options.NodeName))
             args.AddRange(new[] { "--node", options.NodeName });
 
+        // Issue #101: serve is deny-by-default, so the child must be given
+        // its security posture explicitly or it will refuse to start.
+        if (!string.IsNullOrEmpty(options.ApiKey))
+            args.AddRange(new[] { "--api-key", options.ApiKey });
+        else if (options.InsecureDevMode)
+            args.Add("--insecure-dev-mode");
+
         var psi = new ProcessStartInfo
         {
             FileName = binary,
@@ -379,6 +386,15 @@ public sealed class SpawnOptions
     /// the path to the built dfdb host because under `dotnet test`
     /// <see cref="Environment.ProcessPath"/> points at the test runner.</summary>
     public string? BinaryPath { get; init; }
+
+    /// <summary>Admin API key for the child. Issue #101 made `dfdb serve`
+    /// deny-by-default, so every spawn needs either a key or an explicit
+    /// <see cref="InsecureDevMode"/> opt-in or the child exits immediately.</summary>
+    public string? ApiKey { get; init; }
+
+    /// <summary>Start the child with --insecure-dev-mode (no auth, loopback
+    /// only). Ignored when <see cref="ApiKey"/> is set.</summary>
+    public bool InsecureDevMode { get; init; }
 }
 
 /// <summary>Internal record of a running child. Studio sees the projection

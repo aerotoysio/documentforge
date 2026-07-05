@@ -64,8 +64,8 @@ public sealed class RouterIntegrationTests : IDisposable
     {
         // Spawn two backing dfdb instances on free ports.
         var binary = ResolveBinary();
-        var ringA = _services.Spawn(new SpawnOptions { DataDir = FreshDir("ring-a"), BinaryPath = binary });
-        var ringB = _services.Spawn(new SpawnOptions { DataDir = FreshDir("ring-b"), BinaryPath = binary });
+        var ringA = _services.Spawn(new SpawnOptions { DataDir = FreshDir("ring-a"), BinaryPath = binary, InsecureDevMode = true });
+        var ringB = _services.Spawn(new SpawnOptions { DataDir = FreshDir("ring-b"), BinaryPath = binary, InsecureDevMode = true });
         Assert.True(ringA.Ready, "ring-a never became ready");
         Assert.True(ringB.Ready, "ring-b never became ready");
 
@@ -118,8 +118,8 @@ public sealed class RouterIntegrationTests : IDisposable
         // For lookup tables and reference data, every ring needs the
         // same content. The router fans the insert to every leader.
         var binary = ResolveBinary();
-        var ringA = _services.Spawn(new SpawnOptions { DataDir = FreshDir("ring-a"), BinaryPath = binary });
-        var ringB = _services.Spawn(new SpawnOptions { DataDir = FreshDir("ring-b"), BinaryPath = binary });
+        var ringA = _services.Spawn(new SpawnOptions { DataDir = FreshDir("ring-a"), BinaryPath = binary, InsecureDevMode = true });
+        var ringB = _services.Spawn(new SpawnOptions { DataDir = FreshDir("ring-b"), BinaryPath = binary, InsecureDevMode = true });
         Assert.True(ringA.Ready && ringB.Ready);
 
         var config = new ClusterConfig
@@ -164,8 +164,8 @@ public sealed class RouterIntegrationTests : IDisposable
         // should pin to shards[0] rather than crash — keeps the
         // "spin up a router and start poking" UX smooth.
         var binary = ResolveBinary();
-        var ringA = _services.Spawn(new SpawnOptions { DataDir = FreshDir("ring-a"), BinaryPath = binary });
-        var ringB = _services.Spawn(new SpawnOptions { DataDir = FreshDir("ring-b"), BinaryPath = binary });
+        var ringA = _services.Spawn(new SpawnOptions { DataDir = FreshDir("ring-a"), BinaryPath = binary, InsecureDevMode = true });
+        var ringB = _services.Spawn(new SpawnOptions { DataDir = FreshDir("ring-b"), BinaryPath = binary, InsecureDevMode = true });
         Assert.True(ringA.Ready && ringB.Ready);
 
         var config = new ClusterConfig
