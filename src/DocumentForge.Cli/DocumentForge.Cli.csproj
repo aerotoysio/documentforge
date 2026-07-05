@@ -14,6 +14,10 @@
     <ProjectReference Include="..\DocumentForge.Engine\DocumentForge.Engine.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="DocumentForge.Tests" />
+  </ItemGroup>
+
   <!-- Windows service host support: UseWindowsService() is a no-op unless the
        process is actually launched by the Service Control Manager, so this
        stays safe for console `serve` and for Linux/macOS builds. -->
