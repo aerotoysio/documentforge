@@ -20,6 +20,7 @@ public class Program
             return sub switch
             {
                 "serve"     => ServeCommand.Run(rest),
+                "service"   => ServiceCommand.Run(rest),
                 "router"    => RouterCommand.Run(rest),
                 "repl"      => ReplCommand.Run(rest),
                 "inspect"   => InspectCommand.Run(rest),
@@ -72,6 +73,11 @@ public class Program
         Console.WriteLine("           --leader-host H --leader-port N --auto-failover-seconds N]");
         Console.WriteLine("        Start the REST API for one node. Pairs with the admin UI.");
         Console.WriteLine("        Optional replication flags stand up a leader listener or follower loop.");
+        Console.WriteLine();
+        Console.WriteLine("  RUN AS A WINDOWS SERVICE (needs admin)");
+        Console.WriteLine("    service install [--port 4300 --data-dir DIR --api-key KEY]");
+        Console.WriteLine("    service uninstall | start | stop | status");
+        Console.WriteLine("        Register/manage dfdb as a native Windows service (services.msc).");
         Console.WriteLine();
         Console.WriteLine("  QUERY LOCAL DATABASE");
         Console.WriteLine("    inspect <file>                       Show stats, collections, indexes");

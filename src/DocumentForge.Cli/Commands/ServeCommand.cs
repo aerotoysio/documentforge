@@ -4,6 +4,7 @@ using DocumentForge.Core;
 using DocumentForge.Document;
 using DocumentForge.Engine;
 using DocumentForge.Index;
+using Microsoft.Extensions.Hosting;
 
 namespace DocumentForge.Cli.Commands;
 
@@ -18,6 +19,10 @@ public static class ServeCommand
         var config = NodeConfig.Load(args);
 
         var builder = WebApplication.CreateBuilder(args);
+
+        // Run happily as a Windows service when launched by the SCM (via
+        // `dfdb service install`); a no-op for normal console `serve`.
+        builder.Host.UseWindowsService(options => options.ServiceName = "DocumentForge");
 
         // Sensible default logging - quiet the per-request ASP.NET Core chatter
         // (4-5 lines per request swamps real signal at any traffic) but keep the

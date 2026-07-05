@@ -18,6 +18,13 @@
     <InternalsVisibleTo Include="DocumentForge.Tests" />
   </ItemGroup>
 
+  <!-- Windows service host support: UseWindowsService() is a no-op unless the
+       process is actually launched by the Service Control Manager, so this
+       stays safe for console `serve` and for Linux/macOS builds. -->
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="9.*" />
+  </ItemGroup>
+
   <!-- Pull in the airline seed data file so `dfdb seed` works out of the box -->
   <ItemGroup>
     <Compile Include="..\..\samples\DocumentForge.AirlineDemo\SeedData.cs" Link="SeedData.cs" />
