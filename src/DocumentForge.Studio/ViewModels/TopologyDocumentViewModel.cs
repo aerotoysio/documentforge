@@ -122,10 +122,17 @@ public sealed partial class TopologyDocumentViewModel : DocumentViewModel
                 {
                     foreach (var f in status.Followers)
                     {
+                        // The leader only knows a follower by its replication-link
+                        // socket (an ephemeral TCP port, not connectable) unless the
+                        // follower advertised an HTTP endpoint. Label honestly so
+                        // nobody tries to connect to the ephemeral port.
+                        var connectable = !string.IsNullOrWhiteSpace(f.HttpEndpoint);
                         var peer = new TopoNode
                         {
-                            Title = f.Endpoint,
-                            Subtitle = $"follower · lag {f.LagSeq:N0}",
+                            Title = connectable ? f.HttpEndpoint! : f.Endpoint,
+                            Subtitle = connectable
+                                ? $"follower · lag {f.LagSeq:N0}"
+                                : $"follower · replication link (not HTTP) · lag {f.LagSeq:N0}",
                             X = rightX, Y = peerY, Width = nodeW,
                             Fill = FollowerFill, Stroke = FollowerStroke,
                         };
@@ -139,7 +146,7 @@ public sealed partial class TopologyDocumentViewModel : DocumentViewModel
                     var peer = new TopoNode
                     {
                         Title = leaderEp,
-                        Subtitle = "leader",
+                        Subtitle = "leader · replication link (not HTTP)",
                         X = rightX, Y = peerY, Width = nodeW,
                         Fill = LeaderFill, Stroke = LeaderStroke,
                     };

@@ -16,14 +16,18 @@
             </ToolBar>
         </ToolBarTray>
 
-        <!-- Legend -->
-        <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" Margin="10,6">
-            <Border Width="14" Height="14" Background="#E8F0FE" BorderBrush="#2A5DB0" BorderThickness="1" VerticalAlignment="Center"/>
-            <TextBlock Text="Leader" Margin="4,0,16,0" VerticalAlignment="Center"/>
-            <Border Width="14" Height="14" Background="#E6F7EC" BorderBrush="#2E8B57" BorderThickness="1" VerticalAlignment="Center"/>
-            <TextBlock Text="Follower" Margin="4,0,16,0" VerticalAlignment="Center"/>
-            <Border Width="14" Height="14" Background="#F2F2F2" BorderBrush="#999999" BorderThickness="1" VerticalAlignment="Center"/>
-            <TextBlock Text="Standalone" Margin="4,0,16,0" VerticalAlignment="Center"/>
+        <!-- Legend + footnote -->
+        <StackPanel DockPanel.Dock="Bottom" Margin="10,6">
+            <StackPanel Orientation="Horizontal">
+                <Border Width="14" Height="14" Background="#E8F0FE" BorderBrush="#2A5DB0" BorderThickness="1" VerticalAlignment="Center"/>
+                <TextBlock Text="Leader" Margin="4,0,16,0" VerticalAlignment="Center"/>
+                <Border Width="14" Height="14" Background="#E6F7EC" BorderBrush="#2E8B57" BorderThickness="1" VerticalAlignment="Center"/>
+                <TextBlock Text="Follower" Margin="4,0,16,0" VerticalAlignment="Center"/>
+                <Border Width="14" Height="14" Background="#F2F2F2" BorderBrush="#999999" BorderThickness="1" VerticalAlignment="Center"/>
+                <TextBlock Text="Standalone" Margin="4,0,16,0" VerticalAlignment="Center"/>
+            </StackPanel>
+            <TextBlock Foreground="Gray" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap"
+                       Text="Peer boxes labelled &quot;replication link&quot; show a replication TCP socket (an ephemeral port), not a connectable HTTP endpoint — don't try to connect to them. Left-column boxes are this node's databases."/>
         </StackPanel>
 
         <!-- Graph -->
