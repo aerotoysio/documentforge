@@ -892,13 +892,23 @@ public static class DatabaseEndpoints
                 return Results.NotFound(new { error = $"Database '{name}' is not attached." });
             try
             {
+                // Issue #112 — advertise a CONNECTABLE HTTP endpoint for this
+                // follower so the leader's /replication/status (and Studio's
+                // topology graph) shows a real address instead of the follower's
+                // ephemeral replication-socket source port. Explicit body value
+                // wins; otherwise default to how the caller reached this node
+                // (scheme://host of the incoming request).
+                var ownHttp = !string.IsNullOrWhiteSpace(body.HttpEndpoint)
+                    ? body.HttpEndpoint
+                    : $"{ctx.Request.Scheme}://{ctx.Request.Host}";
                 db.StartLogicalReplicationFollower(body.Host, body.Port, body.SharedSecret,
-                    ownHttpEndpoint: null);
+                    ownHttpEndpoint: ownHttp);
                 return Results.Ok(new
                 {
                     database = name,
                     role = "follower",
                     leader = $"{body.Host}:{body.Port}",
+                    httpEndpoint = ownHttp,
                 });
             }
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
@@ -1223,7 +1233,7 @@ public record QueryBody(string Sql);
 // flag for re-attaching a follower to a different leader).
 // ----------------------------------------------------------------
 public record StartLeaderBody(int Port, string? SharedSecret = null);
-public record StartFollowerBody(string Host, int Port, string? SharedSecret = null);
+public record StartFollowerBody(string Host, int Port, string? SharedSecret = null, string? HttpEndpoint = null);
 public record PromoteBody(int Port);
 
 /// <summary>

@@ -377,6 +377,16 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
         Assert.True(alphaStatus.Leader!.FollowerCount >= 1);
         Assert.Equal("follower", betaStatus!.Role);
         Assert.NotNull(betaStatus.Follower?.Leader);
+
+        // Issue #112 — the follower entry must expose a CONNECTABLE httpEndpoint
+        // (its own HTTP base URL), not just the ephemeral replication TCP socket.
+        var followerEntry = alphaStatus.Leader.Followers.FirstOrDefault();
+        Assert.NotNull(followerEntry);
+        Assert.False(string.IsNullOrEmpty(followerEntry!.HttpEndpoint),
+            "follower should advertise a connectable httpEndpoint (issue #112)");
+        Assert.StartsWith("http", followerEntry.HttpEndpoint!);
+        // And it must differ from the ephemeral replication source-port socket.
+        Assert.NotEqual(followerEntry.Endpoint, followerEntry.HttpEndpoint);
         Assert.Equal($"localhost:{replPort}", betaStatus.Follower!.Leader!.Endpoint);
     }
 
@@ -1390,6 +1400,12 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
     {
         public ulong CurrentSeq { get; set; }
         public int FollowerCount { get; set; }
+        public List<ReplicationFollowerEntry> Followers { get; set; } = new();
+    }
+    private sealed class ReplicationFollowerEntry
+    {
+        public string? Endpoint { get; set; }
+        public string? HttpEndpoint { get; set; }
     }
     private sealed class ReplicationFollowerInfo
     {
