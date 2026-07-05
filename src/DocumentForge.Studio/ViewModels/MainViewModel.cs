@@ -17,9 +17,17 @@ public sealed partial class MainViewModel : ObservableObject
     {
         _workspace = workspace;
         _dialogs = dialogs;
+        Documents.Add(new WelcomeDocumentViewModel());
+        _activeDocument = Documents[0];
     }
 
     public ObservableCollection<ServerNodeViewModel> Servers { get; } = new();
+
+    /// <summary>Tabs in the main document area (Welcome + query tabs).</summary>
+    public ObservableCollection<DocumentViewModel> Documents { get; } = new();
+
+    [ObservableProperty]
+    private DocumentViewModel? _activeDocument;
 
     [ObservableProperty]
     private string _statusText = "Ready";
@@ -228,6 +236,43 @@ public sealed partial class MainViewModel : ObservableObject
     private void Exit() => System.Windows.Application.Current.Shutdown();
 
     public void ComingSoon(string message) => _dialogs.ShowInfo("Coming soon", message);
+
+    /// <summary>Opens a query tab against a specific database, optionally seeded
+    /// with SQL (e.g. "SELECT * FROM orders LIMIT 100" from a collection node).</summary>
+    public void OpenQuery(IDfConnection connection, string database, string? initialSql = null)
+    {
+        var document = new QueryDocumentViewModel(connection, database, _workspace, initialSql);
+        Documents.Add(document);
+        ActiveDocument = document;
+        StatusText = $"New query on {database}";
+    }
+
+    /// <summary>Opens a query tab against a server's default database (or its
+    /// first, for a single-file connection).</summary>
+    public async Task OpenQueryOnServerAsync(ServerNodeViewModel server)
+    {
+        try
+        {
+            var databases = await server.Connection.GetDatabasesAsync();
+            var target = databases.FirstOrDefault(d => d.IsDefault) ?? databases.FirstOrDefault();
+            if (target is null)
+            {
+                _dialogs.ShowError("New query", "This connection has no databases to query.");
+                return;
+            }
+            OpenQuery(server.Connection, target.Name);
+        }
+        catch (Exception ex)
+        {
+            _dialogs.ShowError("New query", ex.Message);
+        }
+    }
+
+    public void CloseDocument(object? content)
+    {
+        if (content is DocumentViewModel { CanClose: true } document)
+            Documents.Remove(document);
+    }
 
     public async Task ShutdownAsync()
     {

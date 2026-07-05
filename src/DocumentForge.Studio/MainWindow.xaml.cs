@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Windows;
+using AvalonDock;
 using DocumentForge.Studio.Core.Settings;
 using DocumentForge.Studio.Services;
 using DocumentForge.Studio.ViewModels;
@@ -16,6 +17,11 @@ public partial class MainWindow : Window
         _viewModel = new MainViewModel(workspace, new DialogService(this, workspace));
         DataContext = _viewModel;
     }
+
+    // AvalonDock owns the tab lifecycle; mirror a closed document back into the
+    // bound collection so the VM and the dock stay in sync.
+    private void OnDocumentClosed(object? sender, DocumentClosedEventArgs e)
+        => _viewModel.CloseDocument(e.Document.Content);
 
     protected override async void OnClosing(CancelEventArgs e)
     {

@@ -24,6 +24,9 @@ publish/
 *.dfdb
 *.dfdb.wal
 *.dfdb.recovery
+*.dfdb.lock
+*.dfdb.prepared.log
+*.dfdb.coord.log
 *.followerseq
 
 ## NuGet artifacts
