@@ -106,12 +106,20 @@ public sealed class BackupManager
             // always at a checkpointed boundary.
             db.Snapshot(fullPath);
 
+            // Blob follow-up (#109): capture the out-of-line blob store so a
+            // restored DB's attachments come with it. Copied AFTER the data
+            // snapshot: a blob's bytes are fsync'd BEFORE its descriptor is
+            // recorded, so every $blob descriptor in the snapshot is guaranteed
+            // to have its bytes in the store we copy here. Extra blobs uploaded
+            // after the snapshot are harmless (unreferenced → GC-able).
+            long blobBytes = CopyBlobSidecars(db.FilePath, fullPath);
+
             var record = new BackupRecord
             {
                 Id = Guid.NewGuid().ToString("N"),
                 Database = databaseName,
                 Path = fullPath,
-                SizeBytes = new FileInfo(fullPath).Length,
+                SizeBytes = new FileInfo(fullPath).Length + blobBytes,
                 CreatedAtUtc = DateTime.UtcNow,
                 Kind = kind,
             };
@@ -277,9 +285,38 @@ public sealed class BackupManager
                     $"data dir. Either Drop it via /databases/{newDatabaseName}?deleteFiles=true (after " +
                     $"attaching it) or pick a different name.");
             File.Copy(record.Path, targetPath);
+            // Restore the captured blob store alongside the data file so the
+            // restored DB's attachments resolve (#109).
+            RestoreBlobSidecars(record.Path, targetPath);
             _registry.AttachOrCreate(newDatabaseName, targetPath);
         }
         return targetPath;
+    }
+
+    // Blob follow-up (#109): the blob store lives at "<data>.blobs" (+ ".idx").
+    // These copy it beside a backup snapshot and back on restore. Missing
+    // sidecars (a DB that never used blobs) are simply skipped.
+    private static long CopyBlobSidecars(string sourceDataPath, string backupDataPath)
+    {
+        long copied = 0;
+        foreach (var ext in new[] { ".blobs", ".blobs.idx" })
+        {
+            var src = sourceDataPath + ext;
+            if (!File.Exists(src)) continue;
+            var dst = backupDataPath + ext;
+            File.Copy(src, dst, overwrite: true);
+            copied += new FileInfo(dst).Length;
+        }
+        return copied;
+    }
+
+    private static void RestoreBlobSidecars(string backupDataPath, string targetDataPath)
+    {
+        foreach (var ext in new[] { ".blobs", ".blobs.idx" })
+        {
+            var src = backupDataPath + ext;
+            if (File.Exists(src)) File.Copy(src, targetDataPath + ext, overwrite: false);
+        }
     }
 
     /// <summary>Read the singleton config doc. Returns null if no settings
