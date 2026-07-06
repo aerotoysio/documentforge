@@ -225,7 +225,7 @@ public sealed class ResumableUploadTests : IDisposable
         app.MapPut("/collections/{name}/{id}/blob/{field}", (string name, string id, string field, HttpRequest request) =>
             BlobHandler.Upload(db, blobs.For(db), name, id, field, request));
         app.MapGet("/collections/{name}/{id}/blob/{field}", (string name, string id, string field, HttpRequest request, HttpResponse response) =>
-            BlobHandler.Download(db, blobs.For(db), name, id, field, request, response));
+            BlobHandler.Download(db, blobs, name, id, field, request, response));
         app.StartAsync().GetAwaiter().GetResult();
         _disposables.Add(new Stopper(app));
         return ($"http://127.0.0.1:{port}", db);

@@ -1266,10 +1266,10 @@ public static class DatabaseEndpoints
             var (db, deny) = Resolve(ctx, name, write: true);
             return deny is not null ? Task.FromResult(deny) : Blobs.BlobHandler.Upload(db!, blobs.For(db!), collection, id, field, request);
         }
-        IResult Download(HttpContext ctx, string name, string collection, string id, string field, HttpRequest request, HttpResponse response)
+        async Task<IResult> Download(HttpContext ctx, string name, string collection, string id, string field, HttpRequest request, HttpResponse response)
         {
             var (db, deny) = Resolve(ctx, name, write: false);
-            return deny ?? Blobs.BlobHandler.Download(db!, blobs.For(db!), collection, id, field, request, response);
+            return deny ?? await Blobs.BlobHandler.Download(db!, blobs, collection, id, field, request, response);
         }
         IResult Remove(HttpContext ctx, string name, string collection, string id, string field, HttpRequest request)
         {
@@ -1319,6 +1319,18 @@ public static class DatabaseEndpoints
             if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
             var r = blobs.For(db).Compact();
             return Results.Ok(new { database = name, success = true, liveBlobs = r.LiveBlobs, droppedBlobs = r.DroppedBlobs, bytesReclaimed = r.BytesReclaimed });
+        });
+        // Content-addressed raw fetch (a follower's lazy-replication source), per DB.
+        app.MapGet("/db/{name}/blobs/raw/{sha256}", (HttpContext ctx, string name, string sha256, HttpResponse response) =>
+        {
+            var (db, deny) = Resolve(ctx, name, write: false);
+            if (deny is not null) return deny;
+            if (!Blobs.BlobHandler.IsValidBlobId(sha256))
+                return Results.BadRequest(new { error = "Blob id must be a 64-char SHA-256 hex string." });
+            var stream = blobs.For(db!).OpenRead(sha256);
+            if (stream is null) return Results.NotFound(new { error = "Blob not stored here." });
+            response.Headers["Accept-Ranges"] = "bytes";
+            return Results.Stream(stream, "application/octet-stream");
         });
     }
 }

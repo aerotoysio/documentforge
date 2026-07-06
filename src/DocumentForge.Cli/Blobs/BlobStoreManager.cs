@@ -24,6 +24,38 @@ public sealed class BlobStoreManager : IDisposable
     public BlobStore For(string dataFilePath) =>
         _stores.GetOrAdd(dataFilePath, p => new BlobStore(p + ".blobs"));
 
+    /// <summary>
+    /// Blob follow-up (#109) — optional upstream byte source for lazy
+    /// replication. On a follower, the replicated document carries the
+    /// <c>$blob</c> DESCRIPTOR but not the bytes; when a read misses locally the
+    /// handler pulls the bytes from the leader by content hash through this
+    /// delegate. Null on a leader / standalone node (a miss is just a 404).
+    /// Returns the raw byte stream for a hash, or null if the upstream doesn't
+    /// have it either.
+    /// </summary>
+    public Func<string, CancellationToken, Task<Stream?>>? Upstream { get; set; }
+
+    /// <summary>
+    /// Ensure <paramref name="hash"/>'s bytes are present in
+    /// <paramref name="store"/>, pulling from <see cref="Upstream"/> if
+    /// configured and the blob is missing locally. Returns true if the bytes are
+    /// now local. The pull is integrity-checked: the content-addressed store
+    /// files the bytes under their real SHA-256, and we reject the pull if that
+    /// doesn't equal the requested hash — so a buggy or hostile upstream can
+    /// never make us serve the wrong bytes.
+    /// </summary>
+    public async Task<bool> EnsureLocalAsync(BlobStore store, string hash, CancellationToken ct = default)
+    {
+        if (store.LengthOf(hash) is not null) return true;      // already here
+        if (Upstream is null) return false;                     // no leader to pull from
+
+        using var upstream = await Upstream(hash, ct);
+        if (upstream is null) return false;                     // leader doesn't have it either
+
+        var (storedId, _) = await store.PutAsync(upstream, ct);
+        return string.Equals(storedId, hash, StringComparison.OrdinalIgnoreCase);
+    }
+
     /// <summary>Render the small, fixed-shape descriptor JSON written into the
     /// document field. Uses the reserved <c>$blob</c> key so reads recognise it.
     /// Staying tiny is what keeps page density, index scans and the replication

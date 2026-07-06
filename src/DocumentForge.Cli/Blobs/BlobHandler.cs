@@ -160,6 +160,17 @@ public static class BlobHandler
     /// <c>bytes {start}-{end}/{total}</c> (a chunk) and <c>bytes */{total}</c>
     /// (a status probe). A <c>*</c> total is rejected — the total must be known
     /// so the server can tell when the upload is complete.</summary>
+    /// <summary>A blob id is a lowercase 64-char SHA-256 hex string. Validated
+    /// before it ever touches a store lookup so it can't smuggle path
+    /// characters into the raw-fetch route.</summary>
+    public static bool IsValidBlobId(string id)
+    {
+        if (string.IsNullOrEmpty(id) || id.Length != 64) return false;
+        foreach (var c in id)
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) return false;
+        return true;
+    }
+
     internal static bool TryParseContentRange(string header, out bool statusProbe, out long start, out long total)
     {
         statusProbe = false; start = 0; total = 0;
@@ -184,10 +195,17 @@ public static class BlobHandler
     }
 
     /// <summary>GET — stream a blob's bytes back, honouring an HTTP Range
-    /// header (206 Partial Content). 404 if the doc/field/blob is missing.</summary>
-    public static IResult Download(
-        DocumentForgeDb db, BlobStore store, string collection, string id, string field, HttpRequest request, HttpResponse response)
+    /// header (206 Partial Content). 404 if the doc/field/blob is missing.
+    ///
+    /// <para>Blob replication (#109): if the bytes are missing locally (a
+    /// follower that has the replicated descriptor but not the payload) and an
+    /// <see cref="BlobStoreManager.Upstream"/> is configured, the bytes are
+    /// pulled from the leader by content hash and stored (hash-verified) before
+    /// serving — lazy, on-demand replication.</para></summary>
+    public static async Task<IResult> Download(
+        DocumentForgeDb db, BlobStoreManager blobs, string collection, string id, string field, HttpRequest request, HttpResponse response)
     {
+        var store = blobs.For(db);
         if (!Guid.TryParse(id, out var guid))
             return Results.BadRequest(new { error = "Expected DocumentForge's internal _id (a GUID)." });
 
@@ -203,7 +221,14 @@ public static class BlobHandler
             return Results.NotFound(new { error = $"Field '{field}' is not a blob reference." });
 
         var total = store.LengthOf(desc.Value.Id);
-        if (total is null) return Results.NotFound(new { error = "Blob bytes are not present (collected or not replicated)." });
+        if (total is null)
+        {
+            // Missing locally — try to lazily pull it from the leader.
+            if (await blobs.EnsureLocalAsync(store, desc.Value.Id, request.HttpContext.RequestAborted))
+                total = store.LengthOf(desc.Value.Id);
+            if (total is null)
+                return Results.NotFound(new { error = "Blob bytes are not present (collected, or not replicated and no upstream to pull from)." });
+        }
 
         var contentType = string.IsNullOrWhiteSpace(desc.Value.Mime) ? "application/octet-stream" : desc.Value.Mime!;
         response.Headers["Accept-Ranges"] = "bytes";

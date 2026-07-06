@@ -313,6 +313,24 @@ public static class ServeCommand
         // page cache, or WAL.
         var blobs = new Blobs.BlobStoreManager();
 
+        // Blob replication (#109): a follower configured with an upstream URL
+        // lazily pulls missing blob bytes from the leader by content hash the
+        // first time a document's blob is read. Content-addressing makes the
+        // pull self-verifying. Set via --blob-upstream-url or DFDB_BLOB_UPSTREAM_URL.
+        var blobUpstream = GetArg(args, "--blob-upstream-url")
+            ?? Environment.GetEnvironmentVariable("DFDB_BLOB_UPSTREAM_URL");
+        if (!string.IsNullOrWhiteSpace(blobUpstream))
+        {
+            var upstreamBase = blobUpstream.TrimEnd('/');
+            var blobHttp = new HttpClient { Timeout = TimeSpan.FromMinutes(30) }; // large media pulls
+            blobs.Upstream = async (hash, ct) =>
+            {
+                var resp = await blobHttp.GetAsync($"{upstreamBase}/blobs/raw/{hash}", HttpCompletionOption.ResponseHeadersRead, ct);
+                if (!resp.IsSuccessStatusCode) return null;
+                return await resp.Content.ReadAsStreamAsync(ct);
+            };
+        }
+
         PrintBanner(config, bindUrl, replicationSummary);
         MapEndpoints(app, db, registry, blobs);
         MapAdminEndpoints(app, db, config);
@@ -348,6 +366,16 @@ public static class ServeCommand
         });
         app.Run();
         return 0;
+    }
+
+    /// <summary>Read the value following <paramref name="flag"/> in the CLI
+    /// args, or null if the flag isn't present (or has no value after it).</summary>
+    private static string? GetArg(string[] args, string flag)
+    {
+        for (int i = 0; i < args.Length - 1; i++)
+            if (string.Equals(args[i], flag, StringComparison.OrdinalIgnoreCase))
+                return args[i + 1];
+        return null;
     }
 
     private static void PrintBanner(NodeConfig config, string bindUrl, string replicationSummary)
@@ -470,8 +498,8 @@ public static class ServeCommand
 
         app.MapGet("/collections/{name}/{id}/blob/{field}", (string name, string id, string field, HttpRequest request, HttpResponse response) =>
         {
-            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
-            return Blobs.BlobHandler.Download(db, blobs.For(db), name, id, field, request, response);
+            if (!IsValidCollectionName(name)) return Task.FromResult(InvalidCollectionNameResult());
+            return Blobs.BlobHandler.Download(db, blobs, name, id, field, request, response);
         });
 
         app.MapDelete("/collections/{name}/{id}/blob/{field}", (string name, string id, string field, HttpRequest request) =>
@@ -497,8 +525,8 @@ public static class ServeCommand
         });
         app.MapGet("/collections/{name}/{id}/attachments/{key}", (string name, string id, string key, HttpRequest request, HttpResponse response) =>
         {
-            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
-            return Blobs.BlobHandler.Download(db, blobs.For(db), name, id, key, request, response);
+            if (!IsValidCollectionName(name)) return Task.FromResult(InvalidCollectionNameResult());
+            return Blobs.BlobHandler.Download(db, blobs, name, id, key, request, response);
         });
         app.MapDelete("/collections/{name}/{id}/attachments/{key}", (string name, string id, string key, HttpRequest request) =>
         {
@@ -526,6 +554,20 @@ public static class ServeCommand
         {
             var r = blobs.For(db).Compact();
             return Results.Ok(new { success = true, liveBlobs = r.LiveBlobs, droppedBlobs = r.DroppedBlobs, bytesReclaimed = r.BytesReclaimed });
+        });
+
+        // Content-addressed raw fetch by SHA-256 — the source a follower pulls
+        // from for lazy blob replication (#109). No document lookup; 404 if the
+        // hash isn't stored here. Honours Range so a follower can stream large
+        // blobs. The id is a 64-char hex hash, validated to avoid path tricks.
+        app.MapGet("/blobs/raw/{sha256}", (string sha256, HttpResponse response) =>
+        {
+            if (!Blobs.BlobHandler.IsValidBlobId(sha256))
+                return Results.BadRequest(new { error = "Blob id must be a 64-char SHA-256 hex string." });
+            var stream = blobs.For(db).OpenRead(sha256);
+            if (stream is null) return Results.NotFound(new { error = "Blob not stored here." });
+            response.Headers["Accept-Ranges"] = "bytes";
+            return Results.Stream(stream, "application/octet-stream");
         });
 
         // POST /query - materialised JSON response (default, back-compat).
