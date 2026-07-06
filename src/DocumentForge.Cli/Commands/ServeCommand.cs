@@ -480,6 +480,32 @@ public static class ServeCommand
             return Blobs.BlobHandler.Remove(db, name, id, field, request);
         });
 
+        // Issue #71 — "attachment" alias for the blob routes (the attachment key
+        // IS the document field). POST accepts a Content-Range header for
+        // resumable/chunked upload; GET streams with Range; DELETE is X-Confirm
+        // guarded. These give media apps the exact attachments API they asked
+        // for over the same content-addressed, out-of-line store.
+        app.MapPost("/collections/{name}/{id}/attachments/{key}", (string name, string id, string key, HttpRequest request) =>
+        {
+            if (!IsValidCollectionName(name)) return Task.FromResult(InvalidCollectionNameResult());
+            return Blobs.BlobHandler.Upload(db, blobs.For(db), name, id, key, request);
+        });
+        app.MapPut("/collections/{name}/{id}/attachments/{key}", (string name, string id, string key, HttpRequest request) =>
+        {
+            if (!IsValidCollectionName(name)) return Task.FromResult(InvalidCollectionNameResult());
+            return Blobs.BlobHandler.Upload(db, blobs.For(db), name, id, key, request);
+        });
+        app.MapGet("/collections/{name}/{id}/attachments/{key}", (string name, string id, string key, HttpRequest request, HttpResponse response) =>
+        {
+            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
+            return Blobs.BlobHandler.Download(db, blobs.For(db), name, id, key, request, response);
+        });
+        app.MapDelete("/collections/{name}/{id}/attachments/{key}", (string name, string id, string key, HttpRequest request) =>
+        {
+            if (!IsValidCollectionName(name)) return InvalidCollectionNameResult();
+            return Blobs.BlobHandler.Remove(db, name, id, key, request);
+        });
+
         // Out-of-band mark-sweep GC: reclaim blobs no document references.
         app.MapPost("/admin/blobs/gc", () =>
         {
