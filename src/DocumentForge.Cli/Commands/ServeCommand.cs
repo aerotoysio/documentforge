@@ -322,7 +322,7 @@ public static class ServeCommand
         // data-plane routes still resolve to registry.GetDefault() so
         // single-DB clients see no change. The catalog argument (Issue
         // #82) means attach/detach state survives restarts.
-        DatabaseEndpoints.Map(app, registry, config.DataDir, dbCatalog, backupManager, walArchiver, pitr);
+        DatabaseEndpoints.Map(app, registry, config.DataDir, dbCatalog, backupManager, walArchiver, pitr, blobs);
 
         // Issue #66 Phase 5: service orchestration. Lets Studio (or a CLI)
         // spawn sibling dfdb serve processes from one running service —

@@ -32,8 +32,10 @@ public static class DatabaseEndpoints
     /// is where a path-less <c>POST /databases</c> drops the new <c>.dfdb</c>
     /// (defaults to <c>{dataDir}/{name}.dfdb</c>).
     /// </summary>
-    public static void Map(IEndpointRouteBuilder app, DatabaseRegistry registry, string defaultDataDir, DatabaseCatalog? catalog = null, BackupManager? backupManager = null, WalArchiver? walArchiver = null, PointInTimeRestore? pitr = null)
+    public static void Map(IEndpointRouteBuilder app, DatabaseRegistry registry, string defaultDataDir, DatabaseCatalog? catalog = null, BackupManager? backupManager = null, WalArchiver? walArchiver = null, PointInTimeRestore? pitr = null, Blobs.BlobStoreManager? blobs = null)
     {
+        if (blobs is not null) MapScopedBlobRoutes(app, registry, blobs);
+
         // List every attached database. Stable shape across phases.
         // Admin-scoped: enumerating tenants would leak names to a
         // restricted key, which is what scoped keys exist to prevent.
@@ -1231,6 +1233,85 @@ public static class DatabaseEndpoints
         {
             return null;
         }
+    }
+
+    /// <summary>
+    /// Blob follow-up (#109/#71) — the out-of-line blob + attachment API, scoped
+    /// to a named database so it works in the multi-DB hosting model exactly
+    /// like every other <c>/db/{name}/...</c> route. Each database gets its own
+    /// content-addressed sibling store (via the shared
+    /// <see cref="Blobs.BlobStoreManager"/>, keyed by data-file path), so a
+    /// tenant's blobs never mix with another's. Upload honours <c>Content-Range</c>
+    /// for resumable chunked uploads; download honours <c>Range</c>; delete is
+    /// <c>X-Confirm</c> guarded. Reads require db-read scope, writes db-write,
+    /// and GC requires admin.
+    /// </summary>
+    private static void MapScopedBlobRoutes(IEndpointRouteBuilder app, DatabaseRegistry registry, Blobs.BlobStoreManager blobs)
+    {
+        // Resolve db + scope-gate in one step (captures registry).
+        (DocumentForgeDb? db, IResult? deny) Resolve(HttpContext ctx, string name, bool write)
+        {
+            var gate = write ? ScopeCheck.RequireDbWrite(ctx, name) : ScopeCheck.RequireDbRead(ctx, name);
+            if (gate is { } deny) return (null, deny);
+            var db = registry.TryGet(name);
+            return db is null
+                ? (null, Results.NotFound(new { error = $"Database '{name}' is not attached." }))
+                : (db, null);
+        }
+
+        // Upload (single-shot or resumable via Content-Range). PUT and POST both
+        // map here so the #71 attachments POST verb and the blob PUT verb agree.
+        Task<IResult> Upload(HttpContext ctx, string name, string collection, string id, string field, HttpRequest request)
+        {
+            var (db, deny) = Resolve(ctx, name, write: true);
+            return deny is not null ? Task.FromResult(deny) : Blobs.BlobHandler.Upload(db!, blobs.For(db!), collection, id, field, request);
+        }
+        IResult Download(HttpContext ctx, string name, string collection, string id, string field, HttpRequest request, HttpResponse response)
+        {
+            var (db, deny) = Resolve(ctx, name, write: false);
+            return deny ?? Blobs.BlobHandler.Download(db!, blobs.For(db!), collection, id, field, request, response);
+        }
+        IResult Remove(HttpContext ctx, string name, string collection, string id, string field, HttpRequest request)
+        {
+            var (db, deny) = Resolve(ctx, name, write: true);
+            return deny ?? Blobs.BlobHandler.Remove(db!, collection, id, field, request);
+        }
+
+        app.MapPut("/db/{name}/collections/{collection}/{id}/blob/{field}",
+            (HttpContext ctx, string name, string collection, string id, string field, HttpRequest request) => Upload(ctx, name, collection, id, field, request));
+        app.MapGet("/db/{name}/collections/{collection}/{id}/blob/{field}",
+            (HttpContext ctx, string name, string collection, string id, string field, HttpRequest request, HttpResponse response) => Download(ctx, name, collection, id, field, request, response));
+        app.MapDelete("/db/{name}/collections/{collection}/{id}/blob/{field}",
+            (HttpContext ctx, string name, string collection, string id, string field, HttpRequest request) => Remove(ctx, name, collection, id, field, request));
+
+        // #71 attachment alias (key == field).
+        app.MapPost("/db/{name}/collections/{collection}/{id}/attachments/{key}",
+            (HttpContext ctx, string name, string collection, string id, string key, HttpRequest request) => Upload(ctx, name, collection, id, key, request));
+        app.MapPut("/db/{name}/collections/{collection}/{id}/attachments/{key}",
+            (HttpContext ctx, string name, string collection, string id, string key, HttpRequest request) => Upload(ctx, name, collection, id, key, request));
+        app.MapGet("/db/{name}/collections/{collection}/{id}/attachments/{key}",
+            (HttpContext ctx, string name, string collection, string id, string key, HttpRequest request, HttpResponse response) => Download(ctx, name, collection, id, key, request, response));
+        app.MapDelete("/db/{name}/collections/{collection}/{id}/attachments/{key}",
+            (HttpContext ctx, string name, string collection, string id, string key, HttpRequest request) => Remove(ctx, name, collection, id, key, request));
+
+        // Scoped GC + stats.
+        app.MapPost("/db/{name}/admin/blobs/gc", (HttpContext ctx, string name) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            var referenced = Blobs.BlobStoreManager.CollectReferencedBlobIds(db);
+            var store = blobs.For(db);
+            var collected = store.GarbageCollect(referenced);
+            return Results.Ok(new { database = name, success = true, referenced = referenced.Count, collected, liveBytes = store.LiveBytes });
+        });
+        app.MapGet("/db/{name}/blobs/stats", (HttpContext ctx, string name) =>
+        {
+            var (db, deny) = Resolve(ctx, name, write: false);
+            if (deny is not null) return deny;
+            var store = blobs.For(db!);
+            return Results.Ok(new { database = name, count = store.Count, liveBytes = store.LiveBytes });
+        });
     }
 }
 
