@@ -1312,6 +1312,14 @@ public static class DatabaseEndpoints
             var store = blobs.For(db!);
             return Results.Ok(new { database = name, count = store.Count, liveBytes = store.LiveBytes });
         });
+        app.MapPost("/db/{name}/admin/blobs/compact", (HttpContext ctx, string name) =>
+        {
+            if (ScopeCheck.RequireAdmin(ctx) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            var r = blobs.For(db).Compact();
+            return Results.Ok(new { database = name, success = true, liveBlobs = r.LiveBlobs, droppedBlobs = r.DroppedBlobs, bytesReclaimed = r.BytesReclaimed });
+        });
     }
 }
 

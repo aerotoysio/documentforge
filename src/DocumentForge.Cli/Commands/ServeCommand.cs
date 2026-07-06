@@ -521,6 +521,13 @@ public static class ServeCommand
             return Results.Ok(new { count = store.Count, liveBytes = store.LiveBytes });
         });
 
+        // Reclaim disk from GC'd blobs: rewrite the store with only live bytes.
+        app.MapPost("/admin/blobs/compact", () =>
+        {
+            var r = blobs.For(db).Compact();
+            return Results.Ok(new { success = true, liveBlobs = r.LiveBlobs, droppedBlobs = r.DroppedBlobs, bytesReclaimed = r.BytesReclaimed });
+        });
+
         // POST /query - materialised JSON response (default, back-compat).
         // Pass ?stream=true OR Accept: application/x-ndjson for an NDJSON stream:
         // first line is the metadata envelope, then one document per line.

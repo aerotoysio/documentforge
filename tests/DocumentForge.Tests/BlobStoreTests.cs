@@ -111,9 +111,88 @@ public sealed class BlobStoreTests : IDisposable
         Assert.Equal(data, back.ToArray());
     }
 
+    [Fact]
+    public async Task Compact_ReclaimsSpaceFromGCdBlobs_KeepsLiveReadable()
+    {
+        string keepId, keep2Id;
+        long before;
+        using (var store = new BlobStore(_base))
+        {
+            (keepId, _) = await store.PutAsync(new MemoryStream(Enumerable.Repeat((byte)7, 4096).ToArray()));
+            var (dropId, _) = await store.PutAsync(new MemoryStream(Enumerable.Repeat((byte)9, 8192).ToArray()));
+            (keep2Id, _) = await store.PutAsync(S("second keeper"));
+            before = new FileInfo(_base).Length;
+
+            Assert.Equal(1, store.GarbageCollect(new HashSet<string> { keepId, keep2Id })); // drop the 8 KB one
+
+            var r = store.Compact();
+            Assert.Equal(2, r.LiveBlobs);
+            Assert.Equal(1, r.DroppedBlobs);
+            Assert.True(r.BytesReclaimed >= 8192, $"expected >= 8192 reclaimed, got {r.BytesReclaimed}");
+
+            // Data file physically shrank, live blobs still byte-for-byte correct.
+            Assert.True(new FileInfo(_base).Length < before);
+            Assert.False(store.Contains(dropId));
+            using var read = store.OpenRead(keepId)!;
+            var back = new MemoryStream(); read.CopyTo(back);
+            Assert.Equal(Enumerable.Repeat((byte)7, 4096).ToArray(), back.ToArray());
+            Assert.Equal("second keeper", ReadAll(store.OpenRead(keep2Id)));
+        }
+
+        // Survives reopen — the compacted index + data are authoritative.
+        using (var reopened = new BlobStore(_base))
+        {
+            Assert.True(reopened.Contains(keepId));
+            Assert.True(reopened.Contains(keep2Id));
+            Assert.Equal(2, reopened.Count);
+        }
+    }
+
+    [Fact]
+    public async Task Compact_IsCrashSafe_FinishesSwapWhenMarkerPresent()
+    {
+        string id;
+        using (var store = new BlobStore(_base))
+            (id, _) = await store.PutAsync(S("survives a mid-swap crash"));
+
+        // Simulate a crash AFTER the temps + marker were written but BEFORE the
+        // rename: stage valid temps (a copy of the good files), corrupt the live
+        // data file, and leave the marker. RecoverCompaction must finish the swap.
+        File.Copy(_base, _base + ".compact", overwrite: true);
+        File.Copy(_base + ".idx", _base + ".idx.compact", overwrite: true);
+        File.WriteAllText(_base + ".compact.ready", "");
+        File.WriteAllBytes(_base, Array.Empty<byte>()); // "torn" live data
+
+        using (var recovered = new BlobStore(_base))
+        {
+            Assert.True(recovered.Contains(id));
+            Assert.Equal("survives a mid-swap crash", ReadAll(recovered.OpenRead(id)));
+            Assert.False(File.Exists(_base + ".compact.ready")); // marker cleared
+        }
+    }
+
+    [Fact]
+    public async Task Compact_DiscardsStrayTemps_WhenNoMarker()
+    {
+        string id;
+        using (var store = new BlobStore(_base))
+            (id, _) = await store.PutAsync(S("intact"));
+
+        // A stray temp with no marker = an interrupted compaction before commit;
+        // it must be discarded and the original data left authoritative.
+        File.WriteAllText(_base + ".compact", "garbage");
+
+        using (var store = new BlobStore(_base))
+        {
+            Assert.True(store.Contains(id));
+            Assert.Equal("intact", ReadAll(store.OpenRead(id)));
+            Assert.False(File.Exists(_base + ".compact")); // stray removed
+        }
+    }
+
     public void Dispose()
     {
-        foreach (var f in new[] { _base, _base + ".idx" })
+        foreach (var f in new[] { _base, _base + ".idx", _base + ".compact", _base + ".idx.compact", _base + ".compact.ready" })
             try { File.Delete(f); } catch { }
     }
 }

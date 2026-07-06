@@ -45,6 +45,7 @@ public sealed class BlobStore : IDisposable
         _dataPath = basePath;
         _indexPath = basePath + ".idx";
         Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(basePath))!);
+        RecoverCompaction(); // finish or discard an interrupted Compact() before loading
         LoadIndex();
     }
 
@@ -188,6 +189,118 @@ public sealed class BlobStore : IDisposable
                 }
             }
             return collected;
+        }
+    }
+
+    /// <summary>Outcome of a <see cref="Compact"/> pass.</summary>
+    public readonly record struct CompactionResult(int LiveBlobs, int DroppedBlobs, long BytesReclaimed);
+
+    /// <summary>
+    /// Reclaim disk from GC'd (tombstoned) blobs by rewriting the data file and
+    /// index with only the live blobs, packed contiguously. GC alone only
+    /// tombstones — the dead bytes and stale index records stay until this runs.
+    /// Out of band; never on the transactional hot path.
+    ///
+    /// <para>Crash-safe: the new data + index are written to <c>.compact</c>
+    /// temp files and fsync'd, a <c>.compact.ready</c> marker is fsync'd to
+    /// signal "temps are complete", then the two files are renamed into place
+    /// and the marker removed. If the process dies mid-swap, the constructor's
+    /// <see cref="RecoverCompaction"/> either finishes the rename (marker
+    /// present) or discards the temps (marker absent) — the store never loads a
+    /// half-swapped data/index pair.</para>
+    /// </summary>
+    public CompactionResult Compact()
+    {
+        lock (_lock)
+        {
+            if (_disposed) throw new ObjectDisposedException(nameof(BlobStore));
+
+            var live = _index.Where(kv => kv.Value.Live)
+                             .OrderBy(kv => kv.Value.Offset) // sequential read of the old file
+                             .ToList();
+            long liveBytes = live.Sum(kv => kv.Value.Length);
+            long oldBytes = 0;
+            try { oldBytes = new FileInfo(_dataPath).Length; } catch { }
+            if (oldBytes <= liveBytes && live.Count == _index.Count)
+                return new CompactionResult(live.Count, 0, 0); // nothing dead to reclaim
+
+            var tmpData = _dataPath + ".compact";
+            var tmpIdx = _indexPath + ".compact";
+            var marker = _dataPath + ".compact.ready";
+
+            var newEntries = new Dictionary<string, Entry>(StringComparer.OrdinalIgnoreCase);
+            using (var src = new FileStream(_dataPath, FileMode.OpenOrCreate, FileAccess.Read, FileShare.ReadWrite, 1 << 20, FileOptions.SequentialScan))
+            using (var dataOut = new FileStream(tmpData, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, FileOptions.SequentialScan))
+            using (var idxOut = new FileStream(tmpIdx, FileMode.Create, FileAccess.Write, FileShare.None))
+            {
+                long offset = 0;
+                var buf = new byte[1 << 20];
+                var rec = new byte[IndexRecordSize];
+                foreach (var kv in live)
+                {
+                    src.Seek(kv.Value.Offset, SeekOrigin.Begin);
+                    long remaining = kv.Value.Length;
+                    while (remaining > 0)
+                    {
+                        int want = (int)Math.Min(buf.Length, remaining);
+                        int read = src.Read(buf, 0, want);
+                        if (read <= 0) throw new IOException("Blob data truncated during compaction.");
+                        dataOut.Write(buf, 0, read);
+                        remaining -= read;
+                    }
+                    Convert.FromHexString(kv.Key).CopyTo(rec, 0);
+                    BitConverter.TryWriteBytes(rec.AsSpan(IdBytes), offset);
+                    BitConverter.TryWriteBytes(rec.AsSpan(IdBytes + 8), kv.Value.Length);
+                    rec[IdBytes + 16] = 1; // live
+                    idxOut.Write(rec, 0, rec.Length);
+                    newEntries[kv.Key] = new Entry(offset, kv.Value.Length, Live: true);
+                    offset += kv.Value.Length;
+                }
+                dataOut.Flush(true);
+                idxOut.Flush(true);
+            }
+
+            // Commit point: the marker's existence means both temps are complete.
+            using (var m = new FileStream(marker, FileMode.Create, FileAccess.Write, FileShare.None))
+                m.Flush(true);
+
+            // Close the live append handles so the files can be replaced.
+            try { _dataAppend?.Dispose(); } catch { }
+            try { _indexAppend?.Dispose(); } catch { }
+            _dataAppend = null;
+            _indexAppend = null;
+
+            File.Move(tmpData, _dataPath, overwrite: true);
+            File.Move(tmpIdx, _indexPath, overwrite: true);
+            try { File.Delete(marker); } catch { }
+
+            int dropped = _index.Count - newEntries.Count;
+            _index.Clear();
+            foreach (var kv in newEntries) _index[kv.Key] = kv.Value;
+
+            return new CompactionResult(newEntries.Count, dropped, Math.Max(0, oldBytes - liveBytes));
+        }
+    }
+
+    /// <summary>Finish or discard a compaction that was interrupted by a crash.
+    /// Called once at open, before the index is loaded.</summary>
+    private void RecoverCompaction()
+    {
+        var tmpData = _dataPath + ".compact";
+        var tmpIdx = _indexPath + ".compact";
+        var marker = _dataPath + ".compact.ready";
+        if (File.Exists(marker))
+        {
+            // Temps were fully written — finish the swap idempotently.
+            if (File.Exists(tmpData)) File.Move(tmpData, _dataPath, overwrite: true);
+            if (File.Exists(tmpIdx)) File.Move(tmpIdx, _indexPath, overwrite: true);
+            try { File.Delete(marker); } catch { }
+        }
+        else
+        {
+            // Incomplete — the original data/index are still authoritative.
+            try { File.Delete(tmpData); } catch { }
+            try { File.Delete(tmpIdx); } catch { }
         }
     }
 
