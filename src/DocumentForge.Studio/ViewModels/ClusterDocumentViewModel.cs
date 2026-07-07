@@ -41,12 +41,14 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
 {
     private ClusterConfig _config;
     private readonly IDialogService _dialogs;
+    private readonly Func<string, string?>? _apiKeyForEndpoint;
 
     public ClusterDocumentViewModel(ClusterConfig config, string? filePath, IDialogService dialogs,
-        IReadOnlyList<string>? knownEndpoints = null)
+        IReadOnlyList<string>? knownEndpoints = null, Func<string, string?>? apiKeyForEndpoint = null)
     {
         _config = config;
         _dialogs = dialogs;
+        _apiKeyForEndpoint = apiKeyForEndpoint;
         FilePath = filePath;
         ContentId = filePath is null ? $"cluster:new:{Guid.NewGuid():N}" : $"cluster:{filePath}";
         UpdateTitle();
@@ -263,6 +265,45 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
         {
             StatusMessage = $"Couldn't load from {endpoint}: {ex.Message}. " +
                             "It must be a running `dfdb router` exposing GET /cluster/config.";
+        }
+        finally
+        {
+            IsBusy = false;
+        }
+    }
+
+    /// <summary>Distributes this config to every node it names (issue #113):
+    /// PUT /admin/cluster-config on each distinct leader + follower endpoint.
+    /// Per-node results; nodes reject pushes older than what they hold.</summary>
+    [RelayCommand]
+    private async Task PushToNodesAsync()
+    {
+        var endpoints = ClusterPush.DistinctEndpoints(_config);
+        if (endpoints.Count == 0)
+        {
+            StatusMessage = "No node endpoints in this config — add shards first.";
+            return;
+        }
+        if (!_dialogs.Confirm("Push cluster config",
+                $"Push this cluster config (v{_config.Version}) to {endpoints.Count} node(s)?\n\n" +
+                string.Join("\n", endpoints) +
+                "\n\nEvery node stores it as its cluster.json — this changes routing cluster-wide."))
+            return;
+
+        IsBusy = true;
+        try
+        {
+            var json = _config.ToJson();
+            var results = new List<ClusterPushResult>();
+            foreach (var endpoint in endpoints)
+                results.Add(await ClusterPush.PushAsync(endpoint, json, _apiKeyForEndpoint?.Invoke(endpoint)));
+
+            var ok = results.Count(r => r.Success);
+            var failures = results.Where(r => !r.Success)
+                .Select(r => $"  ✘ {r.Endpoint} — {r.Detail}")
+                .ToList();
+            StatusMessage = $"Pushed v{_config.Version} to {ok}/{results.Count} node(s)." +
+                            (failures.Count > 0 ? Environment.NewLine + string.Join(Environment.NewLine, failures) : "");
         }
         finally
         {

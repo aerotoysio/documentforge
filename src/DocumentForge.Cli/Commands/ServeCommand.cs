@@ -1383,6 +1383,86 @@ public static class ServeCommand
             return Results.Ok(new { saved = true, applied, config = BuildConfigView(db, config) });
         });
 
+        // Issue #113 — cluster-config distribution. Studio (or any admin
+        // client) pushes ONE cluster.json to every node so the whole cluster
+        // agrees on topology, instead of the operator copying the file around.
+        // GET returns the stored config verbatim; PUT validates and persists
+        // it atomically to {dataDir}/cluster.json — the path `dfdb cluster` /
+        // `dfdb rebalance` verbs and spawned routers resolve. A push whose
+        // version is OLDER than the stored one is rejected with 409 so a
+        // stale editor can't roll back a newer topology.
+        app.MapGet("/admin/cluster-config", (HttpContext httpCtx) =>
+        {
+            if (ScopeCheck.RequireAdmin(httpCtx) is { } deny) return deny;
+            var path = Path.Combine(config.DataDir, "cluster.json");
+            if (!File.Exists(path))
+                return Results.NotFound(new { error = "No cluster config stored on this node." });
+            return Results.Text(File.ReadAllText(path), "application/json");
+        });
+
+        app.MapPut("/admin/cluster-config", async (HttpContext httpCtx) =>
+        {
+            if (ScopeCheck.RequireAdmin(httpCtx) is { } deny) return deny;
+
+            using var reader = new StreamReader(httpCtx.Request.Body);
+            var raw = await reader.ReadToEndAsync();
+            if (string.IsNullOrWhiteSpace(raw))
+                return Results.BadRequest(new { error = "Empty body. Send the cluster config JSON itself." });
+
+            DocumentForge.Engine.Cluster.ClusterConfig incoming;
+            try
+            {
+                incoming = DocumentForge.Engine.Cluster.ClusterConfig.FromJson(raw)
+                    ?? throw new InvalidOperationException("Config deserialised to null.");
+            }
+            catch (Exception ex)
+            {
+                return Results.BadRequest(new { error = $"Invalid cluster config: {ex.Message}" });
+            }
+
+            // Structural validation — refuse configs that would only fail at
+            // routing time. (Engine ClusterConfig has no Validate of its own.)
+            foreach (var s in incoming.Shards)
+            {
+                if (string.IsNullOrWhiteSpace(s.Name))
+                    return Results.BadRequest(new { error = "Every shard needs a 'name'." });
+                if (string.IsNullOrWhiteSpace(s.LeaderEndpoint))
+                    return Results.BadRequest(new { error = $"Shard '{s.Name}' needs an 'endpoint' or 'leader'." });
+            }
+            foreach (var (name, policy) in incoming.Collections)
+                if (policy.Strategy == DocumentForge.Engine.Cluster.ShardingStrategy.Hash
+                    && string.IsNullOrWhiteSpace(policy.ShardKeyPath))
+                    return Results.BadRequest(new { error = $"Hash-sharded collection '{name}' needs a 'shardKeyPath'." });
+
+            var path = Path.Combine(config.DataDir, "cluster.json");
+            if (File.Exists(path))
+            {
+                try
+                {
+                    var stored = DocumentForge.Engine.Cluster.ClusterConfig.Load(path);
+                    if (incoming.Version < stored.Version)
+                        return Results.Conflict(new
+                        {
+                            error = $"Stale push: this node has cluster config v{stored.Version}, the push was v{incoming.Version}. " +
+                                    "Load the newer config, reapply your edits, and push again.",
+                            code = "staleVersion",
+                            storedVersion = stored.Version,
+                            pushedVersion = incoming.Version,
+                        });
+                }
+                catch (Exception)
+                {
+                    // An unreadable stored file never blocks a valid replacement.
+                }
+            }
+
+            Directory.CreateDirectory(config.DataDir);
+            var tmp = path + ".tmp";
+            await File.WriteAllTextAsync(tmp, raw);
+            File.Move(tmp, path, overwrite: true);
+            return Results.Ok(new { saved = true, path, version = incoming.Version });
+        });
+
         // Force a cache flush (all dirty pages to disk, truncate recovery log)
         app.MapPost("/admin/flush", (HttpContext httpCtx) =>
         {

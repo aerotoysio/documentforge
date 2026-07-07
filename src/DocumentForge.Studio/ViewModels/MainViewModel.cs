@@ -433,7 +433,16 @@ public sealed partial class MainViewModel : ObservableObject
             .Where(c => c.Kind == Core.Connections.ConnectionKind.Http && !string.IsNullOrWhiteSpace(c.Url))
             .Select(c => c.Url!)
             .ToList();
-        var document = new ClusterDocumentViewModel(config, path, _dialogs, knownEndpoints);
+        // Config pushes reuse the API key of a saved connection matching the
+        // node's URL, so auth-gated nodes accept them without re-entering keys.
+        string? ApiKeyFor(string endpoint)
+        {
+            var match = _workspace.Connections.FirstOrDefault(c =>
+                c.Kind == Core.Connections.ConnectionKind.Http &&
+                string.Equals(c.Url?.TrimEnd('/'), endpoint.TrimEnd('/'), StringComparison.OrdinalIgnoreCase));
+            return match?.ApiKeySecretId is { } id ? _workspace.Secrets.TryGet(id) : null;
+        }
+        var document = new ClusterDocumentViewModel(config, path, _dialogs, knownEndpoints, ApiKeyFor);
         Documents.Add(document);
         ActiveDocument = document;
         StatusText = path is null ? "New cluster config" : $"Cluster — {System.IO.Path.GetFileNameWithoutExtension(path)}";

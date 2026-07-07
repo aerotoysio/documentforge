@@ -15,6 +15,8 @@
                         ToolTip="Write a copy of this cluster config to another file"/>
                 <Separator/>
                 <Button Content="🩺 Check health" Command="{Binding CheckHealthCommand}" Padding="8,2"/>
+                <Button Content="📤 Push to nodes" Command="{Binding PushToNodesCommand}" Padding="8,2"
+                        ToolTip="PUT this config to every node it names (leaders + followers) so the whole cluster agrees on it"/>
                 <Separator/>
                 <TextBlock Text="{Binding SummaryText}" VerticalAlignment="Center" Margin="4,0"/>
             </ToolBar>
@@ -30,7 +32,7 @@
                     <StackPanel>
                         <TextBlock Text="Load from a running cluster" FontWeight="SemiBold"/>
                         <TextBlock Foreground="Gray" FontSize="11" Margin="0,2,0,6" TextWrapping="Wrap"
-                                   Text="Pull the live config straight from a running dfdb router (its GET /cluster/config) so you edit what the cluster is actually running. Applying edits is still file-based — save, then restart the router. Studio can't push config to a live router yet."/>
+                                   Text="Pull the live config straight from a running dfdb router (its GET /cluster/config) so you edit what the cluster is actually running. Use 'Push to nodes' to distribute your edits to every DF instance the config names."/>
                         <StackPanel Orientation="Horizontal">
                             <ComboBox IsEditable="True" Width="240"
                                       Text="{Binding RouterEndpoint, UpdateSourceTrigger=PropertyChanged}"
