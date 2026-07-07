@@ -1,6 +1,6 @@
 # DocumentForge — In-flight status
 
-Last updated: 2026-05-21 · branch `master`
+Last updated: 2026-07-07 · branch `master`
 
 This file is a pickup point — clone the repo on a different machine, `git pull`, read this, and you should know exactly where to continue.
 
@@ -8,70 +8,62 @@ This file is a pickup point — clone the repo on a different machine, `git pull
 
 ## TL;DR
 
-Issue #66 (multi-database hosting) is feature-complete through the visual cluster builder. One `dfdb serve` process hosts N attached databases; Studio manages the whole lifecycle on a single react-flow canvas — drag on a cluster / service / database, wire DBs together for replication, claim DBs into shard rings, and export `cluster.json`. The Studio Explorer, Dashboard and Admin pages are all multi-connection / multi-DB aware.
+The July 5 Studio backlog (#113–#119, seven issues) is **fully shipped** — Studio (the WPF desktop app) now covers connect-to-follower from the topology graph, a service settings editor, a swarm panel for child services, query autocomplete, PITR + WAL-archiving + backup-settings wizards, one-click cluster-config distribution, and a full rebalance flow (plan preview → execute → live progress) backed by new engine HTTP endpoints.
 
-The remaining big rock is the **developer portal (#68)** — now in progress. After that, the production-readiness tail of #66 (lazy open + per-DB quotas, auth scopes) closes the epic.
+The remaining big rocks are the **developer portal (#68)**, the production-readiness tail of **#66** (lazy open + per-DB quotas, auth scopes), and **#73** (macOS arm64 startup crash — needs a Mac to reproduce). Also outstanding: **14 Dependabot alerts** (7 high) on the default branch.
 
 ---
 
-## What's done (on `master`, all pushed)
+## What shipped 2026-07-07 (all on `master`, all pushed)
 
-Multi-DB epic (#66):
-
-```
-Phase 1   — DatabaseRegistry (N attached engines in one process)            ✅
-Phase 2   — /databases REST + Studio databases surface                      ✅
-Phase 2.5 — Scoped /db/{name}/replication/* routes                          ✅
-Phase 3a  — Scoped /db/{name}/query + per-tab DB picker                      ✅
-Phase 5a  — Spawn child dfdb serve from Studio (ServiceManager)             ✅
-Phase 5b  — Across-services topology view (cross-connection graph)          ✅
-Phase 5c  — Shard frame grouping                                            ✅
-Phase 5d  — Drag-to-wire replication + drag-to-reshard                      ✅
-Phase 6   — dfdb router (stateless cluster gateway)                         ✅
-Phase 6b  — Collections tab + Spawn router from Studio                       ✅
-Phase 6c  — Unified cluster builder canvas: drag cluster/service/database,   ✅
-            claim-to-ring, resizable service frames, live-vs-conceptual
-            health dots, export/copy/download cluster.json
-            (design persisted to localStorage)
-```
-
-Studio / portal alignment:
+Studio backlog (#113–#119):
 
 ```
-Explorer  — every connection → its databases → collections, with a          ✅
-            /stats fallback so pre-#66 single-DB services show reachable
-Dashboard — cross-connection overview (reachability probed via /stats)      ✅
-Admin     — connection picker + databases panel                            ✅
-"active" connection reframed as "default" connection                        ✅
+#119 — topology graph: click a follower (advertised HTTP endpoint) to connect  ✅
+#115 — Service Settings panel over GET/PUT /admin/config (#111); semi-sync     ✅
+       knobs live-editable, restart-required fields labelled
+#118 — Services (swarm) panel: spawn/list/kill/log-tail child dfdb services;   ✅
+       children inherit the parent's admin key; one-click connect
+#114 — query workbench autocomplete: keywords/functions, collection names      ✅
+       after FROM/INTO/UPDATE/JOIN, sampled field paths; Ctrl+Space
+#117 — Backups tab → tabbed surface: PITR wizard (preview → restore-as-new),   ✅
+       WAL-archiving toggle + segments, backup settings editor
+#113 — cluster-config distribution: GET/PUT /admin/cluster-config on serve     ✅
+       nodes (validated, atomic, 409 on stale version) + Studio
+       "Push to nodes" with per-node results
+#116 — rebalance over HTTP: plan/execute/status endpoints + Studio             ✅
+       plan-preview/execute/progress UI in the cluster view
 ```
 
-Engine fixes / hardening:
+Engine fix found while verifying #116:
 
 ```
-#62 — typed LINQ Insert/Where JSON casing mismatch       ✅ (closed)
-#63 — FormatLiteral missing Guid literal case            ✅ (closed)
-#64 — self-heal corrupt index catalog (PR #65, merged)   ✅
-Stage A — single-writer / multiple-reader concurrency    ✅
-          (ReaderWriterLockSlim in TransactionManager)
-Insert hot path — dropped two per-doc allocations (a)+(b) ✅
+ClusterRebalancer duplicated every doc moved over HTTP transports —
+docs fetched over HTTP carry _id as a JSON string, GetId() returned
+Empty, source-shard deletes silently failed. ResolveId now parses
+string _ids; failed deletes surface as MoveFailures, never as moves.
+(The dfdb rebalance CLI verb had the same bug.)                          ✅
 ```
+
+Earlier (May–July, already on master): multi-DB epic phases 1–6c, blob store (#109), service settings API (#111), follower HTTP advertisement (#112), backups + WAL archiving + PITR (#87/#88), persistent attach catalog (#82), scoped keys (#101), rebalance CLI, router hot-swap (#134).
 
 ## What's queued (priority order)
 
 | Item | Description | Effort |
 |---|---|---|
-| **#68** *(in progress)* | Developer portal — Nextra docs site: getting-started, REST + CLI reference, LINQ & clustering guides, runnable examples | ~3–4 days |
+| **#68** | Developer portal — docs site: getting-started, REST + CLI reference, LINQ & clustering guides, runnable examples | ~3–4 days |
+| **Dependabot** | 14 alerts on the default branch (7 high, 5 moderate, 2 low) | ~half day |
 | **#66 Phase 3b** | Lazy DB open + per-DB quotas + idle eviction (host 50+ DBs per process) | ~1 day |
 | **#66 Phase 4** | Bearer auth scopes (`db:foo`, `db:*`, `*`) + per-request DB scoping | ~1–2 days |
-| **#70** | Partial-document update (PATCH) / atomic field ops — a new write path | medium |
-| **#69** | Reads against a non-existent collection return HTTP 400 instead of an empty result | quick |
+| **#73** | `dfdb serve` intermittent native crash on macOS arm64 (Kestrel AcceptAsync) — needs a Mac | unknown |
 
 Deferred (perf / debt, opportunistic):
 
-- **BSON serializer rework** — the real insert-rate lever. Insert is allocation-bound (~6.8 KB allocated/doc; BSON serialization dominates), while the engine logic is only ~5.5 µs/doc. The (a)+(b) wins trimmed allocation but throughput is unchanged until the serializer itself is rebuilt. Worth a dedicated session. See `samples/DocumentForge.InsertBench`.
-- SqlBulkCopy-style turbo bulk-load (unsafe ingest + reindex after, or wrapped in a transaction with a size cap).
+- **BSON serializer rework** — the real insert-rate lever (allocation-bound; see `samples/DocumentForge.InsertBench` + `samples/DocumentForge.ScaleBench`).
+- SqlBulkCopy-style turbo bulk-load.
 - Benign build warnings (SYSLIB0057, a few xUnit analyzer nags).
-- 12 Dependabot alerts on the repo.
+- Rebalance shard transports assume one shared admin key (`shardApiKey`); per-shard keys would need the router config's per-endpoint `apiKey` shape in the engine format.
+- Untracked `admin-ui/` folder in the repo root — legacy react-flow admin UI, superseded by the WPF Studio; decide keep-or-delete.
 
 ## To resume
 
@@ -80,44 +72,21 @@ git clone https://github.com/aerotoysio/documentforge
 cd documentforge
 git checkout master
 dotnet build
-dotnet test                      # full suite green; one known-flaky LogicalReplication test
+dotnet test                      # engine suite: 564 green; Studio.Core: 85 green
 ```
 
 Run the stack locally:
 
 ```bash
 # Terminal A — host service (Studio connects here)
-dotnet src/DocumentForge.Cli/bin/Release/net9.0/dfdb.dll serve --data-dir /tmp/dfdb_dev --port 5099
+dotnet src/DocumentForge.Cli/bin/Release/net9.0/dfdb.dll serve --data-dir /tmp/dfdb_dev --port 5099 --api-key <key>
 
 # DocumentForge Studio (Windows desktop app) — the management UI
 dotnet run --project src/DocumentForge.Studio
-#   then add an HTTP connection to http://localhost:5099
-#   (SQL editor + Explorer, cluster builder, connections, backups, API keys)
+#   then add an HTTP connection to http://localhost:5099 with the key
 ```
 
-To spin up a router via the REST endpoint:
-
-```bash
-curl -X POST -H "Content-Type: application/json" -d @- http://localhost:5099/routers <<EOF
-{
-  "name": "demo",
-  "clusterConfigJson": "{
-    \"shards\": [
-      { \"name\": \"ring-a\", \"leader\": { \"baseUrl\": \"http://localhost:5099\", \"database\": \"ring_a\" } },
-      { \"name\": \"ring-b\", \"leader\": { \"baseUrl\": \"http://localhost:5099\", \"database\": \"ring_b\" } }
-    ],
-    \"collections\": [
-      { \"name\": \"orders\", \"strategy\": \"hash\", \"shardKeyPath\": \"pnr\" },
-      { \"name\": \"lookup\", \"strategy\": \"replicated\" }
-    ]
-  }"
-}
-EOF
-```
-
-…or build it visually on the Topology canvas and hit "Spawn router".
-
----
+Studio server admin surface (right-click a server): Topology, API Keys, Backups (PITR/WAL/settings tabs), Service Settings, Services (swarm). Cluster menu → New/Open cluster: edit shards + policies, Check health, Push to nodes, Rebalance (plan → execute → progress).
 
 ## Architecture cheat-sheet
 
@@ -132,6 +101,8 @@ EOF
 │  ServiceManager spawns child dfdb processes:               │
 │    - dfdb serve children (more attached-DB hosts)          │
 │    - dfdb router children (cluster gateways)               │
+│  {dataDir}/cluster.json — the node's stored cluster        │
+│  config (#113); rebalance defaults its "old" side to it    │
 └────────────────────────────────────────────────────────────┘
 
          ┌───── dfdb router (stateless) ─────┐
@@ -145,16 +116,10 @@ EOF
         followers      followers     ← logical replication, same TCP protocol
 ```
 
-Rings can be backed by either a specific attached DB on a multi-DB host
-(`baseUrl + database`) or a separate service's default DB (`baseUrl` only).
-The same router config works for both — peel a ring from local-dev to prod by
-editing one field.
+Two config formats exist — don't mix them:
+- **Engine format** (PascalCase, `Shards[].Endpoint`, `Collections` as a map): written by Studio's cluster editor, `dfdb cluster` verbs, `/admin/cluster-config`, and rebalance.
+- **Router format** (camelCase, `shards[].leader`, `collections` as an array): consumed by `dfdb router` / POST /routers.
 
 ## On-disk format / upgrade notes
 
-The per-database file format is `FileFormatVersion = 1` (magic `DFDB`); `DataFile.ValidateHeader` hard-rejects anything else. Multi-DB hosting is additive — `DatabaseRegistry` maps names → separate `.dfdb` files; it does not change the file format. So upgrading the engine over an existing data file is a no-op migration: point the new build at the old `.dfdb` and it opens as the `default` database. Indexes self-heal (#64). Back up the file and do a clean flush before swapping binaries; downgrading (new file → older build) is the riskier direction and isn't guaranteed clean.
-
-## Open questions
-
-- **Phase 4** auth shape: scopes as `db:foo` (one DB), `db:*` (all DBs), plus the existing `*` admin — standard JWT-style scopes or a custom claim format?
-- **#68** docs hosting: static export to GitHub Pages vs. a hosted target; where the API reference is sourced from (hand-written MDX vs. generated from the route table).
+The per-database file format is `FileFormatVersion = 1` (magic `DFDB`); `DataFile.ValidateHeader` hard-rejects anything else. Multi-DB hosting is additive. Indexes self-heal (#64). Back up the file and do a clean flush before swapping binaries; downgrading (new file → older build) is the riskier direction and isn't guaranteed clean.
