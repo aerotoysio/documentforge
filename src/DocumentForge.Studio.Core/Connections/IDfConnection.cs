@@ -60,6 +60,18 @@ public interface IDfConnection : IAsyncDisposable
     Task<CreatedApiKey> CreateApiKeyAsync(string? description, IReadOnlyList<string> scopes, CancellationToken ct = default);
     Task RevokeApiKeyAsync(string id, CancellationToken ct = default);
 
+    // --- Service settings (server connections only; requires ServerAdmin) ---
+
+    /// <summary>The redacted effective node configuration (engine #111).
+    /// Secrets come back as presence + fingerprint, never plaintext.</summary>
+    Task<ServiceConfigInfo> GetServiceConfigAsync(CancellationToken ct = default);
+
+    /// <summary>Applies the live-editable subset of the node configuration
+    /// (currently the semi-sync replication knobs). Pass null to leave a field
+    /// unchanged. Restart-required fields are rejected by the server. Returns
+    /// the updated effective configuration.</summary>
+    Task<ServiceConfigInfo> UpdateServiceConfigAsync(int? minSyncReplicas, double? syncTimeoutSeconds, CancellationToken ct = default);
+
     // --- Replication (server connections only; requires ServerAdmin) ---
 
     Task<ReplicationStatus> GetReplicationStatusAsync(string database, CancellationToken ct = default);

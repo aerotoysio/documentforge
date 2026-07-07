@@ -566,6 +566,19 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
+    /// <summary>Opens (or re-focuses) the service settings panel for a server (#115).</summary>
+    public void OpenServiceSettings(ServerNodeViewModel server)
+    {
+        var contentId = $"svcconfig:{server.Connection.Descriptor.Id}";
+        var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
+        if (existing is not null) { ActiveDocument = existing; return; }
+
+        var document = new ServiceSettingsDocumentViewModel(server.Connection);
+        Documents.Add(document);
+        ActiveDocument = document;
+        StatusText = $"Service settings — {server.Connection.Descriptor.Name}";
+    }
+
     /// <summary>Opens (or re-focuses) the replication topology graph for a server.</summary>
     public void OpenTopology(ServerNodeViewModel server)
     {

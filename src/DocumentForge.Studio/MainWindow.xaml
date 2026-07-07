@@ -26,6 +26,8 @@
                                   Visibility="{Binding CanManageServer, Converter={StaticResource BoolToVis}}"/>
                         <MenuItem Header="Backups…" Command="{Binding BackupsCommand}"
                                   Visibility="{Binding CanManageServer, Converter={StaticResource BoolToVis}}"/>
+                        <MenuItem Header="Service Settings…" Command="{Binding ServiceSettingsCommand}"
+                                  Visibility="{Binding CanManageServer, Converter={StaticResource BoolToVis}}"/>
                         <MenuItem Header="Refresh" Command="{Binding RefreshCommand}"/>
                         <Separator/>
                         <MenuItem Header="Disconnect" Command="{Binding DisconnectCommand}"/>
@@ -137,6 +139,10 @@
 
         <DataTemplate DataType="{x:Type vm:BackupsDocumentViewModel}">
             <views:BackupsView/>
+        </DataTemplate>
+
+        <DataTemplate DataType="{x:Type vm:ServiceSettingsDocumentViewModel}">
+            <views:ServiceSettingsView/>
         </DataTemplate>
 
         <DataTemplate DataType="{x:Type vm:WelcomeDocumentViewModel}">

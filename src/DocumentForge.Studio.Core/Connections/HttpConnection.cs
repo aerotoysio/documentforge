@@ -409,6 +409,94 @@ public sealed class HttpConnection : IDfConnection
             RecommendationDetail: root.TryGetProperty("recommendationDetail", out var rd) && rd.ValueKind == JsonValueKind.String ? rd.GetString() : null);
     }
 
+    public async Task<ServiceConfigInfo> GetServiceConfigAsync(CancellationToken ct = default)
+    {
+        var body = await GetRawAsync("admin/config", ct).ConfigureAwait(false);
+        return ParseServiceConfig(body);
+    }
+
+    public async Task<ServiceConfigInfo> UpdateServiceConfigAsync(int? minSyncReplicas, double? syncTimeoutSeconds, CancellationToken ct = default)
+    {
+        var payload = new Dictionary<string, object>();
+        if (minSyncReplicas is { } msr) payload["minSyncReplicas"] = msr;
+        if (syncTimeoutSeconds is { } sts) payload["syncTimeoutSeconds"] = sts;
+        if (payload.Count == 0) throw new ArgumentException("Nothing to update — both fields are null.");
+
+        using var response = await _http.PutAsJsonAsync("admin/config", payload, Json, ct).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+
+        using var doc = JsonDocument.Parse(body);
+        return doc.RootElement.TryGetProperty("config", out var cfg)
+            ? ParseServiceConfig(cfg.GetRawText())
+            : ParseServiceConfig(body);
+    }
+
+    private static ServiceConfigInfo ParseServiceConfig(string body)
+    {
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        var node = root.TryGetProperty("node", out var n) ? n : default;
+        var sec = root.TryGetProperty("security", out var s) ? s : default;
+        var tls = sec.ValueKind == JsonValueKind.Object && sec.TryGetProperty("tls", out var t) ? t : default;
+        var repl = root.TryGetProperty("replication", out var r) ? r : default;
+        var net = root.TryGetProperty("network", out var w) ? w : default;
+
+        var scopedKeys = new List<ServiceScopedKeyInfo>();
+        if (sec.ValueKind == JsonValueKind.Object
+            && sec.TryGetProperty("scopedKeys", out var keys) && keys.ValueKind == JsonValueKind.Array)
+            foreach (var k in keys.EnumerateArray())
+                scopedKeys.Add(new ServiceScopedKeyInfo(
+                    Str(k, "description"),
+                    ReadStringArray(k, "scopes"),
+                    Str(k, "keyFingerprint")));
+
+        return new ServiceConfigInfo(
+            NodeName: Str(node, "nodeName"),
+            Port: Int32(node, "port"),
+            DataDir: Str(node, "dataDir"),
+            BindAllInterfaces: Bool(node, "bindAllInterfaces"),
+            InsecureDevMode: Bool(node, "insecureDevMode"),
+            HttpEndpoint: Str(node, "httpEndpoint"),
+            AdminKeyConfigured: Bool(sec, "adminKeyConfigured"),
+            AdminKeyFingerprint: Str(sec, "adminKeyFingerprint"),
+            ReplicationSecretConfigured: Bool(sec, "replicationSecretConfigured"),
+            ReplicationSecretFingerprint: Str(sec, "replicationSecretFingerprint"),
+            TlsConfigured: Bool(tls, "configured"),
+            TlsCertPath: Str(tls, "certPath"),
+            TlsCertPasswordConfigured: Bool(tls, "certPasswordConfigured"),
+            ScopedKeys: scopedKeys,
+            ReplicationRole: Str(repl, "role"),
+            ReplicationPort: NullableInt32(repl, "port"),
+            LeaderHost: Str(repl, "leaderHost"),
+            LeaderPort: NullableInt32(repl, "leaderPort"),
+            MinSyncReplicas: Int32(repl, "minSyncReplicas"),
+            SyncTimeoutSeconds: Double(repl, "syncTimeoutSeconds"),
+            PublicBaseUrl: Str(net, "publicBaseUrl"),
+            RestartRequired: ReadStringArray(root, "restartRequired"),
+            LiveEditable: ReadStringArray(root, "liveEditable"));
+
+        static string? Str(JsonElement e, string prop) =>
+            e.ValueKind == JsonValueKind.Object && e.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.String
+                ? v.GetString() : null;
+
+        static bool Bool(JsonElement e, string prop) =>
+            e.ValueKind == JsonValueKind.Object && e.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.True;
+
+        static int Int32(JsonElement e, string prop) =>
+            e.ValueKind == JsonValueKind.Object && e.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.Number
+                ? v.GetInt32() : 0;
+
+        static int? NullableInt32(JsonElement e, string prop) =>
+            e.ValueKind == JsonValueKind.Object && e.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.Number
+                ? v.GetInt32() : null;
+
+        static double Double(JsonElement e, string prop) =>
+            e.ValueKind == JsonValueKind.Object && e.TryGetProperty(prop, out var v) && v.ValueKind == JsonValueKind.Number
+                ? v.GetDouble() : 0;
+    }
+
     public Task StartReplicationLeaderAsync(string database, int port, CancellationToken ct = default) =>
         PostReplicationAsync($"db/{Uri.EscapeDataString(database)}/replication/start-leader", new { port }, ct);
 

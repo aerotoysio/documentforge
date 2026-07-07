@@ -143,4 +143,76 @@ public sealed class HttpConnectionTests
         Assert.Equal("Bearer", request.Headers.Authorization?.Scheme);
         Assert.Equal("sekrit", request.Headers.Authorization?.Parameter);
     }
+
+    // Shape copied from ServeCommand.BuildConfigView (issue #111).
+    private const string ConfigBody =
+        """
+        {
+          "node": {"nodeName":"n1","port":5099,"dataDir":"/data","bindAllInterfaces":false,"insecureDevMode":false,"httpEndpoint":"http://n1:5099"},
+          "security": {
+            "adminKeyConfigured":true,"adminKeyFingerprint":"sha256:ab12cd34",
+            "replicationSecretConfigured":false,"replicationSecretFingerprint":null,
+            "tls":{"configured":false,"certPath":null,"certPasswordConfigured":false},
+            "scopedKeys":[{"description":"ro key","scopes":["db:orders"],"keyFingerprint":"sha256:00ff00ff"}]
+          },
+          "replication": {"role":"leader","port":6000,"leaderHost":null,"leaderPort":null,"minSyncReplicas":1,"syncTimeoutSeconds":5,"autoFailover":null},
+          "network": {"publicBaseUrl":null},
+          "restartRequired": ["port","dataDir","bindAllInterfaces","insecureDevMode","nodeName","apiKey","replicationSecret","tls","scopedKeys","role","leaderHost","leaderPort","replicationPort","publicBaseUrl"],
+          "liveEditable": ["minSyncReplicas","syncTimeoutSeconds"]
+        }
+        """;
+
+    [Fact]
+    public async Task GetServiceConfig_Parses_Redacted_View()
+    {
+        var handler = new StubHandler().Map("/admin/config", ConfigBody);
+        await using var connection = Connect(handler);
+
+        var config = await connection.GetServiceConfigAsync();
+
+        Assert.Equal("n1", config.NodeName);
+        Assert.Equal(5099, config.Port);
+        Assert.Equal("/data", config.DataDir);
+        Assert.True(config.AdminKeyConfigured);
+        Assert.Equal("sha256:ab12cd34", config.AdminKeyFingerprint);
+        Assert.False(config.ReplicationSecretConfigured);
+        Assert.False(config.TlsConfigured);
+        var key = Assert.Single(config.ScopedKeys);
+        Assert.Equal("ro key", key.Description);
+        Assert.Equal("db:orders", Assert.Single(key.Scopes));
+        Assert.Equal("leader", config.ReplicationRole);
+        Assert.Equal(6000, config.ReplicationPort);
+        Assert.Equal(1, config.MinSyncReplicas);
+        Assert.Equal(5, config.SyncTimeoutSeconds);
+        Assert.Contains("port", config.RestartRequired);
+        Assert.Contains("minSyncReplicas", config.LiveEditable);
+    }
+
+    [Fact]
+    public async Task UpdateServiceConfig_Sends_Only_Provided_Fields_And_Parses_Result()
+    {
+        var handler = new StubHandler().Map("/admin/config",
+            $$"""{"saved":true,"applied":["minSyncReplicas"],"config":{{ConfigBody}}}""");
+        await using var connection = Connect(handler);
+
+        var config = await connection.UpdateServiceConfigAsync(minSyncReplicas: 1, syncTimeoutSeconds: null);
+
+        var request = Assert.Single(handler.Requests);
+        Assert.Equal(HttpMethod.Put, request.Method);
+        var sent = await request.Content!.ReadAsStringAsync();
+        Assert.Contains("minSyncReplicas", sent);
+        Assert.DoesNotContain("syncTimeoutSeconds", sent);
+        Assert.Equal(1, config.MinSyncReplicas);
+    }
+
+    [Fact]
+    public async Task UpdateServiceConfig_With_No_Fields_Throws_Without_A_Request()
+    {
+        var handler = new StubHandler();
+        await using var connection = Connect(handler);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => connection.UpdateServiceConfigAsync(null, null));
+        Assert.Empty(handler.Requests);
+    }
 }

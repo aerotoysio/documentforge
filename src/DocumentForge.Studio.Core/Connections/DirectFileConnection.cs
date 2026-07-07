@@ -177,6 +177,9 @@ public sealed class DirectFileConnection : IDfConnection
     public Task DeleteBackupAsync(string backupId, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
     public Task<string> RestoreBackupAsync(string backupId, string newDatabaseName, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
 
+    public Task<ServiceConfigInfo> GetServiceConfigAsync(CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task<ServiceConfigInfo> UpdateServiceConfigAsync(int? minSyncReplicas, double? syncTimeoutSeconds, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+
     public Task<IReadOnlyList<ApiKeyInfo>> GetApiKeysAsync(CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
     public Task<CreatedApiKey> CreateApiKeyAsync(string? description, IReadOnlyList<string> scopes, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
     public Task RevokeApiKeyAsync(string id, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);

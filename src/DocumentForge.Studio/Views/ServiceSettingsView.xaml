@@ -1,0 +1,69 @@
+<UserControl x:Class="DocumentForge.Studio.Views.ServiceSettingsView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="clr-namespace:DocumentForge.Studio.ViewModels"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             mc:Ignorable="d"
+             d:DataContext="{d:DesignInstance vm:ServiceSettingsDocumentViewModel}">
+    <UserControl.Resources>
+        <CollectionViewSource x:Key="GroupedRows" Source="{Binding Rows}">
+            <CollectionViewSource.GroupDescriptions>
+                <PropertyGroupDescription PropertyName="Section"/>
+            </CollectionViewSource.GroupDescriptions>
+        </CollectionViewSource>
+    </UserControl.Resources>
+
+    <DockPanel>
+        <!-- Toolbar -->
+        <ToolBarTray DockPanel.Dock="Top" IsLocked="True">
+            <ToolBar>
+                <Button Content="🔄 Refresh" Command="{Binding RefreshCommand}" Padding="8,2"/>
+            </ToolBar>
+        </ToolBarTray>
+
+        <!-- Status -->
+        <TextBlock DockPanel.Dock="Bottom" Text="{Binding StatusMessage}" Margin="10,6"
+                   Foreground="#555" FontSize="11" TextWrapping="Wrap"/>
+
+        <!-- Live-editable knobs -->
+        <GroupBox DockPanel.Dock="Bottom" Header="Live settings (applied without a restart)" Margin="10,4">
+            <StackPanel Orientation="Horizontal" Margin="4,6">
+                <TextBlock Text="Min sync replicas:" VerticalAlignment="Center"/>
+                <TextBox Text="{Binding MinSyncReplicasText, UpdateSourceTrigger=PropertyChanged}"
+                         Width="60" Margin="6,0,18,0" VerticalAlignment="Center"/>
+                <TextBlock Text="Sync timeout (s):" VerticalAlignment="Center"/>
+                <TextBox Text="{Binding SyncTimeoutSecondsText, UpdateSourceTrigger=PropertyChanged}"
+                         Width="60" Margin="6,0,18,0" VerticalAlignment="Center"/>
+                <Button Content="Apply" Command="{Binding ApplyCommand}" Padding="14,3"/>
+            </StackPanel>
+        </GroupBox>
+
+        <!-- Settings list, grouped by section -->
+        <ListView ItemsSource="{Binding Source={StaticResource GroupedRows}}" BorderThickness="0" Margin="6">
+            <ListView.GroupStyle>
+                <GroupStyle>
+                    <GroupStyle.HeaderTemplate>
+                        <DataTemplate>
+                            <TextBlock Text="{Binding Name}" FontWeight="SemiBold" FontSize="13"
+                                       Margin="0,10,0,4" Foreground="#2A5DB0"/>
+                        </DataTemplate>
+                    </GroupStyle.HeaderTemplate>
+                </GroupStyle>
+            </ListView.GroupStyle>
+            <ListView.View>
+                <GridView>
+                    <GridViewColumn Header="Setting" Width="220" DisplayMemberBinding="{Binding Setting}"/>
+                    <GridViewColumn Header="Value" Width="380" DisplayMemberBinding="{Binding Value}"/>
+                    <GridViewColumn Header="Notes" Width="140">
+                        <GridViewColumn.CellTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding Note}" Foreground="#996800" FontSize="11"/>
+                            </DataTemplate>
+                        </GridViewColumn.CellTemplate>
+                    </GridViewColumn>
+                </GridView>
+            </ListView.View>
+        </ListView>
+    </DockPanel>
+</UserControl>
