@@ -10,53 +10,178 @@
         <TextBlock DockPanel.Dock="Top" Text="Backups" FontSize="18" FontWeight="Light"/>
         <TextBlock DockPanel.Dock="Bottom" Text="{Binding StatusMessage}" Margin="0,8,0,0" TextWrapping="Wrap"/>
 
-        <!-- Take backup -->
-        <Border DockPanel.Dock="Top" BorderBrush="#E4E4E4" BorderThickness="1" CornerRadius="5" Padding="12" Margin="0,10,0,10">
-            <DockPanel>
-                <TextBlock Text="Back up database:" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                <Button DockPanel.Dock="Right" Content="Take backup" Padding="12,3" Margin="8,0,0,0"
-                        Command="{Binding TakeBackupCommand}"/>
-                <ComboBox ItemsSource="{Binding Databases}" SelectedItem="{Binding SelectedDatabase}" Width="220"/>
-            </DockPanel>
-        </Border>
+        <TabControl Margin="0,10,0,0" BorderThickness="0,1,0,0">
 
-        <!-- Restore -->
-        <Border DockPanel.Dock="Bottom" Background="#F7F8FA" BorderBrush="#E4E4E4" BorderThickness="1"
-                CornerRadius="5" Padding="12" Margin="0,10,0,0">
-            <DockPanel>
-                <TextBlock Text="Restore selected backup as new database:" VerticalAlignment="Center" Margin="0,0,8,0"/>
-                <Button DockPanel.Dock="Right" Content="Restore" Padding="12,3" Margin="8,0,0,0"
-                        Command="{Binding RestoreCommand}"/>
-                <TextBox Text="{Binding RestoreAsName, UpdateSourceTrigger=PropertyChanged}"
-                         ToolTip="New database name (never overwrites an existing DB)"/>
-            </DockPanel>
-        </Border>
+            <!-- ================= Backups (list / take / restore / delete) ================= -->
+            <TabItem Header="Backups">
+                <DockPanel Margin="0,10,0,0">
+                    <!-- Take backup -->
+                    <Border DockPanel.Dock="Top" BorderBrush="#E4E4E4" BorderThickness="1" CornerRadius="5" Padding="12" Margin="0,0,0,10">
+                        <DockPanel>
+                            <TextBlock Text="Back up database:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                            <Button DockPanel.Dock="Right" Content="Take backup" Padding="12,3" Margin="8,0,0,0"
+                                    Command="{Binding TakeBackupCommand}"/>
+                            <ComboBox ItemsSource="{Binding Databases}" SelectedItem="{Binding SelectedDatabase}" Width="220"/>
+                        </DockPanel>
+                    </Border>
 
-        <!-- Backups list -->
-        <DockPanel>
-            <Button DockPanel.Dock="Top" HorizontalAlignment="Left" Content="🔄 Refresh" Padding="8,2" Margin="0,0,0,6"
-                    Command="{Binding RefreshCommand}"/>
-            <DataGrid ItemsSource="{Binding Backups}" SelectedItem="{Binding SelectedBackup}"
-                      AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Single"
-                      HeadersVisibility="Column" CanUserAddRows="False" GridLinesVisibility="Horizontal" FontSize="12">
-                <DataGrid.Columns>
-                    <DataGridTextColumn Header="Database" Binding="{Binding Database}" Width="160"/>
-                    <DataGridTextColumn Header="Created (UTC)" Binding="{Binding Created}" Width="Auto"/>
-                    <DataGridTextColumn Header="Size" Binding="{Binding SizeText}" Width="100"/>
-                    <DataGridTextColumn Header="Kind" Binding="{Binding Kind}" Width="90"/>
-                    <DataGridTextColumn Header="Id" Binding="{Binding Id}" Width="*" FontFamily="Consolas"/>
-                    <DataGridTemplateColumn Width="80">
-                        <DataGridTemplateColumn.CellTemplate>
-                            <DataTemplate>
-                                <Button Content="Delete" Padding="4,0" Margin="2"
-                                        Command="{Binding DataContext.DeleteCommand,
-                                            RelativeSource={RelativeSource AncestorType=DataGrid}}"
-                                        CommandParameter="{Binding}"/>
-                            </DataTemplate>
-                        </DataGridTemplateColumn.CellTemplate>
-                    </DataGridTemplateColumn>
-                </DataGrid.Columns>
-            </DataGrid>
-        </DockPanel>
+                    <!-- Restore -->
+                    <Border DockPanel.Dock="Bottom" Background="#F7F8FA" BorderBrush="#E4E4E4" BorderThickness="1"
+                            CornerRadius="5" Padding="12" Margin="0,10,0,0">
+                        <DockPanel>
+                            <TextBlock Text="Restore selected backup as new database:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                            <Button DockPanel.Dock="Right" Content="Restore" Padding="12,3" Margin="8,0,0,0"
+                                    Command="{Binding RestoreCommand}"/>
+                            <TextBox Text="{Binding RestoreAsName, UpdateSourceTrigger=PropertyChanged}"
+                                     ToolTip="New database name (never overwrites an existing DB)"/>
+                        </DockPanel>
+                    </Border>
+
+                    <!-- Backups list -->
+                    <DockPanel>
+                        <Button DockPanel.Dock="Top" HorizontalAlignment="Left" Content="🔄 Refresh" Padding="8,2" Margin="0,0,0,6"
+                                Command="{Binding RefreshCommand}"/>
+                        <DataGrid ItemsSource="{Binding Backups}" SelectedItem="{Binding SelectedBackup}"
+                                  AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Single"
+                                  HeadersVisibility="Column" CanUserAddRows="False" GridLinesVisibility="Horizontal" FontSize="12">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Header="Database" Binding="{Binding Database}" Width="160"/>
+                                <DataGridTextColumn Header="Created (UTC)" Binding="{Binding Created}" Width="Auto"/>
+                                <DataGridTextColumn Header="Size" Binding="{Binding SizeText}" Width="100"/>
+                                <DataGridTextColumn Header="Kind" Binding="{Binding Kind}" Width="90"/>
+                                <DataGridTextColumn Header="Id" Binding="{Binding Id}" Width="*" FontFamily="Consolas"/>
+                                <DataGridTemplateColumn Width="80">
+                                    <DataGridTemplateColumn.CellTemplate>
+                                        <DataTemplate>
+                                            <Button Content="Delete" Padding="4,0" Margin="2"
+                                                    Command="{Binding DataContext.DeleteCommand,
+                                                        RelativeSource={RelativeSource AncestorType=DataGrid}}"
+                                                    CommandParameter="{Binding}"/>
+                                        </DataTemplate>
+                                    </DataGridTemplateColumn.CellTemplate>
+                                </DataGridTemplateColumn>
+                            </DataGrid.Columns>
+                        </DataGrid>
+                    </DockPanel>
+                </DockPanel>
+            </TabItem>
+
+            <!-- ================= Point-in-time restore ================= -->
+            <TabItem Header="Point-in-time restore">
+                <DockPanel Margin="0,10,0,0">
+                    <Border DockPanel.Dock="Top" BorderBrush="#E4E4E4" BorderThickness="1" CornerRadius="5" Padding="12">
+                        <StackPanel>
+                            <TextBlock TextWrapping="Wrap" Foreground="#555" Margin="0,0,0,8"
+                                       Text="Restores a database to a moment in time: a base backup plus archived WAL segments replayed up to the target. Pick the base backup on the Backups tab, then preview before restoring — the restore always lands in a NEW database."/>
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="Base backup:" VerticalAlignment="Center"/>
+                                <TextBlock Text="{Binding SelectedBackup.Id, FallbackValue='(select one on the Backups tab)'}"
+                                           FontFamily="Consolas" Margin="6,0,18,0" VerticalAlignment="Center"/>
+                                <TextBlock Text="Target time (UTC):" VerticalAlignment="Center"/>
+                                <TextBox Text="{Binding PitrTargetTimeText, UpdateSourceTrigger=PropertyChanged}" Width="160" Margin="6,0,12,0"
+                                         ToolTip="e.g. 2026-07-07 14:30:00"/>
+                                <Button Content="Preview" Command="{Binding PitrPreviewCommand}" Padding="14,3"/>
+                            </StackPanel>
+                        </StackPanel>
+                    </Border>
+
+                    <Border DockPanel.Dock="Bottom" Background="#F7F8FA" BorderBrush="#E4E4E4" BorderThickness="1"
+                            CornerRadius="5" Padding="12" Margin="0,10,0,0">
+                        <DockPanel>
+                            <TextBlock Text="Restore as new database:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+                            <Button DockPanel.Dock="Right" Content="Restore to point in time" Padding="12,3" Margin="8,0,0,0"
+                                    Command="{Binding PitrRestoreCommand}" IsEnabled="{Binding PitrCanRestore}"/>
+                            <TextBox Text="{Binding PitrRestoreAsName, UpdateSourceTrigger=PropertyChanged}"
+                                     ToolTip="New database name (never overwrites an existing DB)"/>
+                        </DockPanel>
+                    </Border>
+
+                    <!-- Plan preview -->
+                    <TextBox Text="{Binding PitrPreviewText, Mode=OneWay}" IsReadOnly="True" Margin="0,10,0,0"
+                             FontFamily="Consolas" FontSize="12" TextWrapping="Wrap"
+                             VerticalScrollBarVisibility="Auto" Background="#FAFAFA" BorderBrush="#E4E4E4"/>
+                </DockPanel>
+            </TabItem>
+
+            <!-- ================= WAL archiving ================= -->
+            <TabItem Header="WAL archiving">
+                <DockPanel Margin="0,10,0,0">
+                    <Border DockPanel.Dock="Top" BorderBrush="#E4E4E4" BorderThickness="1" CornerRadius="5" Padding="12">
+                        <StackPanel>
+                            <TextBlock TextWrapping="Wrap" Foreground="#555" Margin="0,0,0,8"
+                                       Text="Continuous WAL archiving ships write-ahead-log segments as they close — the data source for point-in-time restore. Toggle it per database; segments accumulate in the server's archive directory."/>
+                            <StackPanel Orientation="Horizontal">
+                                <TextBlock Text="Database:" VerticalAlignment="Center"/>
+                                <ComboBox ItemsSource="{Binding Databases}" SelectedItem="{Binding SelectedDatabase}"
+                                          Width="220" Margin="6,0,12,0"/>
+                                <Button Content="🔄 Refresh status" Command="{Binding RefreshArchiveCommand}" Padding="10,3" Margin="0,0,12,0"/>
+                                <Button Command="{Binding ToggleArchiveCommand}" Padding="14,3">
+                                    <Button.Style>
+                                        <Style TargetType="Button">
+                                            <Setter Property="Content" Value="Enable archiving"/>
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding ArchiveEnabled}" Value="True">
+                                                    <Setter Property="Content" Value="Disable archiving"/>
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </Button.Style>
+                                </Button>
+                            </StackPanel>
+                            <TextBlock Text="{Binding ArchiveStatusText}" Margin="0,8,0,0" TextWrapping="Wrap"/>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Segment list -->
+                    <DataGrid ItemsSource="{Binding Segments}" Margin="0,10,0,0"
+                              AutoGenerateColumns="False" IsReadOnly="True" SelectionMode="Single"
+                              HeadersVisibility="Column" CanUserAddRows="False" GridLinesVisibility="Horizontal" FontSize="12">
+                        <DataGrid.Columns>
+                            <DataGridTextColumn Header="Seq" Binding="{Binding Sequence}" Width="90"/>
+                            <DataGridTextColumn Header="Archived (UTC)" Binding="{Binding Archived}" Width="Auto"/>
+                            <DataGridTextColumn Header="Size" Binding="{Binding SizeText}" Width="110"/>
+                            <DataGridTextColumn Header="Records" Binding="{Binding Records}" Width="*"/>
+                        </DataGrid.Columns>
+                    </DataGrid>
+                </DockPanel>
+            </TabItem>
+
+            <!-- ================= Settings ================= -->
+            <TabItem Header="Settings">
+                <StackPanel Margin="0,10,0,0" MaxWidth="620" HorizontalAlignment="Left">
+                    <Border BorderBrush="#E4E4E4" BorderThickness="1" CornerRadius="5" Padding="12">
+                        <StackPanel>
+                            <TextBlock TextWrapping="Wrap" Foreground="#555" Margin="0,0,0,10"
+                                       Text="Where backups land, how many are kept per database, and an optional cron schedule for automatic backups. Applied live via PUT /admin/backup/config."/>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                    <RowDefinition Height="Auto"/>
+                                </Grid.RowDefinitions>
+                                <TextBlock Grid.Row="0" Grid.Column="0" Text="Backup directory:" VerticalAlignment="Center" Margin="0,0,10,8"/>
+                                <TextBox Grid.Row="0" Grid.Column="1" Text="{Binding ConfigBackupDir, UpdateSourceTrigger=PropertyChanged}"
+                                         Margin="0,0,0,8" ToolTip="Blank = server default"/>
+                                <TextBlock Grid.Row="1" Grid.Column="0" Text="Retention (per DB):" VerticalAlignment="Center" Margin="0,0,10,8"/>
+                                <TextBox Grid.Row="1" Grid.Column="1" Text="{Binding ConfigRetentionText, UpdateSourceTrigger=PropertyChanged}"
+                                         Width="80" HorizontalAlignment="Left" Margin="0,0,0,8"/>
+                                <TextBlock Grid.Row="2" Grid.Column="0" Text="Schedule (cron):" VerticalAlignment="Center" Margin="0,0,10,0"/>
+                                <TextBox Grid.Row="2" Grid.Column="1" Text="{Binding ConfigScheduleCron, UpdateSourceTrigger=PropertyChanged}"
+                                         ToolTip="e.g. 0 3 * * *  (daily 03:00) — blank disables scheduled backups"/>
+                            </Grid>
+                            <StackPanel Orientation="Horizontal" Margin="0,12,0,0">
+                                <Button Content="Reload" Command="{Binding LoadConfigCommand}" Padding="12,3" Margin="0,0,8,0"/>
+                                <Button Content="Save" Command="{Binding SaveConfigCommand}" Padding="14,3"/>
+                            </StackPanel>
+                            <TextBlock Text="{Binding ConfigStatusText}" Margin="0,10,0,0" TextWrapping="Wrap" Foreground="#555"/>
+                        </StackPanel>
+                    </Border>
+                </StackPanel>
+            </TabItem>
+        </TabControl>
     </DockPanel>
 </UserControl>

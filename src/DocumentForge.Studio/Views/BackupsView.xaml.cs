@@ -19,5 +19,6 @@ public partial class BackupsView : UserControl
         if (_loaded || DataContext is not BackupsDocumentViewModel vm) return;
         _loaded = true;
         await vm.RefreshAsync();
+        await vm.LoadConfigCommand.ExecuteAsync(null);
     }
 }

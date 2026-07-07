@@ -272,6 +272,121 @@ public sealed class HttpConnection : IDfConnection
         return doc.RootElement.TryGetProperty("filePath", out var fp) ? fp.GetString() ?? newDatabaseName : newDatabaseName;
     }
 
+    public async Task<BackupConfigInfo> GetBackupConfigAsync(CancellationToken ct = default)
+    {
+        var body = await GetRawAsync("admin/backup/config", ct).ConfigureAwait(false);
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        return new BackupConfigInfo(
+            BackupDir: root.TryGetProperty("backupDir", out var bd) && bd.ValueKind == JsonValueKind.String ? bd.GetString() : null,
+            BackupDirConfigured: root.TryGetProperty("backupDirConfigured", out var bc) && bc.ValueKind == JsonValueKind.String ? bc.GetString() : null,
+            RetentionCount: root.TryGetProperty("retentionCount", out var rc) && rc.ValueKind == JsonValueKind.Number ? rc.GetInt32() : 10,
+            ScheduleCron: root.TryGetProperty("scheduleCron", out var sc) && sc.ValueKind == JsonValueKind.String ? sc.GetString() : null);
+    }
+
+    public async Task SetBackupConfigAsync(string? backupDir, int retentionCount, string? scheduleCron, CancellationToken ct = default)
+    {
+        using var response = await _http.PutAsJsonAsync("admin/backup/config",
+            new { backupDir, retentionCount, scheduleCron }, Json, ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        }
+    }
+
+    public async Task<ArchiveStatusInfo> GetArchiveStatusAsync(string database, CancellationToken ct = default)
+    {
+        var body = await GetRawAsync($"databases/{Uri.EscapeDataString(database)}/archive/status", ct).ConfigureAwait(false);
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        return new ArchiveStatusInfo(
+            Database: root.TryGetProperty("database", out var db) && db.ValueKind == JsonValueKind.String ? db.GetString() ?? database : database,
+            Enabled: root.TryGetProperty("enabled", out var en) && en.ValueKind == JsonValueKind.True,
+            NextSequence: root.TryGetProperty("nextSequence", out var ns) && ns.ValueKind == JsonValueKind.Number ? ns.GetInt64() : 0,
+            LastShippedAtUtc: root.TryGetProperty("lastShippedAtUtc", out var ls) && ls.ValueKind == JsonValueKind.String ? ls.GetString() : null,
+            SegmentsThisSession: root.TryGetProperty("segmentsThisSession", out var ss) && ss.ValueKind == JsonValueKind.Number ? ss.GetInt64() : 0);
+    }
+
+    public async Task SetArchiveEnabledAsync(string database, bool enabled, CancellationToken ct = default)
+    {
+        var verb = enabled ? "enable" : "disable";
+        using var response = await _http.PostAsync(
+            $"databases/{Uri.EscapeDataString(database)}/archive/{verb}", content: null, ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        }
+    }
+
+    public async Task<IReadOnlyList<ArchiveSegmentInfo>> GetArchiveSegmentsAsync(string database, CancellationToken ct = default)
+    {
+        var body = await GetRawAsync($"databases/{Uri.EscapeDataString(database)}/archive/segments", ct).ConfigureAwait(false);
+        using var doc = JsonDocument.Parse(body);
+        var result = new List<ArchiveSegmentInfo>();
+        if (doc.RootElement.TryGetProperty("segments", out var arr) && arr.ValueKind == JsonValueKind.Array)
+            foreach (var s in arr.EnumerateArray())
+                result.Add(new ArchiveSegmentInfo(
+                    SequenceNumber: s.TryGetProperty("sequenceNumber", out var sn) && sn.ValueKind == JsonValueKind.Number ? sn.GetInt64() : 0,
+                    ArchivedAtUtc: s.TryGetProperty("archivedAtUtc", out var aa) && aa.ValueKind == JsonValueKind.String ? aa.GetString() : null,
+                    ByteCount: s.TryGetProperty("byteCount", out var bc) && bc.ValueKind == JsonValueKind.Number ? bc.GetInt64() : 0,
+                    RecordCount: s.TryGetProperty("recordCount", out var rc) && rc.ValueKind == JsonValueKind.Number ? rc.GetInt64() : 0));
+        return result;
+    }
+
+    public async Task<PitrPreviewInfo> PreviewPitrRestoreAsync(string backupId, DateTime targetTimeUtc, CancellationToken ct = default)
+    {
+        using var response = await _http.PostAsJsonAsync("admin/backup/restore-pitr/preview",
+            new { backupId, targetTimeUtc }, Json, ct).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        var baseBackup = root.TryGetProperty("baseBackup", out var bb) ? bb : default;
+        return new PitrPreviewInfo(
+            FeasibleToRestore: root.TryGetProperty("feasibleToRestore", out var f) && f.ValueKind == JsonValueKind.True,
+            RefusalReason: root.TryGetProperty("refusalReason", out var rr) && rr.ValueKind == JsonValueKind.String ? rr.GetString() : null,
+            BaseBackupId: baseBackup.ValueKind == JsonValueKind.Object && baseBackup.TryGetProperty("id", out var id) ? id.GetString() ?? backupId : backupId,
+            BaseDatabase: baseBackup.ValueKind == JsonValueKind.Object && baseBackup.TryGetProperty("database", out var bd) ? bd.GetString() ?? "" : "",
+            BaseCreatedAtUtc: baseBackup.ValueKind == JsonValueKind.Object && baseBackup.TryGetProperty("createdAtUtc", out var ca) && ca.ValueKind == JsonValueKind.String ? ca.GetString() : null,
+            SegmentCount: root.TryGetProperty("segmentCount", out var sc) && sc.ValueKind == JsonValueKind.Number ? sc.GetInt32() : 0,
+            BytesToReplay: root.TryGetProperty("bytesToReplay", out var br) && br.ValueKind == JsonValueKind.Number ? br.GetInt64() : 0,
+            SequenceGaps: ParseGaps(root));
+    }
+
+    public async Task<PitrRestoreResult> RestorePitrAsync(string backupId, DateTime targetTimeUtc, string newDatabaseName, CancellationToken ct = default)
+    {
+        using var response = await _http.PostAsJsonAsync("admin/backup/restore-pitr",
+            new { backupId, targetTimeUtc, newDatabaseName }, Json, ct).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        return new PitrRestoreResult(
+            Database: root.TryGetProperty("database", out var db) ? db.GetString() ?? newDatabaseName : newDatabaseName,
+            FilePath: root.TryGetProperty("filePath", out var fp) ? fp.GetString() ?? "" : "",
+            SourceDatabase: root.TryGetProperty("sourceDatabase", out var sd) ? sd.GetString() ?? "" : "",
+            SegmentsApplied: root.TryGetProperty("segmentsApplied", out var sa) && sa.ValueKind == JsonValueKind.Number ? sa.GetInt32() : 0,
+            BytesReplayed: root.TryGetProperty("bytesReplayed", out var br) && br.ValueKind == JsonValueKind.Number ? br.GetInt64() : 0);
+    }
+
+    private static IReadOnlyList<PitrSequenceGap> ParseGaps(JsonElement root)
+    {
+        var gaps = new List<PitrSequenceGap>();
+        if (root.TryGetProperty("sequenceGaps", out var arr) && arr.ValueKind == JsonValueKind.Array)
+            foreach (var g in arr.EnumerateArray())
+                gaps.Add(new PitrSequenceGap(
+                    AfterSequence: g.TryGetProperty("afterSequence", out var a) && a.ValueKind == JsonValueKind.Number ? a.GetInt64() : 0,
+                    BeforeSequence: g.TryGetProperty("beforeSequence", out var b) && b.ValueKind == JsonValueKind.Number ? b.GetInt64() : 0,
+                    MissingCount: g.TryGetProperty("missingCount", out var m) && m.ValueKind == JsonValueKind.Number ? m.GetInt64() : 0));
+        return gaps;
+    }
+
     private static BackupInfo ParseBackup(JsonElement b) => new(
         b.TryGetProperty("id", out var id) ? id.GetString() ?? "" : "",
         b.TryGetProperty("database", out var db) ? db.GetString() ?? "" : "",

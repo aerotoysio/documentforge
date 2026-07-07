@@ -54,6 +54,31 @@ public interface IDfConnection : IAsyncDisposable
     /// <summary>Restores a backup as a new database. Returns the new database's file path.</summary>
     Task<string> RestoreBackupAsync(string backupId, string newDatabaseName, CancellationToken ct = default);
 
+    // --- Backup admin: config, WAL archiving, PITR (server connections only) ---
+
+    /// <summary>Backup settings (directory, retention, schedule).</summary>
+    Task<BackupConfigInfo> GetBackupConfigAsync(CancellationToken ct = default);
+
+    /// <summary>Saves backup settings. Null backupDir/scheduleCron clear the
+    /// explicit setting back to the server default.</summary>
+    Task SetBackupConfigAsync(string? backupDir, int retentionCount, string? scheduleCron, CancellationToken ct = default);
+
+    /// <summary>Per-database WAL-archiving status.</summary>
+    Task<ArchiveStatusInfo> GetArchiveStatusAsync(string database, CancellationToken ct = default);
+
+    /// <summary>Turns continuous WAL archiving on/off for a database.</summary>
+    Task SetArchiveEnabledAsync(string database, bool enabled, CancellationToken ct = default);
+
+    /// <summary>Shipped WAL segments for a database, oldest first.</summary>
+    Task<IReadOnlyList<ArchiveSegmentInfo>> GetArchiveSegmentsAsync(string database, CancellationToken ct = default);
+
+    /// <summary>Dry-run a point-in-time restore: base backup + target time →
+    /// feasibility, segments to replay, and any sequence gaps. No mutation.</summary>
+    Task<PitrPreviewInfo> PreviewPitrRestoreAsync(string backupId, DateTime targetTimeUtc, CancellationToken ct = default);
+
+    /// <summary>Executes a point-in-time restore into a NEW database.</summary>
+    Task<PitrRestoreResult> RestorePitrAsync(string backupId, DateTime targetTimeUtc, string newDatabaseName, CancellationToken ct = default);
+
     // --- API keys (server connections only; requires ServerAdmin) ---
 
     Task<IReadOnlyList<ApiKeyInfo>> GetApiKeysAsync(CancellationToken ct = default);

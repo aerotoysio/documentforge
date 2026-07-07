@@ -177,6 +177,14 @@ public sealed class DirectFileConnection : IDfConnection
     public Task DeleteBackupAsync(string backupId, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
     public Task<string> RestoreBackupAsync(string backupId, string newDatabaseName, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
 
+    public Task<BackupConfigInfo> GetBackupConfigAsync(CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task SetBackupConfigAsync(string? backupDir, int retentionCount, string? scheduleCron, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task<ArchiveStatusInfo> GetArchiveStatusAsync(string database, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task SetArchiveEnabledAsync(string database, bool enabled, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task<IReadOnlyList<ArchiveSegmentInfo>> GetArchiveSegmentsAsync(string database, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task<PitrPreviewInfo> PreviewPitrRestoreAsync(string backupId, DateTime targetTimeUtc, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task<PitrRestoreResult> RestorePitrAsync(string backupId, DateTime targetTimeUtc, string newDatabaseName, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+
     public Task<IReadOnlyList<ManagedServiceEntry>> GetManagedServicesAsync(CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
     public Task<SpawnedServiceInfo> SpawnServiceAsync(int? port, string? nodeName, string? dataDir, string? apiKey, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
     public Task StopManagedServiceAsync(int port, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
