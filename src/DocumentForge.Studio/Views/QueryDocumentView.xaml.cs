@@ -5,7 +5,9 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Threading;
 using System.Xml;
+using DocumentForge.Studio.Core.Query;
 using DocumentForge.Studio.ViewModels;
+using ICSharpCode.AvalonEdit.CodeCompletion;
 using ICSharpCode.AvalonEdit.Highlighting;
 using ICSharpCode.AvalonEdit.Highlighting.Xshd;
 
@@ -14,12 +16,14 @@ namespace DocumentForge.Studio.Views;
 public partial class QueryDocumentView : UserControl
 {
     private bool _editorSeeded;
+    private CompletionWindow? _completionWindow;
 
     public QueryDocumentView()
     {
         InitializeComponent();
         Editor.SyntaxHighlighting = LoadSqlHighlighting();
         Editor.PreviewKeyDown += OnEditorKeyDown;
+        Editor.TextArea.TextEntered += OnTextEntered;
         Loaded += OnLoaded;
     }
 
@@ -52,6 +56,60 @@ public partial class QueryDocumentView : UserControl
             e.Handled = true;
             _ = RunAsync();
         }
+        else if (e.Key == Key.Space && Keyboard.Modifiers.HasFlag(ModifierKeys.Control))
+        {
+            e.Handled = true;
+            _ = ShowCompletionAsync(force: true);
+        }
+    }
+
+    // --- Autocomplete (issue #114) ---
+    // Opens on Ctrl+Space and on typing an identifier character. The window
+    // filters live as the user keeps typing; data comes from the VM's caches
+    // (keywords/functions are static, collections + sampled field paths are
+    // fetched once per tab).
+
+    private void OnTextEntered(object? sender, TextCompositionEventArgs e)
+    {
+        if (_completionWindow is not null) return; // already open — it filters itself
+        if (e.Text.Length == 1 && (char.IsLetter(e.Text[0]) || e.Text[0] == '_'))
+            _ = ShowCompletionAsync();
+    }
+
+    private async Task ShowCompletionAsync(bool force = false)
+    {
+        if (ViewModel is not { } vm || _completionWindow is not null) return;
+
+        var text = Editor.Text;
+        var caret = Editor.CaretOffset;
+        var (start, prefix) = SqlAutocomplete.CurrentWord(text, caret);
+        if (!force && prefix.Length == 0) return;
+
+        var collections = await vm.GetCompletionCollectionsAsync();
+        IReadOnlyList<string> fields = Array.Empty<string>();
+        if (SqlAutocomplete.TargetCollection(text) is { } target)
+            fields = await vm.GetCompletionFieldsAsync(target);
+
+        // The caret may have moved while data loaded — recompute the word.
+        text = Editor.Text;
+        caret = Editor.CaretOffset;
+        (start, prefix) = SqlAutocomplete.CurrentWord(text, caret);
+
+        var items = SqlAutocomplete.GetCompletions(text, caret, collections, fields);
+        if (items.Count == 0) return;
+
+        _completionWindow = new CompletionWindow(Editor.TextArea)
+        {
+            StartOffset = start,
+            CloseWhenCaretAtBeginning = true,
+        };
+        _completionWindow.CompletionList.IsFiltering = true;
+        foreach (var item in items)
+            _completionWindow.CompletionList.CompletionData.Add(new SqlCompletionData(item));
+        _completionWindow.Closed += (_, _) => _completionWindow = null;
+        _completionWindow.Show();
+        if (prefix.Length > 0)
+            _completionWindow.CompletionList.SelectItem(prefix);
     }
 
     private async void OnRun(object sender, RoutedEventArgs e) => await RunAsync();

@@ -285,6 +285,36 @@ public sealed partial class QueryDocumentViewModel : DocumentViewModel
         StatusSummary = message;
     }
 
+    // --- Autocomplete data (issue #114) ---
+    // Cached per tab: collection names once, field paths per collection (from
+    // a one-document sample). Failures degrade to empty — completion is a
+    // convenience, never an error surface.
+
+    private IReadOnlyList<string>? _completionCollections;
+    private readonly Dictionary<string, IReadOnlyList<string>> _completionFields = new(StringComparer.OrdinalIgnoreCase);
+
+    public async Task<IReadOnlyList<string>> GetCompletionCollectionsAsync()
+    {
+        if (_completionCollections is not null) return _completionCollections;
+        try { _completionCollections = await _connection.GetCollectionNamesAsync(Database); }
+        catch { _completionCollections = Array.Empty<string>(); }
+        return _completionCollections;
+    }
+
+    public async Task<IReadOnlyList<string>> GetCompletionFieldsAsync(string collection)
+    {
+        if (_completionFields.TryGetValue(collection, out var cached)) return cached;
+        IReadOnlyList<string> fields;
+        try
+        {
+            var sample = await _connection.ExecuteAsync(Database, $"SELECT * FROM {collection} LIMIT 1");
+            fields = SqlAutocomplete.FlattenFields(sample.Documents.FirstOrDefault());
+        }
+        catch { fields = Array.Empty<string>(); }
+        _completionFields[collection] = fields;
+        return fields;
+    }
+
     private void ReloadHistory()
     {
         History.Clear();
