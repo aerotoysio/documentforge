@@ -10,7 +10,7 @@ This file is a pickup point — clone the repo on a different machine, `git pull
 
 The July 5 Studio backlog (#113–#119, seven issues) is **fully shipped** — Studio (the WPF desktop app) now covers connect-to-follower from the topology graph, a service settings editor, a swarm panel for child services, query autocomplete, PITR + WAL-archiving + backup-settings wizards, one-click cluster-config distribution, and a full rebalance flow (plan preview → execute → live progress) backed by new engine HTTP endpoints.
 
-The remaining big rocks are the **developer portal (#68)**, the production-readiness tail of **#66** (lazy open + per-DB quotas, auth scopes), and **#73** (macOS arm64 startup crash — needs a Mac to reproduce). Also outstanding: **14 Dependabot alerts** (7 high) on the default branch.
+The remaining big rocks are the **developer portal (#68)**, the production-readiness tail of **#66** (lazy open + per-DB quotas, auth scopes), and **#73** (macOS arm64 startup crash — needs a Mac to reproduce). Dependabot is clean: all 14 alerts pointed at the retired admin-ui's package-lock and were dismissed as not-used (2026-07-07).
 
 ---
 
@@ -52,7 +52,6 @@ Earlier (May–July, already on master): multi-DB epic phases 1–6c, blob store
 | Item | Description | Effort |
 |---|---|---|
 | **#68** | Developer portal — docs site: getting-started, REST + CLI reference, LINQ & clustering guides, runnable examples | ~3–4 days |
-| **Dependabot** | 14 alerts on the default branch (7 high, 5 moderate, 2 low) | ~half day |
 | **#66 Phase 3b** | Lazy DB open + per-DB quotas + idle eviction (host 50+ DBs per process) | ~1 day |
 | **#66 Phase 4** | Bearer auth scopes (`db:foo`, `db:*`, `*`) + per-request DB scoping | ~1–2 days |
 | **#73** | `dfdb serve` intermittent native crash on macOS arm64 (Kestrel AcceptAsync) — needs a Mac | unknown |
@@ -63,7 +62,6 @@ Deferred (perf / debt, opportunistic):
 - SqlBulkCopy-style turbo bulk-load.
 - Benign build warnings (SYSLIB0057, a few xUnit analyzer nags).
 - Rebalance shard transports assume one shared admin key (`shardApiKey`); per-shard keys would need the router config's per-endpoint `apiKey` shape in the engine format.
-- Untracked `admin-ui/` folder in the repo root — legacy react-flow admin UI, superseded by the WPF Studio; decide keep-or-delete.
 
 ## To resume
 
