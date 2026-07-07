@@ -44,6 +44,25 @@ public sealed class ClusterRebalancer
         public string ToShard { get; init; } = "";
         public long DocsMoved { get; init; }
         public long DocsScanned { get; init; }
+
+        /// <summary>Documents whose source-shard delete failed (or whose _id
+        /// couldn't be resolved) — they were NOT moved and may now exist on
+        /// both shards. Non-zero means the operator should investigate.</summary>
+        public long MoveFailures { get; init; }
+    }
+
+    /// <summary>Resolve a document's id whether it arrived in-process (typed
+    /// ObjectId) or over HTTP (JSON round-trip turns _id into a hex STRING —
+    /// GetId() returns Empty for those, which made HTTP-transport rebalances
+    /// delete nothing and duplicate every moved doc).</summary>
+    private static DocumentId ResolveId(DocumentForge.Document.BsonDocument doc)
+    {
+        var id = doc.GetId();
+        if (!id.IsEmpty) return id;
+        var raw = doc["_id"];
+        if (raw.Type == DocumentForge.Document.BsonType.String && Guid.TryParse(raw.AsString, out var g))
+            return new DocumentId(g);
+        return DocumentId.Empty;
     }
 
     /// <summary>
@@ -137,7 +156,7 @@ public sealed class ClusterRebalancer
                 var fromName = plan.OldConfig.Shards[srcIdx].Name;
                 var result = srcShard.Execute($"SELECT * FROM {migration.CollectionName}");
 
-                long scanned = 0, moved = 0;
+                long scanned = 0, moved = 0, failures = 0;
                 foreach (var doc in result.Documents)
                 {
                     scanned++;
@@ -146,25 +165,26 @@ public sealed class ClusterRebalancer
                     var toName = plan.NewConfig.Shards[newIdx].Name;
                     if (fromName.Equals(toName, StringComparison.OrdinalIgnoreCase)) continue;
 
-                    // Move: write on new shard, delete from old.
-                    // (Best-effort: if the dest write fails we abort - doc still on old shard.)
-                    var docId = doc.GetId();
+                    // Move: write on new shard, delete from old — in that order,
+                    // so a failure can only ever duplicate a doc, never lose one.
+                    var docId = ResolveId(doc);
+                    if (docId.IsEmpty) { failures++; continue; }
                     newShards.Items[newIdx].Insert(migration.CollectionName, doc);
-                    srcShard.DeleteById(migration.CollectionName, docId);
+                    if (!srcShard.DeleteById(migration.CollectionName, docId)) { failures++; continue; }
                     moved++;
 
                     if (moved % 1000 == 0)
                         onProgress?.Invoke(new Progress {
                             CollectionName = migration.CollectionName,
                             FromShard = fromName, ToShard = "(many)",
-                            DocsMoved = moved, DocsScanned = scanned
+                            DocsMoved = moved, DocsScanned = scanned, MoveFailures = failures
                         });
                 }
 
                 onProgress?.Invoke(new Progress {
                     CollectionName = migration.CollectionName,
                     FromShard = fromName, ToShard = "(done)",
-                    DocsMoved = moved, DocsScanned = scanned
+                    DocsMoved = moved, DocsScanned = scanned, MoveFailures = failures
                 });
             }
         }
@@ -264,6 +284,9 @@ public sealed class ClusterRebalancer
 
                         if (!shardByName.TryGetValue(toName, out var destShard)) continue;
 
+                        var docId = ResolveId(doc);
+                        if (docId.IsEmpty) continue;
+
                         // Idempotent: if the doc was already written by a client, our DeleteById
                         // on srcShard succeeds (even without a live copy there it's fine) and
                         // the destination may already have a newer version.
@@ -276,7 +299,7 @@ public sealed class ClusterRebalancer
                             // Destination has it (possibly a newer version from a client write)
                             // - don't overwrite, just clean up the source.
                         }
-                        srcShard.DeleteById(collName, doc.GetId());
+                        srcShard.DeleteById(collName, docId);
                         moved++;
                         report.TotalMoved++;
 

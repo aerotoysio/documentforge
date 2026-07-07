@@ -1463,6 +1463,119 @@ public static class ServeCommand
             return Results.Ok(new { saved = true, path, version = incoming.Version });
         });
 
+        // Issue #116 — HTTP rebalance. The same plan/execute the `dfdb
+        // rebalance` CLI verb runs, exposed so Studio can drive it: plan is a
+        // dry run (per-collection move counts, no mutation), execute runs the
+        // offline migration in the background with progress readable from
+        // /admin/rebalance/status. One rebalance at a time per node. The old
+        // config defaults to this node's stored cluster.json (#113); on
+        // success the new config replaces it.
+        app.MapPost("/admin/rebalance/plan", async (HttpContext httpCtx) =>
+        {
+            if (ScopeCheck.RequireAdmin(httpCtx) is { } deny) return deny;
+            var (plan, error) = await BuildRebalancePlanAsync(httpCtx, config);
+            if (error is not null) return error;
+            return Results.Ok(RebalancePlanToWire(plan!));
+        });
+
+        app.MapPost("/admin/rebalance/execute", async (HttpContext httpCtx) =>
+        {
+            if (ScopeCheck.RequireAdmin(httpCtx) is { } deny) return deny;
+            lock (_rebalanceLock)
+            {
+                if (_rebalance is { Running: true })
+                    return Results.Conflict(new { error = "A rebalance is already running on this node. Poll /admin/rebalance/status." });
+            }
+
+            var (plan, error) = await BuildRebalancePlanAsync(httpCtx, config);
+            if (error is not null) return error;
+
+            var state = new RebalanceState
+            {
+                Running = true,
+                StartedAtUtc = DateTime.UtcNow,
+                TotalToMove = plan!.Plan.TotalDocumentsToMove,
+            };
+            lock (_rebalanceLock) _rebalance = state;
+
+            var shardKey = plan.ShardApiKey;
+            _ = Task.Run(() =>
+            {
+                try
+                {
+                    DocumentForge.Engine.Cluster.ClusterRebalancer.Execute(
+                        plan.Plan,
+                        d => new DocumentForge.Engine.Cluster.HttpShardTransport(d.Name, d.LeaderEndpoint, apiKey: shardKey),
+                        p =>
+                        {
+                            lock (_rebalanceLock)
+                            {
+                                state.LastProgress = $"{p.CollectionName}: {p.FromShard} → {p.ToShard} · moved {p.DocsMoved:N0} / scanned {p.DocsScanned:N0}" +
+                                                     (p.MoveFailures > 0 ? $" · ⚠ {p.MoveFailures:N0} failed" : "");
+                                if (p.ToShard == "(done)")
+                                {
+                                    state.DocsMoved += p.DocsMoved;
+                                    state.MoveFailures += p.MoveFailures;
+                                }
+                            }
+                        });
+
+                    // The executed topology is now reality — store it as this
+                    // node's cluster.json so config and data agree (#113).
+                    try
+                    {
+                        Directory.CreateDirectory(config.DataDir);
+                        File.WriteAllText(Path.Combine(config.DataDir, "cluster.json"), plan.NewConfigJson);
+                    }
+                    catch { /* best-effort; the operator can push it explicitly */ }
+
+                    lock (_rebalanceLock)
+                    {
+                        state.Running = false;
+                        state.CompletedAtUtc = DateTime.UtcNow;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    lock (_rebalanceLock)
+                    {
+                        state.Running = false;
+                        state.CompletedAtUtc = DateTime.UtcNow;
+                        state.Error = ex.Message;
+                    }
+                }
+            });
+
+            return Results.Accepted("/admin/rebalance/status", new
+            {
+                started = true,
+                totalDocumentsToMove = state.TotalToMove,
+                status = "/admin/rebalance/status",
+            });
+        });
+
+        app.MapGet("/admin/rebalance/status", (HttpContext httpCtx) =>
+        {
+            if (ScopeCheck.RequireAdmin(httpCtx) is { } deny) return deny;
+            lock (_rebalanceLock)
+            {
+                if (_rebalance is null)
+                    return Results.Ok(new { running = false, started = false });
+                return Results.Ok(new
+                {
+                    running = _rebalance.Running,
+                    started = true,
+                    startedAtUtc = _rebalance.StartedAtUtc?.ToString("O"),
+                    completedAtUtc = _rebalance.CompletedAtUtc?.ToString("O"),
+                    error = _rebalance.Error,
+                    totalDocumentsToMove = _rebalance.TotalToMove,
+                    documentsMoved = _rebalance.DocsMoved,
+                    moveFailures = _rebalance.MoveFailures,
+                    lastProgress = _rebalance.LastProgress,
+                });
+            }
+        });
+
         // Force a cache flush (all dirty pages to disk, truncate recovery log)
         app.MapPost("/admin/flush", (HttpContext httpCtx) =>
         {
@@ -1582,6 +1695,108 @@ public static class ServeCommand
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
     }
+
+    // Issue #116 — one rebalance at a time per node; progress readable while
+    // it runs and after it finishes (until the next one starts).
+    private static readonly object _rebalanceLock = new();
+    private static RebalanceState? _rebalance;
+
+    private sealed class RebalanceState
+    {
+        public bool Running;
+        public DateTime? StartedAtUtc;
+        public DateTime? CompletedAtUtc;
+        public string? Error;
+        public long TotalToMove;
+        public long DocsMoved;
+        public long MoveFailures;
+        public string? LastProgress;
+    }
+
+    private sealed record RebalancePlanRequest(
+        DocumentForge.Engine.Cluster.ClusterRebalancer.MigrationPlan Plan,
+        string NewConfigJson,
+        string? ShardApiKey);
+
+    /// <summary>Parses a rebalance request body ({ oldConfigJson?, newConfigJson,
+    /// shardApiKey? }), defaulting the old config to this node's stored
+    /// cluster.json, and produces the dry-run migration plan. Returns either the
+    /// plan or an error result — never both.</summary>
+    private static async Task<(RebalancePlanRequest? Plan, IResult? Error)> BuildRebalancePlanAsync(
+        HttpContext httpCtx, NodeConfig config)
+    {
+        using var reader = new StreamReader(httpCtx.Request.Body);
+        var raw = await reader.ReadToEndAsync();
+        if (string.IsNullOrWhiteSpace(raw))
+            return (null, Results.BadRequest(new { error = "Empty body. Send { \"newConfigJson\": \"...\" } (oldConfigJson defaults to this node's stored cluster.json)." }));
+
+        string? oldJson = null, newJson = null, shardApiKey = null;
+        try
+        {
+            using var doc = JsonDocument.Parse(raw);
+            var root = doc.RootElement;
+            if (root.TryGetProperty("oldConfigJson", out var o) && o.ValueKind == JsonValueKind.String) oldJson = o.GetString();
+            if (root.TryGetProperty("newConfigJson", out var n) && n.ValueKind == JsonValueKind.String) newJson = n.GetString();
+            if (root.TryGetProperty("shardApiKey", out var k) && k.ValueKind == JsonValueKind.String) shardApiKey = k.GetString();
+        }
+        catch (JsonException ex)
+        {
+            return (null, Results.BadRequest(new { error = $"Invalid JSON: {ex.Message}" }));
+        }
+
+        if (string.IsNullOrWhiteSpace(newJson))
+            return (null, Results.BadRequest(new { error = "Missing 'newConfigJson'." }));
+
+        if (oldJson is null)
+        {
+            var storedPath = Path.Combine(config.DataDir, "cluster.json");
+            if (!File.Exists(storedPath))
+                return (null, Results.BadRequest(new
+                {
+                    error = "No 'oldConfigJson' in the request and no cluster.json stored on this node. " +
+                            "Push the current config first (PUT /admin/cluster-config) or send oldConfigJson explicitly.",
+                }));
+            oldJson = File.ReadAllText(storedPath);
+        }
+
+        DocumentForge.Engine.Cluster.ClusterConfig oldCfg, newCfg;
+        try { oldCfg = DocumentForge.Engine.Cluster.ClusterConfig.FromJson(oldJson)!; }
+        catch (Exception ex) { return (null, Results.BadRequest(new { error = $"Invalid oldConfigJson: {ex.Message}" })); }
+        try { newCfg = DocumentForge.Engine.Cluster.ClusterConfig.FromJson(newJson)!; }
+        catch (Exception ex) { return (null, Results.BadRequest(new { error = $"Invalid newConfigJson: {ex.Message}" })); }
+
+        if (newCfg.Shards.Count == 0)
+            return (null, Results.BadRequest(new { error = "newConfigJson has no shards." }));
+
+        try
+        {
+            var plan = DocumentForge.Engine.Cluster.ClusterRebalancer.Plan(
+                oldCfg, newCfg,
+                d => new DocumentForge.Engine.Cluster.HttpShardTransport(d.Name, d.LeaderEndpoint, apiKey: shardApiKey));
+            return (new RebalancePlanRequest(plan, newJson!, shardApiKey), null);
+        }
+        catch (Exception ex)
+        {
+            return (null, Results.BadRequest(new { error = $"Planning failed: {ex.Message} (all shards in the old config must be reachable)." }));
+        }
+    }
+
+    private static object RebalancePlanToWire(RebalancePlanRequest request) => new
+    {
+        totalDocumentsToMove = request.Plan.TotalDocumentsToMove,
+        collections = request.Plan.Collections.Select(c => new
+        {
+            name = c.CollectionName,
+            shardKeyPath = c.ShardKeyPath,
+            estimatedMovedDocs = c.EstimatedMovedDocs,
+            moves = c.Moves.OrderBy(m => m.Key.From).Select(m => new
+            {
+                from = m.Key.From,
+                to = m.Key.To,
+                count = m.Value,
+            }).ToList(),
+        }).ToList(),
+    };
 
     // Issue #111 — fields that require a process restart to change; the config
     // API is explicit about these rather than silently ignoring an edit.

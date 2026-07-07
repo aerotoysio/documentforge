@@ -272,6 +272,97 @@ public sealed partial class ClusterDocumentViewModel : DocumentViewModel
         }
     }
 
+    // ------------------------------------------------------------------
+    // Rebalance (issue #116): a coordinator node plans + executes the
+    // migration from ITS stored cluster.json (the "old" topology) to this
+    // editor's config (the "new" one). Plan is a dry run; execute runs in
+    // the coordinator's background and is polled here until done.
+    // ------------------------------------------------------------------
+
+    [ObservableProperty] private string _rebalanceCoordinator = "";
+    [ObservableProperty] private string _rebalancePlanText =
+        "Pick a coordinator node, then Preview plan. The coordinator's stored cluster.json is the current topology; this editor's config is the target.";
+    [ObservableProperty] private bool _rebalanceCanExecute;
+
+    partial void OnRebalanceCoordinatorChanged(string value) => RebalanceCanExecute = false;
+
+    [RelayCommand]
+    private async Task PreviewRebalanceAsync()
+    {
+        var coordinator = RebalanceCoordinator.Trim();
+        if (coordinator.Length == 0) { RebalancePlanText = "Enter the coordinator node's endpoint."; return; }
+
+        IsBusy = true;
+        RebalanceCanExecute = false;
+        try
+        {
+            var apiKey = _apiKeyForEndpoint?.Invoke(coordinator);
+            var plan = await ClusterRebalance.PlanAsync(coordinator, _config.ToJson(), shardApiKey: apiKey, apiKey: apiKey);
+            var lines = new List<string> { $"Total documents to move: {plan.TotalDocumentsToMove:N0}" };
+            foreach (var c in plan.Collections)
+            {
+                lines.Add($"{c.Name}  (hash on {c.ShardKeyPath}, {c.EstimatedMovedDocs:N0} moves)");
+                lines.AddRange(c.Moves.Select(m => $"   {m.From} → {m.To}: {m.Count:N0}"));
+            }
+            if (plan.Collections.Count == 0)
+                lines.Add("No hash-sharded collections in the current topology — nothing would move.");
+            lines.Add("");
+            lines.Add(plan.TotalDocumentsToMove == 0
+                ? "Topologies already agree (or nothing to move). Executing is harmless but unnecessary."
+                : "Review the moves, then Execute. The migration is OFFLINE — run it in a maintenance window.");
+            RebalancePlanText = string.Join(Environment.NewLine, lines);
+            RebalanceCanExecute = true;
+        }
+        catch (Exception ex) { RebalancePlanText = ex.Message; }
+        finally { IsBusy = false; }
+    }
+
+    [RelayCommand]
+    private async Task ExecuteRebalanceAsync()
+    {
+        var coordinator = RebalanceCoordinator.Trim();
+        if (coordinator.Length == 0 || !RebalanceCanExecute) return;
+        if (!_dialogs.Confirm("Execute rebalance",
+                $"Execute the migration on coordinator {coordinator}?\n\n" +
+                "Documents move between shards (offline migration — run in a maintenance window). " +
+                "On success the coordinator stores this editor's config as its cluster.json; " +
+                "use 'Push to nodes' afterwards so every other node agrees."))
+            return;
+
+        IsBusy = true;
+        RebalanceCanExecute = false;
+        try
+        {
+            var apiKey = _apiKeyForEndpoint?.Invoke(coordinator);
+            await ClusterRebalance.ExecuteAsync(coordinator, _config.ToJson(), shardApiKey: apiKey, apiKey: apiKey);
+
+            // Poll until the coordinator reports completion.
+            while (true)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(2));
+                var status = await ClusterRebalance.GetStatusAsync(coordinator, apiKey);
+                RebalancePlanText =
+                    $"{(status.Running ? "Rebalancing…" : "Finished.")} moved {status.DocumentsMoved:N0} / ~{status.TotalDocumentsToMove:N0}" +
+                    (status.MoveFailures > 0 ? $" · ⚠ {status.MoveFailures:N0} move(s) FAILED (possible duplicates — investigate)" : "") +
+                    (status.LastProgress is { } p ? Environment.NewLine + p : "");
+                if (!status.Running)
+                {
+                    RebalancePlanText += status.Error is { } err
+                        ? Environment.NewLine + $"✘ Failed: {err}"
+                        : Environment.NewLine + "✔ Migration complete. Now 'Push to nodes' so the whole cluster runs this config.";
+                    StatusMessage = status.Error is null ? "Rebalance complete." : $"Rebalance failed: {status.Error}";
+                    break;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            RebalancePlanText = ex.Message;
+            StatusMessage = $"Rebalance failed: {ex.Message}";
+        }
+        finally { IsBusy = false; }
+    }
+
     /// <summary>Distributes this config to every node it names (issue #113):
     /// PUT /admin/cluster-config on each distinct leader + follower endpoint.
     /// Per-node results; nodes reject pushes older than what they hold.</summary>
