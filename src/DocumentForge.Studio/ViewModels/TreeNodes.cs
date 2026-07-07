@@ -137,6 +137,9 @@ public sealed partial class ServerNodeViewModel : TreeNodeViewModel
 
     [RelayCommand]
     private void ServiceSettings() => _main.OpenServiceSettings(this);
+
+    [RelayCommand]
+    private void Services() => _main.OpenServices(this);
 }
 
 public sealed partial class DatabaseNodeViewModel : TreeNodeViewModel

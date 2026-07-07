@@ -1,0 +1,86 @@
+<UserControl x:Class="DocumentForge.Studio.Views.ServicesView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:vm="clr-namespace:DocumentForge.Studio.ViewModels"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             mc:Ignorable="d"
+             d:DataContext="{d:DesignInstance vm:ServicesDocumentViewModel}">
+    <DockPanel>
+        <!-- Toolbar -->
+        <ToolBarTray DockPanel.Dock="Top" IsLocked="True">
+            <ToolBar>
+                <Button Content="🔄 Refresh" Command="{Binding RefreshCommand}" Padding="8,2"/>
+                <Separator/>
+                <TextBlock Text="Port:" VerticalAlignment="Center" Margin="4,0,2,0"/>
+                <TextBox Text="{Binding SpawnPortText, UpdateSourceTrigger=PropertyChanged}" Width="56"
+                         ToolTip="Blank = pick a free port"/>
+                <TextBlock Text="Name:" VerticalAlignment="Center" Margin="8,0,2,0"/>
+                <TextBox Text="{Binding SpawnNodeName, UpdateSourceTrigger=PropertyChanged}" Width="110"
+                         ToolTip="Optional node name (also names the data dir)"/>
+                <Button Content="➕ Spawn child" Command="{Binding SpawnCommand}" Padding="8,2" Margin="6,0,0,0"
+                        ToolTip="Spawns a child dfdb serve. It inherits this server's admin key, so your current credentials work on it."/>
+                <Separator/>
+                <Button Content="🔌 Connect" Command="{Binding ConnectCommand}" Padding="8,2"
+                        ToolTip="Open the selected child in Object Explorer"/>
+                <Button Content="📜 Log" Command="{Binding ViewLogCommand}" Padding="8,2"
+                        ToolTip="Tail the selected child's stdout/stderr"/>
+                <Button Content="⏹ Stop" Command="{Binding StopCommand}" Padding="8,2"/>
+                <Button Content="⏹⏹ Stop all" Command="{Binding StopAllCommand}" Padding="8,2"/>
+            </ToolBar>
+        </ToolBarTray>
+
+        <!-- Status -->
+        <TextBlock DockPanel.Dock="Bottom" Text="{Binding StatusMessage}" Margin="10,6"
+                   Foreground="#555" FontSize="11" TextWrapping="Wrap"/>
+
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="150"/>
+            </Grid.RowDefinitions>
+
+            <!-- Children list -->
+            <ListView Grid.Row="0" ItemsSource="{Binding Services}" SelectedItem="{Binding SelectedService}"
+                      BorderThickness="0" Margin="6">
+                <ListView.View>
+                    <GridView>
+                        <GridViewColumn Header="Port" Width="60" DisplayMemberBinding="{Binding Port}"/>
+                        <GridViewColumn Header="Kind" Width="60" DisplayMemberBinding="{Binding Kind}"/>
+                        <GridViewColumn Header="Name" Width="120" DisplayMemberBinding="{Binding Name}"/>
+                        <GridViewColumn Header="Status" Width="90">
+                            <GridViewColumn.CellTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text="{Binding Status}">
+                                        <TextBlock.Style>
+                                            <Style TargetType="TextBlock">
+                                                <Setter Property="Foreground" Value="#B00020"/>
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding IsRunning}" Value="True">
+                                                        <Setter Property="Foreground" Value="#2E8B57"/>
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                </DataTemplate>
+                            </GridViewColumn.CellTemplate>
+                        </GridViewColumn>
+                        <GridViewColumn Header="Base URL" Width="180" DisplayMemberBinding="{Binding BaseUrl}"/>
+                        <GridViewColumn Header="Data dir" Width="280" DisplayMemberBinding="{Binding DataDir}"/>
+                        <GridViewColumn Header="Started (UTC)" Width="150" DisplayMemberBinding="{Binding Started}"/>
+                    </GridView>
+                </ListView.View>
+            </ListView>
+
+            <GridSplitter Grid.Row="1" Height="4" HorizontalAlignment="Stretch" Background="#DDD"/>
+
+            <!-- Log tail -->
+            <TextBox Grid.Row="2" Text="{Binding LogText, Mode=OneWay}" IsReadOnly="True"
+                     FontFamily="Consolas" FontSize="11" Margin="6"
+                     VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto"
+                     TextWrapping="NoWrap" Background="#FAFAFA"/>
+        </Grid>
+    </DockPanel>
+</UserControl>

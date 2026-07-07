@@ -177,6 +177,11 @@ public sealed class DirectFileConnection : IDfConnection
     public Task DeleteBackupAsync(string backupId, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
     public Task<string> RestoreBackupAsync(string backupId, string newDatabaseName, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
 
+    public Task<IReadOnlyList<ManagedServiceEntry>> GetManagedServicesAsync(CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task<SpawnedServiceInfo> SpawnServiceAsync(int? port, string? nodeName, string? dataDir, string? apiKey, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task StopManagedServiceAsync(int port, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+    public Task<string> GetManagedServiceLogAsync(int port, int maxBytes = 16384, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
+
     public Task<ServiceConfigInfo> GetServiceConfigAsync(CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
     public Task<ServiceConfigInfo> UpdateServiceConfigAsync(int? minSyncReplicas, double? syncTimeoutSeconds, CancellationToken ct = default) => throw new NotSupportedException(ServerOnly);
 

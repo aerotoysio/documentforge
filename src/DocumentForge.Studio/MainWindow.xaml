@@ -28,6 +28,8 @@
                                   Visibility="{Binding CanManageServer, Converter={StaticResource BoolToVis}}"/>
                         <MenuItem Header="Service Settings…" Command="{Binding ServiceSettingsCommand}"
                                   Visibility="{Binding CanManageServer, Converter={StaticResource BoolToVis}}"/>
+                        <MenuItem Header="Services (swarm)…" Command="{Binding ServicesCommand}"
+                                  Visibility="{Binding CanManageServer, Converter={StaticResource BoolToVis}}"/>
                         <MenuItem Header="Refresh" Command="{Binding RefreshCommand}"/>
                         <Separator/>
                         <MenuItem Header="Disconnect" Command="{Binding DisconnectCommand}"/>
@@ -143,6 +145,10 @@
 
         <DataTemplate DataType="{x:Type vm:ServiceSettingsDocumentViewModel}">
             <views:ServiceSettingsView/>
+        </DataTemplate>
+
+        <DataTemplate DataType="{x:Type vm:ServicesDocumentViewModel}">
+            <views:ServicesView/>
         </DataTemplate>
 
         <DataTemplate DataType="{x:Type vm:WelcomeDocumentViewModel}">

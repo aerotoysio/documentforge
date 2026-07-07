@@ -409,6 +409,67 @@ public sealed class HttpConnection : IDfConnection
             RecommendationDetail: root.TryGetProperty("recommendationDetail", out var rd) && rd.ValueKind == JsonValueKind.String ? rd.GetString() : null);
     }
 
+    public async Task<IReadOnlyList<ManagedServiceEntry>> GetManagedServicesAsync(CancellationToken ct = default)
+    {
+        var body = await GetRawAsync("services", ct).ConfigureAwait(false);
+        using var doc = JsonDocument.Parse(body);
+        var result = new List<ManagedServiceEntry>();
+        if (doc.RootElement.TryGetProperty("services", out var arr) && arr.ValueKind == JsonValueKind.Array)
+            foreach (var s in arr.EnumerateArray())
+                result.Add(new ManagedServiceEntry(
+                    Port: s.TryGetProperty("port", out var p) && p.ValueKind == JsonValueKind.Number ? p.GetInt32() : 0,
+                    NodeName: s.TryGetProperty("nodeName", out var n) && n.ValueKind == JsonValueKind.String ? n.GetString() : null,
+                    BaseUrl: s.TryGetProperty("baseUrl", out var b) && b.ValueKind == JsonValueKind.String ? b.GetString() ?? "" : "",
+                    DataDir: s.TryGetProperty("dataDir", out var d) && d.ValueKind == JsonValueKind.String ? d.GetString() ?? "" : "",
+                    StartedAtUtc: s.TryGetProperty("startedAt", out var sa) && sa.ValueKind == JsonValueKind.String ? sa.GetString() : null,
+                    Running: s.TryGetProperty("running", out var r) && r.ValueKind == JsonValueKind.True,
+                    ExitCode: s.TryGetProperty("exitCode", out var ec) && ec.ValueKind == JsonValueKind.Number ? ec.GetInt32() : null,
+                    Kind: s.TryGetProperty("kind", out var k) && k.ValueKind == JsonValueKind.String ? k.GetString() ?? "serve" : "serve"));
+        return result;
+    }
+
+    public async Task<SpawnedServiceInfo> SpawnServiceAsync(int? port, string? nodeName, string? dataDir, string? apiKey, CancellationToken ct = default)
+    {
+        var payload = new Dictionary<string, object>();
+        if (port is { } p) payload["port"] = p;
+        if (!string.IsNullOrWhiteSpace(nodeName)) payload["nodeName"] = nodeName;
+        if (!string.IsNullOrWhiteSpace(dataDir)) payload["dataDir"] = dataDir;
+        if (!string.IsNullOrWhiteSpace(apiKey)) payload["apiKey"] = apiKey;
+
+        using var response = await _http.PostAsJsonAsync("services", payload, Json, ct).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+
+        using var doc = JsonDocument.Parse(body);
+        var root = doc.RootElement;
+        return new SpawnedServiceInfo(
+            Port: root.TryGetProperty("port", out var rp) && rp.ValueKind == JsonValueKind.Number ? rp.GetInt32() : 0,
+            BaseUrl: root.TryGetProperty("baseUrl", out var bu) && bu.ValueKind == JsonValueKind.String ? bu.GetString() ?? "" : "",
+            NodeName: root.TryGetProperty("nodeName", out var nn) && nn.ValueKind == JsonValueKind.String ? nn.GetString() : null,
+            DataDir: root.TryGetProperty("dataDir", out var dd) && dd.ValueKind == JsonValueKind.String ? dd.GetString() ?? "" : "",
+            Ready: root.TryGetProperty("ready", out var rd) && rd.ValueKind == JsonValueKind.True);
+    }
+
+    public async Task StopManagedServiceAsync(int port, CancellationToken ct = default)
+    {
+        using var response = await _http.DeleteAsync($"services/{port}", ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        }
+    }
+
+    public async Task<string> GetManagedServiceLogAsync(int port, int maxBytes = 16384, CancellationToken ct = default)
+    {
+        using var response = await _http.GetAsync($"services/{port}/logs?maxBytes={maxBytes}", ct).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        return body;
+    }
+
     public async Task<ServiceConfigInfo> GetServiceConfigAsync(CancellationToken ct = default)
     {
         var body = await GetRawAsync("admin/config", ct).ConfigureAwait(false);

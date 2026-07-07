@@ -60,6 +60,22 @@ public interface IDfConnection : IAsyncDisposable
     Task<CreatedApiKey> CreateApiKeyAsync(string? description, IReadOnlyList<string> scopes, CancellationToken ct = default);
     Task RevokeApiKeyAsync(string id, CancellationToken ct = default);
 
+    // --- Managed child services (server connections only; requires ServerAdmin) ---
+
+    /// <summary>Children spawned by this service's ServiceManager (GET /services).</summary>
+    Task<IReadOnlyList<ManagedServiceEntry>> GetManagedServicesAsync(CancellationToken ct = default);
+
+    /// <summary>Spawns a child dfdb serve process (POST /services). All fields
+    /// optional: null port picks a free one, null apiKey inherits the parent's.
+    /// Returns the child's endpoint so callers can connect to it.</summary>
+    Task<SpawnedServiceInfo> SpawnServiceAsync(int? port, string? nodeName, string? dataDir, string? apiKey, CancellationToken ct = default);
+
+    /// <summary>Stops and reaps a managed child (DELETE /services/{port}).</summary>
+    Task StopManagedServiceAsync(int port, CancellationToken ct = default);
+
+    /// <summary>Tails a managed child's combined stdout/stderr log.</summary>
+    Task<string> GetManagedServiceLogAsync(int port, int maxBytes = 16384, CancellationToken ct = default);
+
     // --- Service settings (server connections only; requires ServerAdmin) ---
 
     /// <summary>The redacted effective node configuration (engine #111).

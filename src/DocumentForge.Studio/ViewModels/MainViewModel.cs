@@ -566,6 +566,26 @@ public sealed partial class MainViewModel : ObservableObject
         }
     }
 
+    /// <summary>Opens (or re-focuses) the swarm panel for a server — spawn,
+    /// list, kill, and tail child dfdb services (#118).</summary>
+    public void OpenServices(ServerNodeViewModel server)
+    {
+        var contentId = $"services:{server.Connection.Descriptor.Id}";
+        var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
+        if (existing is not null) { ActiveDocument = existing; return; }
+
+        // Children inherit the parent's admin key, so connect to them with the
+        // parent's key when we don't already know the endpoint.
+        var parentDescriptor = server.Connection.Descriptor;
+        Func<string, Task> connect = url => ConnectToEndpointAsync(url,
+            parentDescriptor.ApiKeySecretId is { } id ? _workspace.Secrets.TryGet(id) : null);
+
+        var document = new ServicesDocumentViewModel(server.Connection, connect);
+        Documents.Add(document);
+        ActiveDocument = document;
+        StatusText = $"Services — {server.Connection.Descriptor.Name}";
+    }
+
     /// <summary>Opens (or re-focuses) the service settings panel for a server (#115).</summary>
     public void OpenServiceSettings(ServerNodeViewModel server)
     {
@@ -586,17 +606,19 @@ public sealed partial class MainViewModel : ObservableObject
         var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
         if (existing is not null) { ActiveDocument = existing; return; }
 
-        var document = new TopologyDocumentViewModel(server.Connection, ConnectToEndpointAsync);
+        var document = new TopologyDocumentViewModel(server.Connection, url => ConnectToEndpointAsync(url));
         Documents.Add(document);
         ActiveDocument = document;
         StatusText = $"Topology — {server.Connection.Descriptor.Name}";
     }
 
     /// <summary>Connects to a service by its HTTP base URL (e.g. a follower
-    /// clicked in the topology graph). Reuses an already-open connection when
-    /// one matches, then a saved descriptor (which may carry an API key);
-    /// otherwise connects ad-hoc without saving.</summary>
-    public async Task ConnectToEndpointAsync(string url)
+    /// clicked in the topology graph, or a spawned child). Reuses an
+    /// already-open connection when one matches, then a saved descriptor
+    /// (which may carry an API key); otherwise connects ad-hoc without saving,
+    /// using <paramref name="fallbackApiKey"/> when provided (children inherit
+    /// their parent's admin key).</summary>
+    public async Task ConnectToEndpointAsync(string url, string? fallbackApiKey = null)
     {
         url = url.TrimEnd('/');
 
@@ -626,7 +648,7 @@ public sealed partial class MainViewModel : ObservableObject
             Kind = ConnectionKind.Http,
             Url = url,
         };
-        await OpenConnectionAsync(descriptor, apiKey: null, save: false);
+        await OpenConnectionAsync(descriptor, fallbackApiKey, save: false);
     }
 
     /// <summary>Opens (or re-focuses) the dashboard for a database.</summary>
