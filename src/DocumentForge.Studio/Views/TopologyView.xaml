@@ -27,7 +27,7 @@
                 <TextBlock Text="Standalone" Margin="4,0,16,0" VerticalAlignment="Center"/>
             </StackPanel>
             <TextBlock Foreground="Gray" FontSize="11" Margin="0,4,0,0" TextWrapping="Wrap"
-                       Text="Peer boxes labelled &quot;replication link&quot; show a replication TCP socket (an ephemeral port), not a connectable HTTP endpoint — don't try to connect to them. Left-column boxes are this node's databases."/>
+                       Text="Followers that advertise an HTTP endpoint are clickable — click one to open a connection to it in Object Explorer. Peer boxes labelled &quot;replication link&quot; show a replication TCP socket (an ephemeral port), not a connectable HTTP endpoint. Left-column boxes are this node's databases."/>
         </StackPanel>
 
         <!-- Graph -->
@@ -81,6 +81,21 @@
                             <Border Width="{Binding Width}" Height="{Binding Height}"
                                     Background="{Binding Fill}" BorderBrush="{Binding Stroke}" BorderThickness="2"
                                     CornerRadius="6" Padding="10,6">
+                                <Border.InputBindings>
+                                    <MouseBinding MouseAction="LeftClick"
+                                                  Command="{Binding DataContext.ConnectToNodeCommand, RelativeSource={RelativeSource AncestorType=UserControl}}"
+                                                  CommandParameter="{Binding}"/>
+                                </Border.InputBindings>
+                                <Border.Style>
+                                    <Style TargetType="Border">
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding IsConnectable}" Value="True">
+                                                <Setter Property="Cursor" Value="Hand"/>
+                                                <Setter Property="ToolTip" Value="Click to open a connection to this node"/>
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Border.Style>
                                 <StackPanel VerticalAlignment="Center">
                                     <TextBlock Text="{Binding Title}" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
                                     <TextBlock Text="{Binding Subtitle}" FontSize="11" Foreground="#555"

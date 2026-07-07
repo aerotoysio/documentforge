@@ -573,10 +573,47 @@ public sealed partial class MainViewModel : ObservableObject
         var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
         if (existing is not null) { ActiveDocument = existing; return; }
 
-        var document = new TopologyDocumentViewModel(server.Connection);
+        var document = new TopologyDocumentViewModel(server.Connection, ConnectToEndpointAsync);
         Documents.Add(document);
         ActiveDocument = document;
         StatusText = $"Topology — {server.Connection.Descriptor.Name}";
+    }
+
+    /// <summary>Connects to a service by its HTTP base URL (e.g. a follower
+    /// clicked in the topology graph). Reuses an already-open connection when
+    /// one matches, then a saved descriptor (which may carry an API key);
+    /// otherwise connects ad-hoc without saving.</summary>
+    public async Task ConnectToEndpointAsync(string url)
+    {
+        url = url.TrimEnd('/');
+
+        var open = Servers.FirstOrDefault(s =>
+            s.Connection.Descriptor.Kind == ConnectionKind.Http &&
+            string.Equals(s.Connection.Descriptor.Url?.TrimEnd('/'), url, StringComparison.OrdinalIgnoreCase));
+        if (open is not null)
+        {
+            open.IsExpanded = true;
+            StatusText = $"Already connected to {url}";
+            return;
+        }
+
+        var saved = _workspace.Connections.FirstOrDefault(c =>
+            c.Kind == ConnectionKind.Http &&
+            string.Equals(c.Url?.TrimEnd('/'), url, StringComparison.OrdinalIgnoreCase));
+        if (saved is not null)
+        {
+            var apiKey = saved.ApiKeySecretId is { } id ? _workspace.Secrets.TryGet(id) : null;
+            await OpenConnectionAsync(saved, apiKey, save: false);
+            return;
+        }
+
+        var descriptor = new ConnectionDescriptor
+        {
+            Name = url.Replace("https://", "").Replace("http://", ""),
+            Kind = ConnectionKind.Http,
+            Url = url,
+        };
+        await OpenConnectionAsync(descriptor, apiKey: null, save: false);
     }
 
     /// <summary>Opens (or re-focuses) the dashboard for a database.</summary>

@@ -18,6 +18,13 @@ public sealed class TopoNode
     public Brush Fill { get; init; } = Brushes.White;
     public Brush Stroke { get; init; } = Brushes.Gray;
 
+    /// <summary>The node's advertised HTTP base URL, when it has one (#112).
+    /// Set only on peers that can actually be connected to — clicking such a
+    /// node opens a Studio connection to it (#119).</summary>
+    public string? HttpEndpoint { get; init; }
+
+    public bool IsConnectable => !string.IsNullOrWhiteSpace(HttpEndpoint);
+
     public double CenterY => Y + Height / 2;
     public double Right => X + Width;
 }
@@ -39,6 +46,7 @@ public sealed class TopoEdge
 public sealed partial class TopologyDocumentViewModel : DocumentViewModel
 {
     private readonly IDfConnection _connection;
+    private readonly Func<string, Task>? _connectToEndpoint;
 
     private static readonly Brush LeaderFill = new SolidColorBrush(Color.FromRgb(0xE8, 0xF0, 0xFE));
     private static readonly Brush LeaderStroke = new SolidColorBrush(Color.FromRgb(0x2A, 0x5D, 0xB0));
@@ -47,9 +55,10 @@ public sealed partial class TopologyDocumentViewModel : DocumentViewModel
     private static readonly Brush NoneFill = new SolidColorBrush(Color.FromRgb(0xF2, 0xF2, 0xF2));
     private static readonly Brush NoneStroke = new SolidColorBrush(Color.FromRgb(0x99, 0x99, 0x99));
 
-    public TopologyDocumentViewModel(IDfConnection connection)
+    public TopologyDocumentViewModel(IDfConnection connection, Func<string, Task>? connectToEndpoint = null)
     {
         _connection = connection;
+        _connectToEndpoint = connectToEndpoint;
         Title = $"Topology — {connection.Descriptor.Name}";
         ContentId = $"topo:{connection.Descriptor.Id}";
     }
@@ -131,10 +140,11 @@ public sealed partial class TopologyDocumentViewModel : DocumentViewModel
                         {
                             Title = connectable ? f.HttpEndpoint! : f.Endpoint,
                             Subtitle = connectable
-                                ? $"follower · lag {f.LagSeq:N0}"
+                                ? $"follower · lag {f.LagSeq:N0} · click to connect"
                                 : $"follower · replication link (not HTTP) · lag {f.LagSeq:N0}",
                             X = rightX, Y = peerY, Width = nodeW,
                             Fill = FollowerFill, Stroke = FollowerStroke,
+                            HttpEndpoint = connectable ? f.HttpEndpoint : null,
                         };
                         Nodes.Add(peer);
                         AddEdge(dbNode, peer, $"lag {f.LagSeq:N0}");
@@ -172,6 +182,17 @@ public sealed partial class TopologyDocumentViewModel : DocumentViewModel
         {
             IsBusy = false;
         }
+    }
+
+    /// <summary>Opens a Studio connection to a clicked node's advertised HTTP
+    /// endpoint (#119). No-op for nodes without one (ephemeral replication
+    /// sockets aren't connectable).</summary>
+    [RelayCommand]
+    private async Task ConnectToNodeAsync(TopoNode? node)
+    {
+        if (node?.HttpEndpoint is not { Length: > 0 } endpoint || _connectToEndpoint is null) return;
+        StatusMessage = $"Connecting to {endpoint}…";
+        await _connectToEndpoint(endpoint);
     }
 
     private void AddEdge(TopoNode from, TopoNode to, string label) =>
