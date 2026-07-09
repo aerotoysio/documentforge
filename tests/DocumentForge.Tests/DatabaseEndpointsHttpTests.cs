@@ -271,6 +271,98 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
         Assert.Equal("sale", doc["lastOp"].AsString);
     }
 
+    // ---- Scoped by-business-key routes (/db/{name}/collections/{c}/by/{field}/{value}).
+    // Mirror the flat by-field family so multi-DB clients (AeroBus et al) can key
+    // documents by their own ids without a dedicated node per database.
+
+    [Fact]
+    public async Task ScopedByField_Get_FindsDocument_AndMissesReturn404()
+    {
+        var (registry, baseUrl, dataDir) = BootServer();
+        registry.AttachOrCreate("airline", Path.Combine(dataDir, "airline.dfdb"));
+        var db = registry.Get("airline");
+        db.Insert("orders", """{"pnr":"ABC123","status":"held"}""");
+
+        var found = await _http.GetAsync($"{baseUrl}/db/airline/collections/orders/by/pnr/ABC123");
+        Assert.Equal(HttpStatusCode.OK, found.StatusCode);
+        var body = await found.Content.ReadAsStringAsync();
+        Assert.Contains("\"database\":\"airline\"", body);
+        Assert.Contains("\"pnr\":\"ABC123\"", body);
+        Assert.Contains("\"_etag\"", body); // metadata preserved for If-Match flows
+
+        var miss = await _http.GetAsync($"{baseUrl}/db/airline/collections/orders/by/pnr/NOPE99");
+        Assert.Equal(HttpStatusCode.NotFound, miss.StatusCode);
+
+        var wrongDb = await _http.GetAsync($"{baseUrl}/db/ghost/collections/orders/by/pnr/ABC123");
+        Assert.Equal(HttpStatusCode.NotFound, wrongDb.StatusCode);
+    }
+
+    [Fact]
+    public async Task ScopedByField_Put_ReplacesFirstMatch()
+    {
+        var (registry, baseUrl, dataDir) = BootServer();
+        registry.AttachOrCreate("airline", Path.Combine(dataDir, "airline.dfdb"));
+        var db = registry.Get("airline");
+        var id = db.Insert("orders", """{"pnr":"ABC123","status":"held"}""");
+
+        var resp = await _http.PutAsync($"{baseUrl}/db/airline/collections/orders/by/pnr/ABC123",
+            new StringContent("""{"pnr":"ABC123","status":"paid"}""", System.Text.Encoding.UTF8, "application/json"));
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("\"database\":\"airline\"", body);
+        Assert.Contains($"\"id\":\"{id}\"", body);
+
+        Assert.Equal("paid", db.GetCollection("orders")!.FindById(id)!["status"].AsString);
+    }
+
+    [Fact]
+    public async Task ScopedByField_Patch_MergesIntoResolvedDocument()
+    {
+        var (registry, baseUrl, dataDir) = BootServer();
+        registry.AttachOrCreate("airline", Path.Combine(dataDir, "airline.dfdb"));
+        var db = registry.Get("airline");
+        var id = db.Insert("orders", """{"pnr":"ABC123","status":"held","note":"x"}""");
+
+        var resp = await PatchJson($"{baseUrl}/db/airline/collections/orders/by/pnr/ABC123",
+            """{"status":"ticketed","note":null}""");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+
+        var doc = db.GetCollection("orders")!.FindById(id)!;
+        Assert.Equal("ticketed", doc["status"].AsString);
+        Assert.False(doc.ContainsKey("note"));
+    }
+
+    [Fact]
+    public async Task ScopedByField_Delete_RemovesAllMatches()
+    {
+        var (registry, baseUrl, dataDir) = BootServer();
+        registry.AttachOrCreate("airline", Path.Combine(dataDir, "airline.dfdb"));
+        var db = registry.Get("airline");
+        db.Insert("etickets", """{"orderId":"OD1","doc":"999-1"}""");
+        db.Insert("etickets", """{"orderId":"OD1","doc":"999-2"}""");
+        db.Insert("etickets", """{"orderId":"OD2","doc":"999-3"}""");
+
+        var resp = await _http.DeleteAsync($"{baseUrl}/db/airline/collections/etickets/by/orderId/OD1");
+        Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("\"deletedCount\":2", body);
+
+        var remaining = db.Execute("SELECT * FROM etickets");
+        Assert.Single(remaining.Documents);
+    }
+
+    [Fact]
+    public async Task ScopedByField_RejectsHostileFieldPath()
+    {
+        var (registry, baseUrl, dataDir) = BootServer();
+        registry.AttachOrCreate("airline", Path.Combine(dataDir, "airline.dfdb"));
+        registry.Get("airline").Insert("orders", """{"pnr":"ABC123"}""");
+
+        // A field segment that could form SQL syntax must be rejected, not interpolated.
+        var resp = await _http.GetAsync($"{baseUrl}/db/airline/collections/orders/by/pnr%27%20OR%201%3D1--/x");
+        Assert.Equal(HttpStatusCode.BadRequest, resp.StatusCode);
+    }
+
     [Fact]
     public async Task Patch_IfMatch_Mismatch_Returns412_AndWritesNothing()
     {
