@@ -405,6 +405,8 @@ public static class ServeCommand
         Console.WriteLine("             POST /seed | GET /health | GET /version");
         Console.WriteLine("  databases: GET  /databases | POST /databases | DELETE /databases/{name}");
         Console.WriteLine("             POST /databases/{name}/set-default");
+        Console.WriteLine("  db-scoped: /db/{db}/query | /db/{db}/collections/{name}[/{id}|/by/{field}/{value}]");
+        Console.WriteLine("             (flat routes target the default database; /db/{db}/… targets any attached one)");
         Console.WriteLine("  services:  GET  /services | POST /services | DELETE /services/{port}");
         Console.WriteLine("  keys:      GET  /admin/keys | POST /admin/keys | DELETE /admin/keys/{id}");
         Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint | POST /admin/snapshot");
@@ -2032,7 +2034,7 @@ public static class ServeCommand
     private static readonly System.Text.RegularExpressions.Regex _fieldPathRegex =
         new("^[a-zA-Z_][a-zA-Z0-9_.\\[\\]]*$", System.Text.RegularExpressions.RegexOptions.Compiled);
 
-    private static bool IsValidFieldPath(string field) =>
+    internal static bool IsValidFieldPath(string field) =>
         !string.IsNullOrEmpty(field) && _fieldPathRegex.IsMatch(field);
 
     /// <summary>
@@ -2087,7 +2089,7 @@ public static class ServeCommand
         && name.Length <= MaxCollectionNameLength
         && _collectionNameRegex.IsMatch(name);
 
-    private static IResult InvalidCollectionNameResult() =>
+    internal static IResult InvalidCollectionNameResult() =>
         Results.BadRequest(new { error = $"Collection name must match [a-zA-Z_][a-zA-Z0-9_]* and be at most {MaxCollectionNameLength} chars." });
 
     /// <summary>

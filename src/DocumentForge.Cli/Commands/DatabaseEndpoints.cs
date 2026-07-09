@@ -1136,6 +1136,131 @@ public static class DatabaseEndpoints
             return PatchHandler.Handle(db, collection, id, request);
         });
 
+        // ---- Scoped by-business-key routes (GET/PUT/PATCH/DELETE …/by/{field}/{value}).
+        // The flat by-field family only sees the default database, which forced
+        // clients that key documents by their own ids (e.g. AeroBus) onto a
+        // dedicated node per database. Shapes mirror the flat routes exactly,
+        // plus the `database` field every scoped route carries.
+
+        // Look up by any field — e.g. GET /db/airline/collections/orders/by/pnr/ABC123.
+        // Uses an index when one exists on the field; collection scan otherwise.
+        app.MapGet("/db/{name}/collections/{collection}/by/{field}/{value}",
+            (HttpContext ctx, string name, string collection, string field, string value) =>
+        {
+            if (ScopeCheck.RequireDbRead(ctx, name) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            if (!ServeCommand.IsValidCollectionName(collection)) return ServeCommand.InvalidCollectionNameResult();
+            if (!ServeCommand.IsValidFieldPath(field))
+                return Results.BadRequest(new { error = "Field name must match [a-zA-Z_][a-zA-Z0-9_.\\[\\]]*" });
+
+            if (db.GetCollection(collection) is null) return Results.NotFound();
+
+            var safeValue = value.Replace("'", "''");
+            var r = db.Execute($"SELECT * FROM {collection} WHERE {field} = '{safeValue}' LIMIT 1");
+            if (!r.Success) return Results.BadRequest(new { error = r.Message, code = r.ErrorCode });
+            if (r.Documents.Count == 0) return Results.NotFound();
+
+            return Results.Ok(new
+            {
+                database = name,
+                collection,
+                plan = r.QueryPlan,
+                executionTimeMs = r.ExecutionTime.TotalMilliseconds,
+                document = JsonDocument.Parse(r.Documents[0].ToJson()).RootElement,
+            });
+        });
+
+        // Replace by business key — resolves {field}={value} to an _id (honouring
+        // indexes) then replaces the document with the request body.
+        app.MapPut("/db/{name}/collections/{collection}/by/{field}/{value}",
+            async (HttpContext ctx, string name, string collection, string field, string value, HttpRequest request) =>
+        {
+            if (ScopeCheck.RequireDbWrite(ctx, name) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            if (!ServeCommand.IsValidCollectionName(collection)) return ServeCommand.InvalidCollectionNameResult();
+            if (!ServeCommand.IsValidFieldPath(field))
+                return Results.BadRequest(new { error = "Field name must match [a-zA-Z_][a-zA-Z0-9_.\\[\\]]*" });
+
+            using var reader = new StreamReader(request.Body);
+            var json = await reader.ReadToEndAsync();
+            if (string.IsNullOrWhiteSpace(json)) return Results.BadRequest(new { error = "Empty body" });
+
+            if (db.GetCollection(collection) is null) return Results.NotFound();
+
+            var safeValue = value.Replace("'", "''");
+            var found = db.Execute($"SELECT * FROM {collection} WHERE {field} = '{safeValue}' LIMIT 1");
+            if (!found.Success) return Results.BadRequest(new { error = found.Message, code = found.ErrorCode });
+            if (found.Documents.Count == 0) return Results.NotFound();
+
+            try
+            {
+                var docId = found.Documents[0].GetId();
+                if (!db.Replace(collection, docId, json)) return Results.NotFound();
+                return Results.Ok(new
+                {
+                    database = name,
+                    success = true,
+                    id = docId.ToString(),
+                    collection,
+                    matchedBy = new { field, value },
+                    plan = found.QueryPlan,
+                });
+            }
+            catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
+        });
+
+        // PATCH by business key — same resolution, then the shared merge/$ops patch.
+        app.MapPatch("/db/{name}/collections/{collection}/by/{field}/{value}",
+            async (HttpContext ctx, string name, string collection, string field, string value, HttpRequest request) =>
+        {
+            if (ScopeCheck.RequireDbWrite(ctx, name) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            if (!ServeCommand.IsValidCollectionName(collection)) return ServeCommand.InvalidCollectionNameResult();
+            if (!ServeCommand.IsValidFieldPath(field))
+                return Results.BadRequest(new { error = "Field name must match [a-zA-Z_][a-zA-Z0-9_.\\[\\]]*" });
+
+            if (db.GetCollection(collection) is null) return Results.NotFound();
+
+            var safeValue = value.Replace("'", "''");
+            var found = db.Execute($"SELECT * FROM {collection} WHERE {field} = '{safeValue}' LIMIT 1");
+            if (!found.Success) return Results.BadRequest(new { error = found.Message, code = found.ErrorCode });
+            if (found.Documents.Count == 0) return Results.NotFound();
+
+            var docId = found.Documents[0].GetId();
+            return await PatchHandler.Handle(db, collection, docId.ToString(), request);
+        });
+
+        // Delete by any field — deletes ALL matches, mirroring the flat route.
+        app.MapDelete("/db/{name}/collections/{collection}/by/{field}/{value}",
+            (HttpContext ctx, string name, string collection, string field, string value) =>
+        {
+            if (ScopeCheck.RequireDbWrite(ctx, name) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            if (!ServeCommand.IsValidCollectionName(collection)) return ServeCommand.InvalidCollectionNameResult();
+            if (!ServeCommand.IsValidFieldPath(field))
+                return Results.BadRequest(new { error = "Field name must match [a-zA-Z_][a-zA-Z0-9_.\\[\\]]*" });
+
+            if (db.GetCollection(collection) is null) return Results.NotFound();
+
+            var safeValue = value.Replace("'", "''");
+            var r = db.Execute($"DELETE FROM {collection} WHERE {field} = '{safeValue}'");
+            if (!r.Success) return Results.BadRequest(new { error = r.Message, code = r.ErrorCode });
+
+            return Results.Ok(new
+            {
+                database = name,
+                success = true,
+                collection,
+                deletedCount = r.AffectedCount,
+                plan = r.QueryPlan,
+                executionTimeMs = r.ExecutionTime.TotalMilliseconds,
+            });
+        });
+
         // Scoped delete by internal _id.
         app.MapDelete("/db/{name}/collections/{collection}/{id}", (HttpContext ctx, string name, string collection, string id) =>
         {
