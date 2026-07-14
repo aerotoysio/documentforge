@@ -19,6 +19,7 @@ public partial class App : Application
         };
 
         var workspace = new StudioWorkspace();
+        SeedFirstRunConnection(workspace);
         try
         {
             Directory.CreateDirectory(workspace.Settings.DefaultDataDirectory);
@@ -28,8 +29,6 @@ public partial class App : Application
             // A locked-down profile without C:\data is not fatal — the user
             // can point connections anywhere.
         }
-
-        SeedFirstRunConnection(workspace);
 
         // A .dfdb passed on the command line (file association / "Open with").
         var startupFile = e.Args.FirstOrDefault(a =>
@@ -41,15 +40,17 @@ public partial class App : Application
 
     // First run: give the user a ready-made connection to the local service the
     // installer bundles, so the Object Explorer isn't empty on first launch. The
-    // port matches what the installer configured (port.txt), defaulting to the
-    // DocumentForge standard port 4300; the API key the installer provisioned
-    // for the service (service-key.txt) rides along into the secret store so
-    // the seeded connection just works against a deny-by-default node.
+    // installer records its chosen data folder in datadir.txt next to the exe;
+    // port.txt and service-key.txt live inside that folder. The API key rides
+    // into the secret store so the seeded connection just works against a
+    // deny-by-default node, and Studio's default data directory follows the
+    // folder the installer configured.
     private static void SeedFirstRunConnection(StudioWorkspace workspace)
     {
-        var port = ReadInstalledPort();
+        var dataDir = ReadInstalledDataDir();
+        var port = ReadInstalledPort(dataDir);
         var url = $"http://localhost:{port}";
-        var apiKey = ReadInstalledServiceKey();
+        var apiKey = ReadInstalledServiceKey(dataDir);
 
         // Upgrade path: an earlier install seeded this connection without a
         // key and the installer has since provisioned one — attach it rather
@@ -66,6 +67,8 @@ public partial class App : Application
 
         if (workspace.Connections.Count > 0) return;
 
+        workspace.Settings.DefaultDataDirectory = dataDir;
+        workspace.SaveSettings();
         workspace.UpsertConnection(new ConnectionDescriptor
         {
             Name = $"Local DocumentForge (localhost:{port})",
@@ -74,35 +77,44 @@ public partial class App : Application
         }, apiKey);
     }
 
-    /// <summary>The API key the installer provisioned for the bundled service,
-    /// read from service-key.txt next to the exe. Null when absent (older
-    /// installs, or the service component wasn't selected).</summary>
-    private static string? ReadInstalledServiceKey()
+    /// <summary>The data folder the installer configured, read from datadir.txt
+    /// next to the exe. Defaults to the DocumentForge standard.</summary>
+    private static string ReadInstalledDataDir()
     {
-        try
-        {
-            var path = Path.Combine(AppContext.BaseDirectory, "service-key.txt");
-            if (File.Exists(path))
-            {
-                var key = File.ReadAllText(path).Trim();
-                if (key.Length > 0) return key;
-            }
-        }
-        catch { /* fall back to no key */ }
-        return null;
+        var dir = ReadInstalledFile(Path.Combine(AppContext.BaseDirectory, "datadir.txt"));
+        return dir ?? @"C:\data\documentforge";
     }
 
-    /// <summary>The port the installer configured for the local service, read
-    /// from port.txt next to the exe. Defaults to 4300 (DocumentForge standard).</summary>
-    private static int ReadInstalledPort()
+    /// <summary>The API key the installer provisioned for the bundled service:
+    /// service-key.txt in the data folder (pre-0.10.1: next to the exe). Null
+    /// when absent — older installs, or the service component wasn't selected.</summary>
+    private static string? ReadInstalledServiceKey(string dataDir) =>
+        ReadInstalledFile(Path.Combine(dataDir, "service-key.txt"))
+        ?? ReadInstalledFile(Path.Combine(AppContext.BaseDirectory, "service-key.txt"));
+
+    /// <summary>The port the installer configured for the local service:
+    /// port.txt in the data folder (pre-0.10.1: next to the exe). Defaults to
+    /// 4300 (DocumentForge standard).</summary>
+    private static int ReadInstalledPort(string dataDir)
+    {
+        var text = ReadInstalledFile(Path.Combine(dataDir, "port.txt"))
+                   ?? ReadInstalledFile(Path.Combine(AppContext.BaseDirectory, "port.txt"));
+        return int.TryParse(text, out var p) && p is > 0 and <= 65535 ? p : 4300;
+    }
+
+    /// <summary>Trimmed content of an installer-written file, or null when the
+    /// file is missing, empty, or unreadable.</summary>
+    private static string? ReadInstalledFile(string path)
     {
         try
         {
-            var path = Path.Combine(AppContext.BaseDirectory, "port.txt");
-            if (File.Exists(path) && int.TryParse(File.ReadAllText(path).Trim(), out var p) && p is > 0 and <= 65535)
-                return p;
+            if (File.Exists(path))
+            {
+                var text = File.ReadAllText(path).Trim();
+                if (text.Length > 0) return text;
+            }
         }
-        catch { /* fall back to default */ }
-        return 4300;
+        catch { /* treat as absent */ }
+        return null;
     }
 }

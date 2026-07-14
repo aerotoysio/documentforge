@@ -55,7 +55,7 @@ public static class ServiceCommand
                   ?? throw new InvalidOperationException("Could not resolve the dfdb executable path.");
 
         var port = GetOpt(args, "--port") ?? "4300";
-        var dataDir = GetOpt(args, "--data-dir") ?? @"C:\data\documentForge";
+        var dataDir = GetOpt(args, "--data-dir") ?? @"C:\data\documentforge";
         var apiKey = GetOpt(args, "--api-key");
         var bindAll = args.Contains("--bind-all-interfaces");
 
@@ -152,7 +152,7 @@ public static class ServiceCommand
         Console.WriteLine("  Default service name: DocumentForge   ·   default port: 4300");
         Console.WriteLine();
         Console.WriteLine("  EXAMPLE (elevated prompt):");
-        Console.WriteLine("    dfdb service install --port 4300 --data-dir C:\\data\\documentForge --api-key s3cret");
+        Console.WriteLine("    dfdb service install --port 4300 --data-dir C:\\data\\documentforge --api-key s3cret");
         Console.WriteLine("    dfdb service start");
         Console.WriteLine();
         return 0;

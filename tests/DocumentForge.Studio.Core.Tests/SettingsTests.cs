@@ -140,7 +140,7 @@ public sealed class SettingsTests : IDisposable
 
         var workspace = new StudioWorkspace(_dir);
 
-        Assert.Equal(@"C:\data\documentForge", workspace.Settings.DefaultDataDirectory);
+        Assert.Equal(@"C:\data\documentforge", workspace.Settings.DefaultDataDirectory);
         Assert.True(File.Exists(Path.Combine(_dir, "settings.json.corrupt")));
     }
 }
