@@ -6,7 +6,7 @@
 
 #define AppName "DocumentForge Studio"
 #ifndef AppVersion
-  #define AppVersion "0.10.0"
+  #define AppVersion "0.10.1"
 #endif
 #define Publisher "DocumentForge"
 #define ExeName "DocumentForgeStudio.exe"
@@ -58,7 +58,7 @@ Name: "{#DataDir}"; Components: service; Flags: uninsneveruninstall
 Name: "{group}\DocumentForge Studio"; Filename: "{app}\{#ExeName}"; Components: studio
 Name: "{userdesktop}\DocumentForge Studio"; Filename: "{app}\{#ExeName}"; Components: studio; Tasks: desktopicon
 Name: "{group}\Start DocumentForge Service"; Filename: "{app}\service\dfdb.exe"; \
-    Parameters: "serve --port {code:GetPort} --data-dir ""{#DataDir}"""; Components: service
+    Parameters: "serve --port {code:GetPort} --data-dir ""{#DataDir}"" --api-key ""{code:GetApiKey}"""; Components: service
 Name: "{group}\Uninstall DocumentForge Studio"; Filename: "{uninstallexe}"
 
 [Tasks]
@@ -74,15 +74,23 @@ Root: HKCU; Subkey: "Software\Classes\DocumentForge.Database\shell\open\command"
 
 [Run]
 Filename: "{app}\{#ExeName}"; Description: "Launch DocumentForge Studio"; Components: studio; Flags: nowait postinstall skipifsilent
-Filename: "{app}\service\dfdb.exe"; Parameters: "serve --port {code:GetPort} --data-dir ""{#DataDir}"""; \
+Filename: "{app}\service\dfdb.exe"; Parameters: "serve --port {code:GetPort} --data-dir ""{#DataDir}"" --api-key ""{code:GetApiKey}"""; \
     Description: "Start the DocumentForge service now"; Components: service; Flags: nowait postinstall skipifsilent unchecked
+
+[UninstallDelete]
+; Files written by [Code] — the uninstaller doesn't track those on its own.
+Type: files; Name: "{app}\port.txt"
+Type: files; Name: "{app}\service-key.txt"
+Type: files; Name: "{app}\service-installed.txt"
 
 [Code]
 var
   PortPage: TInputQueryWizardPage;
+  ApiKeyValue: String;
 
 procedure InitializeWizard;
 begin
+  Randomize;
   PortPage := CreateInputQueryPage(wpSelectComponents,
     'DocumentForge port',
     'Which TCP port should the DocumentForge service use?',
@@ -97,6 +105,31 @@ begin
   Result := Trim(PortPage.Values[0]);
   if Result = '' then
     Result := '{#DefaultPort}';
+end;
+
+// The API key the bundled service runs with (dfdb refuses to start without
+// auth — deny by default). Reused from service-key.txt on upgrades so a new
+// installer run doesn't orphan an already-registered service; generated
+// fresh (48 hex chars) on first install. Studio reads the same file on
+// startup to seed its local connection, so the key is never typed by hand.
+function GetApiKey(Param: String): String;
+var
+  KeyFile: String;
+  Existing: AnsiString;
+  I: Integer;
+const
+  HexChars = '0123456789abcdef';
+begin
+  if ApiKeyValue = '' then
+  begin
+    KeyFile := ExpandConstant('{app}\service-key.txt');
+    if FileExists(KeyFile) and LoadStringFromFile(KeyFile, Existing) and (Trim(String(Existing)) <> '') then
+      ApiKeyValue := Trim(String(Existing))
+    else
+      for I := 1 to 48 do
+        ApiKeyValue := ApiKeyValue + HexChars[Random(16) + 1];
+  end;
+  Result := ApiKeyValue;
 end;
 
 function NextButtonClick(CurPageID: Integer): Boolean;
@@ -127,16 +160,24 @@ begin
   // and the service shortcut agree.
   SaveStringToFile(ExpandConstant('{app}\port.txt'), GetPort(''), False);
 
+  // Persist the service API key next to port.txt whenever the service ships:
+  // Studio reads it on startup to seed an authenticated local connection,
+  // and it's the operator's reference copy for manual `dfdb service install`.
+  if WizardIsComponentSelected('service') then
+    SaveStringToFile(ExpandConstant('{app}\service-key.txt'), GetApiKey(''), False);
+
   // Optional: register a real Windows service (dfdb service install, which also
   // starts it). Elevated via UAC because the installer itself is per-user.
   if WizardIsComponentSelected('service') and WizardIsTaskSelected('startupservice') then
   begin
     Exe := ExpandConstant('{app}\service\dfdb.exe');
-    Params := 'service install --port ' + GetPort('') + ' --data-dir "{#DataDir}"';
+    Params := 'service install --port ' + GetPort('') + ' --data-dir "{#DataDir}"'
+              + ' --api-key "' + GetApiKey('') + '"';
     if not ShellExec('runas', Exe, Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
        or (ResultCode <> 0) then
       MsgBox('The Windows service could not be installed (you may have declined the admin prompt). ' +
-             'You can install it later from an elevated prompt with:  dfdb service install, ' +
+             'You can install it later from an elevated prompt with:  dfdb service install --api-key <key> ' +
+             '(the key is saved in service-key.txt in the install folder), ' +
              'or run it manually from the Start Menu shortcut.', mbInformation, MB_OK)
     else
       // Marker so uninstall knows to remove the service.

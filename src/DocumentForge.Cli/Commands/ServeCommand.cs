@@ -97,6 +97,15 @@ public static class ServeCommand
         var startupSecurityError = ValidateStartupSecurity(config, keyStore.Count);
         if (startupSecurityError is not null)
         {
+            // Also log through the host so the reason is visible when running
+            // under the SCM (UseWindowsService wires an EventLog provider) —
+            // otherwise a fresh service install dies with a bare error 1053
+            // and the console text below is invisible.
+            Microsoft.Extensions.Logging.LoggerExtensions.LogError(app.Logger,
+                "DocumentForge failed to start: {Error} Configure an API key " +
+                "(--api-key / DFDB_API_KEY / security.apiKey in node.json) or pass " +
+                "--insecure-dev-mode for loopback-only development.",
+                startupSecurityError);
             Console.Error.WriteLine();
             Console.Error.WriteLine($"  \x1b[31mERROR:\x1b[0m {startupSecurityError}");
             Console.Error.WriteLine();

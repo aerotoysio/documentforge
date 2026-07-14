@@ -42,17 +42,54 @@ public partial class App : Application
     // First run: give the user a ready-made connection to the local service the
     // installer bundles, so the Object Explorer isn't empty on first launch. The
     // port matches what the installer configured (port.txt), defaulting to the
-    // DocumentForge standard port 4300.
+    // DocumentForge standard port 4300; the API key the installer provisioned
+    // for the service (service-key.txt) rides along into the secret store so
+    // the seeded connection just works against a deny-by-default node.
     private static void SeedFirstRunConnection(StudioWorkspace workspace)
     {
-        if (workspace.Connections.Count > 0) return;
         var port = ReadInstalledPort();
+        var url = $"http://localhost:{port}";
+        var apiKey = ReadInstalledServiceKey();
+
+        // Upgrade path: an earlier install seeded this connection without a
+        // key and the installer has since provisioned one — attach it rather
+        // than leaving the user to dig the key out of service-key.txt.
+        var existing = workspace.Connections.Find(c =>
+            c.Kind == ConnectionKind.Http &&
+            string.Equals(c.Url, url, StringComparison.OrdinalIgnoreCase));
+        if (existing is not null)
+        {
+            if (existing.ApiKeySecretId is null && apiKey is not null)
+                workspace.UpsertConnection(existing, apiKey);
+            return;
+        }
+
+        if (workspace.Connections.Count > 0) return;
+
         workspace.UpsertConnection(new ConnectionDescriptor
         {
             Name = $"Local DocumentForge (localhost:{port})",
             Kind = ConnectionKind.Http,
-            Url = $"http://localhost:{port}",
-        });
+            Url = url,
+        }, apiKey);
+    }
+
+    /// <summary>The API key the installer provisioned for the bundled service,
+    /// read from service-key.txt next to the exe. Null when absent (older
+    /// installs, or the service component wasn't selected).</summary>
+    private static string? ReadInstalledServiceKey()
+    {
+        try
+        {
+            var path = Path.Combine(AppContext.BaseDirectory, "service-key.txt");
+            if (File.Exists(path))
+            {
+                var key = File.ReadAllText(path).Trim();
+                if (key.Length > 0) return key;
+            }
+        }
+        catch { /* fall back to no key */ }
+        return null;
     }
 
     /// <summary>The port the installer configured for the local service, read

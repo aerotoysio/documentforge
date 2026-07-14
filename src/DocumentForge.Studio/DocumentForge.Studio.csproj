@@ -9,10 +9,10 @@
     <ApplicationIcon>Assets\studio.ico</ApplicationIcon>
 
     <!-- Studio has its own version, independent of the engine's (Directory.Build.props). -->
-    <Version>0.10.0</Version>
-    <AssemblyVersion>0.10.0.0</AssemblyVersion>
-    <FileVersion>0.10.0.0</FileVersion>
-    <InformationalVersion>0.10.0-beta</InformationalVersion>
+    <Version>0.10.1</Version>
+    <AssemblyVersion>0.10.1.0</AssemblyVersion>
+    <FileVersion>0.10.1.0</FileVersion>
+    <InformationalVersion>0.10.1-beta</InformationalVersion>
     <Product>DocumentForge Studio</Product>
     <Description>SSMS-style management studio for DocumentForge — connect, query, edit, and manage databases, replication, and sharding.</Description>
     <Company>DocumentForge</Company>
