@@ -90,7 +90,6 @@ var
 
 procedure InitializeWizard;
 begin
-  Randomize;
   PortPage := CreateInputQueryPage(wpSelectComponents,
     'DocumentForge port',
     'Which TCP port should the DocumentForge service use?',
@@ -110,15 +109,12 @@ end;
 // The API key the bundled service runs with (dfdb refuses to start without
 // auth — deny by default). Reused from service-key.txt on upgrades so a new
 // installer run doesn't orphan an already-registered service; generated
-// fresh (48 hex chars) on first install. Studio reads the same file on
-// startup to seed its local connection, so the key is never typed by hand.
+// fresh on first install. Studio reads the same file on startup to seed its
+// local connection, so the key is never typed by hand.
 function GetApiKey(Param: String): String;
 var
   KeyFile: String;
   Existing: AnsiString;
-  I: Integer;
-const
-  HexChars = '0123456789abcdef';
 begin
   if ApiKeyValue = '' then
   begin
@@ -126,8 +122,13 @@ begin
     if FileExists(KeyFile) and LoadStringFromFile(KeyFile, Existing) and (Trim(String(Existing)) <> '') then
       ApiKeyValue := Trim(String(Existing))
     else
-      for I := 1 to 48 do
-        ApiKeyValue := ApiKeyValue + HexChars[Random(16) + 1];
+      // Inno's script PRNG has no Randomize, so don't trust it alone:
+      // hash install-time + machine/user identity + PRNG output into a
+      // 64-hex key that's unique per machine and install.
+      ApiKeyValue := GetSHA256OfUnicodeString(
+        GetDateTimeString('yyyy/mm/dd hh:nn:ss', '-', ':') + '|' +
+        ExpandConstant('{computername}|{username}') + '|' +
+        IntToStr(Random(2147483647)) + '|' + IntToStr(Random(2147483647)));
   end;
   Result := ApiKeyValue;
 end;
