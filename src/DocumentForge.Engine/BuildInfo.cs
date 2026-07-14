@@ -34,13 +34,31 @@ namespace DocumentForge.Engine;
 /// </summary>
 public static class BuildInfo
 {
+    private static readonly Lazy<string> _version = new(ResolveVersion);
     private static readonly Lazy<string> _sha = new(ResolveSha);
     private static readonly Lazy<DateTime?> _builtAt = new(ResolveBuiltAtUtc);
     private static readonly Lazy<string?> _image = new(ResolveImage);
 
+    public static string Version => _version.Value;
     public static string Sha => _sha.Value;
     public static DateTime? BuiltAtUtc => _builtAt.Value;
     public static string? Image => _image.Value;
+
+    private static string ResolveVersion()
+    {
+        // The MSBuild <Version> property (Directory.Build.props) lands as the
+        // prefix of AssemblyInformationalVersion, before the '+sha' suffix.
+        // Every caller that used to hardcode the release number reads this
+        // instead, so a props bump is the whole story.
+        var asm = Assembly.GetExecutingAssembly();
+        var info = asm.GetCustomAttribute<AssemblyInformationalVersionAttribute>()?.InformationalVersion;
+        if (!string.IsNullOrEmpty(info))
+        {
+            int plusIdx = info.IndexOf('+');
+            return plusIdx > 0 ? info[..plusIdx] : info;
+        }
+        return asm.GetName().Version?.ToString(3) ?? "dev";
+    }
 
     private static string ResolveSha()
     {

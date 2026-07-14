@@ -54,7 +54,7 @@ public class Program
 
     private static int PrintVersion()
     {
-        Console.WriteLine("dfdb 1.4.0");
+        Console.WriteLine($"dfdb {DocumentForge.Engine.BuildInfo.Version}");
         Console.WriteLine("DocumentForge - embedded JSON document database with replication and sharding");
         return 0;
     }

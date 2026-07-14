@@ -150,7 +150,7 @@ public static class RouterEndpoints
             status = "ok",
             node = "router",
             role = "router",
-            version = "1.4.0",
+            version = DocumentForge.Engine.BuildInfo.Version,
             configPath = Path.GetFullPath(configPath),
             shards = router.Config.Shards.Count,
             collections = router.Config.Collections.Count,

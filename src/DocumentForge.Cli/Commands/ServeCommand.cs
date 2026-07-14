@@ -1281,7 +1281,7 @@ public static class ServeCommand
             {
                 status = healthy ? "ok" : "degraded",
                 node = config.NodeName,
-                version = "1.4.0",
+                version = DocumentForge.Engine.BuildInfo.Version,
                 readOnly = db.IsReadOnly,
                 uptimeSeconds = Math.Round((DateTime.UtcNow - _startedAt).TotalSeconds, 1),
                 health = healthy ? null : new
