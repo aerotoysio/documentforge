@@ -9,7 +9,7 @@
 
   <!-- Shared NuGet metadata. Per-project csproj files control whether to pack. -->
   <PropertyGroup>
-    <Version>1.4.0</Version>
+    <Version>1.5.0</Version>
     <Authors>DocumentForge contributors</Authors>
     <Company>DocumentForge</Company>
     <Product>DocumentForge</Product>
