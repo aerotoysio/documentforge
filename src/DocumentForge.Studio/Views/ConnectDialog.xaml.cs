@@ -154,8 +154,25 @@ public partial class ConnectDialog : Window
         descriptor.FilePath = isFile ? FilePathBox.Text.Trim() : null;
         descriptor.Url = isFile ? null : UrlBox.Text.Trim().TrimEnd('/');
 
-        var apiKey = !isFile && ApiKeyBox.Password.Length > 0 ? ApiKeyBox.Password : null;
+        var apiKey = isFile ? null : NormalizeApiKey(ApiKeyBox.Password);
         return new ConnectRequest(descriptor, apiKey, SaveCheck.IsChecked == true);
+    }
+
+    /// <summary>
+    /// The connection sends the key as <c>Authorization: Bearer &lt;key&gt;</c> itself,
+    /// so the box wants the bare key. Be forgiving about how it arrives: trim
+    /// copy-paste whitespace/newlines (keys are hash/exact-matched server-side, so
+    /// a trailing newline means 401) and strip a pasted "Bearer " prefix — the
+    /// server's own 401 text says "Provide Authorization: Bearer &lt;apiKey&gt;",
+    /// which lures people into typing exactly that.
+    /// </summary>
+    internal static string? NormalizeApiKey(string? raw)
+    {
+        var key = raw?.Trim();
+        if (string.IsNullOrEmpty(key)) return null;
+        if (key.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+            key = key["Bearer ".Length..].Trim();
+        return key.Length == 0 ? null : key;
     }
 
     private bool MatchesEditing(bool isFile) =>

@@ -313,7 +313,10 @@ public static class ServeCommand
             ctx.Response.StatusCode = 401;
             await ctx.Response.WriteAsJsonAsync(new
             {
-                error = "Unauthorized. Provide Authorization: Bearer <apiKey>.",
+                // Careful wording: clients (incl. Studio) surface this verbatim, and
+                // "Provide Authorization: Bearer <apiKey>" taught users to type
+                // "Bearer <key>" into API-key fields — which then double-prefixes.
+                error = "Unauthorized: missing or invalid API key. Send the key as an HTTP Bearer token; in Studio, paste just the key (no 'Bearer' prefix).",
             });
         }
 
@@ -416,7 +419,7 @@ public static class ServeCommand
         Console.WriteLine("             POST /databases/{name}/set-default");
         Console.WriteLine("  services:  GET  /services | POST /services | DELETE /services/{port}");
         Console.WriteLine("  keys:      GET  /admin/keys | POST /admin/keys | DELETE /admin/keys/{id}");
-        Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint | POST /admin/snapshot");
+        Console.WriteLine("  admin:     POST /admin/flush | POST /admin/checkpoint | POST /admin/snapshot | POST /admin/restart");
         Console.WriteLine("             POST /admin/compact/{collection}");
         Console.WriteLine("             POST /admin/rebuild-indexes/{collection}");
         Console.WriteLine("             POST /admin/rebuild-index/{collection}/{indexName}");
@@ -1603,6 +1606,29 @@ public static class ServeCommand
             db.Checkpoint();
             sw.Stop();
             return Results.Ok(new { success = true, timeMs = sw.Elapsed.TotalMilliseconds });
+        });
+
+        // Restart the node: flush everything durable, acknowledge, then exit the
+        // process so the host brings it back — the Windows service's recovery
+        // action (restart/5000, set by `dfdb service install`) or IIS's ANCM.
+        // The non-zero exit code is deliberate: SCM recovery only fires on a
+        // failure-style termination, not a clean stop. Under a bare console run
+        // (dev) there is no supervisor, so this is simply a remote stop.
+        app.MapPost("/admin/restart", (HttpContext httpCtx) =>
+        {
+            if (ScopeCheck.RequireAdmin(httpCtx) is { } deny) return deny;
+            db.Flush();
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(750); // let the 202 response flush to the caller
+                Environment.Exit(64);
+            });
+            return Results.Accepted(value: new
+            {
+                success = true,
+                message = "Flushed; the node is exiting for restart. Under the DocumentForge " +
+                          "Windows service or IIS it restarts automatically; a console-run node must be started again.",
+            });
         });
 
         // Take a consistent snapshot of the data file. Blocks writes briefly

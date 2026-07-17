@@ -602,7 +602,7 @@ public sealed partial class MainViewModel : ObservableObject
         var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
         if (existing is not null) { ActiveDocument = existing; return; }
 
-        var document = new ServiceSettingsDocumentViewModel(server.Connection);
+        var document = new ServiceSettingsDocumentViewModel(server.Connection, _dialogs);
         Documents.Add(document);
         ActiveDocument = document;
         StatusText = $"Service settings — {server.Connection.Descriptor.Name}";

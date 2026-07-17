@@ -19,6 +19,9 @@
         <ToolBarTray DockPanel.Dock="Top" IsLocked="True">
             <ToolBar>
                 <Button Content="🔄 Refresh" Command="{Binding RefreshCommand}" Padding="8,2"/>
+                <Separator/>
+                <Button Content="♻ Restart service…" Command="{Binding RestartServiceCommand}" Padding="8,2"
+                        ToolTip="Flush + restart the node (Windows service / IIS restarts it automatically). Needed after changing any 'restart to change' setting in node.json."/>
             </ToolBar>
         </ToolBarTray>
 

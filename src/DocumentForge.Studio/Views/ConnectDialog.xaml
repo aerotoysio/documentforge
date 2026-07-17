@@ -50,8 +50,8 @@
                 <TextBlock Text="API key:" VerticalAlignment="Center" Width="90"/>
                 <PasswordBox x:Name="ApiKeyBox"/>
             </DockPanel>
-            <TextBlock Text="Leave the key empty for a dev-mode node (no auth configured)."
-                       Foreground="Gray" FontSize="11" Margin="90,4,0,0"/>
+            <TextBlock Text="Paste just the key (hex or df_…) — 'Bearer' is added automatically. Leave empty for a dev-mode node (no auth configured)."
+                       Foreground="Gray" FontSize="11" Margin="90,4,0,0" TextWrapping="Wrap"/>
         </StackPanel>
 
         <!-- Name + save -->

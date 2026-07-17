@@ -46,8 +46,14 @@ public sealed class HttpConnection : IDfConnection
         // A generous ceiling; per-query timeouts are enforced by the caller's
         // CancellationToken (the workbench "Timeout (s)" field), which fires first.
         _http.Timeout = TimeSpan.FromMinutes(10);
-        if (!string.IsNullOrEmpty(apiKey))
-            _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+        // Normalise the key defensively: keys saved by older Studio versions may
+        // carry copy-paste whitespace or a typed "Bearer " prefix (the server
+        // hash/exact-matches the token, so either means an unexplained 401).
+        var key = apiKey?.Trim();
+        if (key is not null && key.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase))
+            key = key["Bearer ".Length..].Trim();
+        if (!string.IsNullOrEmpty(key))
+            _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", key);
     }
 
     public ConnectionDescriptor Descriptor { get; }
@@ -607,6 +613,22 @@ public sealed class HttpConnection : IDfConnection
         return doc.RootElement.TryGetProperty("config", out var cfg)
             ? ParseServiceConfig(cfg.GetRawText())
             : ParseServiceConfig(body);
+    }
+
+    public async Task<string> RestartServerAsync(CancellationToken ct = default)
+    {
+        using var response = await _http.PostAsync("admin/restart", content: null, ct).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("message", out var msg) && msg.ValueKind == JsonValueKind.String)
+                return msg.GetString()!;
+        }
+        catch (JsonException) { }
+        return "Restart requested.";
     }
 
     private static ServiceConfigInfo ParseServiceConfig(string body)

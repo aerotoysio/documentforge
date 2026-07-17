@@ -113,6 +113,12 @@ public interface IDfConnection : IAsyncDisposable
     /// the updated effective configuration.</summary>
     Task<ServiceConfigInfo> UpdateServiceConfigAsync(int? minSyncReplicas, double? syncTimeoutSeconds, CancellationToken ct = default);
 
+    /// <summary>Asks the node to restart itself (POST /admin/restart): it flushes,
+    /// acknowledges, and exits so its host (Windows service recovery / IIS) brings
+    /// it back. Returns the server's acknowledgement message. The connection will
+    /// be briefly unreachable afterwards — poll <see cref="GetHealthAsync"/>.</summary>
+    Task<string> RestartServerAsync(CancellationToken ct = default);
+
     // --- Replication (server connections only; requires ServerAdmin) ---
 
     Task<ReplicationStatus> GetReplicationStatusAsync(string database, CancellationToken ct = default);
