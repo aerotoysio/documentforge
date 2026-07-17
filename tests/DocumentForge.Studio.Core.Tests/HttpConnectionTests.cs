@@ -215,4 +215,42 @@ public sealed class HttpConnectionTests
             () => connection.UpdateServiceConfigAsync(null, null));
         Assert.Empty(handler.Requests);
     }
+
+    // ── API-key normalisation ────────────────────────────────────────────────
+    // Keys are hash/exact-matched server-side, so copy-paste whitespace or a
+    // user-typed "Bearer " prefix (the old 401 text invited exactly that) used
+    // to yield an unexplainable 401 with a perfectly valid key.
+
+    [Theory]
+    [InlineData("df_abc123", "df_abc123")]
+    [InlineData("  df_abc123\r\n", "df_abc123")]                 // copy-paste whitespace
+    [InlineData("Bearer df_abc123", "df_abc123")]                // typed the 401 hint verbatim
+    [InlineData("bearer  df_abc123 ", "df_abc123")]              // case + inner spacing
+    [InlineData("8340c13f386a2ef99bb32147", "8340c13f386a2ef99bb32147")] // legacy hex key untouched
+    public async Task ApiKey_Is_Normalised_Before_The_Authorization_Header(string typed, string expected)
+    {
+        var handler = new StubHandler().Map("/health", """{"status":"ok"}""");
+        await using var connection = Connect(handler, typed);
+
+        await connection.GetHealthAsync();
+
+        var auth = handler.Requests.Single().Headers.Authorization;
+        Assert.NotNull(auth);
+        Assert.Equal("Bearer", auth!.Scheme);
+        Assert.Equal(expected, auth.Parameter);
+    }
+
+    [Fact]
+    public async Task RestartServer_Posts_Admin_Restart_And_Returns_Message()
+    {
+        var handler = new StubHandler().Map("/admin/restart",
+            """{"success":true,"message":"Flushed; the node is exiting for restart."}""",
+            HttpStatusCode.Accepted);
+        await using var connection = Connect(handler, "df_abc123");
+
+        var message = await connection.RestartServerAsync();
+
+        Assert.Contains("exiting for restart", message);
+        Assert.Equal(HttpMethod.Post, handler.Requests.Single().Method);
+    }
 }
