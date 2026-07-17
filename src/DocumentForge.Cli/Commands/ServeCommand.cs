@@ -1171,7 +1171,7 @@ public static class ServeCommand
                             return Results.BadRequest(new { error = $"op[{opIndex}]: 'op' and 'collection' are required." });
                         }
                         if (!IsValidCollectionName(collection!))
-                            return Results.BadRequest(new { error = $"op[{opIndex}]: collection name must match [a-zA-Z_][a-zA-Z0-9_]* and be at most {MaxCollectionNameLength} chars." });
+                            return Results.BadRequest(new { error = $"op[{opIndex}]: collection name must be dot-separated identifier segments and at most {MaxCollectionNameLength} chars." });
 
                         switch (op)
                         {
@@ -2108,12 +2108,15 @@ public static class ServeCommand
 
     /// <summary>
     /// Whitelists collection names coming from a URL path segment before they
-    /// are interpolated into SQL. Mirrors the query lexer's identifier rule
-    /// ([a-zA-Z_][a-zA-Z0-9_]*) so every accepted name is also queryable; the
-    /// length cap keeps a hostile name from bloating the single-page catalog.
+    /// are interpolated into SQL. Accepts dot-separated identifier segments
+    /// (each [a-zA-Z_][a-zA-Z0-9_]*) — namespaced names like
+    /// <c>catalogue.flights</c> are first-class (clients group collections by
+    /// module), and the query lexer already resolves qualified identifiers, so
+    /// every accepted name remains queryable. No leading/trailing/double dots;
+    /// the length cap keeps a hostile name from bloating the single-page catalog.
     /// </summary>
     private static readonly System.Text.RegularExpressions.Regex _collectionNameRegex =
-        new("^[a-zA-Z_][a-zA-Z0-9_]*$", System.Text.RegularExpressions.RegexOptions.Compiled);
+        new(@"^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)*$", System.Text.RegularExpressions.RegexOptions.Compiled);
 
     private const int MaxCollectionNameLength = 128;
 
@@ -2123,7 +2126,7 @@ public static class ServeCommand
         && _collectionNameRegex.IsMatch(name);
 
     private static IResult InvalidCollectionNameResult() =>
-        Results.BadRequest(new { error = $"Collection name must match [a-zA-Z_][a-zA-Z0-9_]* and be at most {MaxCollectionNameLength} chars." });
+        Results.BadRequest(new { error = $"Collection name must be dot-separated identifier segments ([a-zA-Z_][a-zA-Z0-9_]*, e.g. catalogue.flights) and at most {MaxCollectionNameLength} chars." });
 
     /// <summary>
     /// Issue #101 — the deny-by-default startup gate. Returns null when the

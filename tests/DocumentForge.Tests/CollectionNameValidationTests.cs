@@ -19,6 +19,13 @@ public class CollectionNameValidationTests
     [InlineData("a")]
     [InlineData("_")]
     [InlineData("flight_legs_v2")]
+    // Namespaced names are first-class: clients group collections by module
+    // (aerobus uses catalogue.flights, orders.orders, policystudio.spaces, …).
+    // The query lexer resolves dotted identifiers, so these stay queryable.
+    [InlineData("catalogue.flights")]
+    [InlineData("orders.orders")]
+    [InlineData("policystudio.spaces")]
+    [InlineData("a.b.c")]
     public void ValidNames_AreAccepted(string name)
     {
         Assert.True(ServeCommand.IsValidCollectionName(name));
@@ -41,7 +48,10 @@ public class CollectionNameValidationTests
     [InlineData(" ")]
     [InlineData("1orders")]                                  // must not start with a digit
     [InlineData("orders-archive")]                           // hyphen is not a SQL identifier char
-    [InlineData("orders.archive")]                           // dot would read as a path
+    [InlineData(".orders")]                                  // no leading dot
+    [InlineData("orders.")]                                  // no trailing dot
+    [InlineData("orders..archive")]                          // no empty segment
+    [InlineData("orders.1archive")]                          // segments must not start with a digit
     [InlineData("orders name")]
     [InlineData("orders'")]
     [InlineData("orders\"")]
