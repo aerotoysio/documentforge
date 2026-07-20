@@ -123,12 +123,28 @@ public partial class QueryDocumentView : UserControl
         await vm.ExecuteAsync(sql);
     }
 
-    // Keep the engine's own _id / _etag columns read-only even when the grid
-    // is editable — they're identity/concurrency tokens, not user data.
+    // The engine's own _id / _etag columns are identity/concurrency tokens,
+    // not user data: hidden by default (the "System fields" toggle brings them
+    // back for CAS debugging), and read-only whenever shown.
     private void OnAutoGeneratingColumn(object? sender, DataGridAutoGeneratingColumnEventArgs e)
     {
-        if (e.PropertyName is "_id" or "_etag")
+        if (e.PropertyName.StartsWith('_'))
+        {
+            if (ShowSystemFields.IsChecked != true)
+            {
+                e.Cancel = true;
+                return;
+            }
             e.Column.IsReadOnly = true;
+        }
+    }
+
+    private void OnShowSystemFieldsToggled(object sender, RoutedEventArgs e)
+    {
+        // Column auto-generation only runs on a rebind — bounce the source.
+        var source = ResultsGrid.ItemsSource;
+        ResultsGrid.ItemsSource = null;
+        ResultsGrid.ItemsSource = source;
     }
 
     private void OnCellEditEnding(object? sender, DataGridCellEditEndingEventArgs e)

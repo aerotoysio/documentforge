@@ -29,6 +29,10 @@
                 <TextBox Text="{Binding RowLimit}" Width="56" Margin="4,0,0,0" VerticalAlignment="Center"
                          ToolTip="Auto-append LIMIT to unbounded SELECTs"/>
                 <Separator/>
+                <CheckBox x:Name="ShowSystemFields" Content="System fields" IsChecked="False"
+                          VerticalAlignment="Center" Click="OnShowSystemFieldsToggled"
+                          ToolTip="Show the engine's _id / _etag columns (storage identity and concurrency token — not document data)"/>
+                <Separator/>
                 <TextBlock Text="Timeout (s):" VerticalAlignment="Center" Margin="4,0,4,0"/>
                 <TextBox Text="{Binding TimeoutSeconds}" Width="44" VerticalAlignment="Center"
                          ToolTip="Auto-cancel the query after N seconds (0 = no timeout)"/>
