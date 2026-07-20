@@ -374,6 +374,65 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
     }
 
     [Fact]
+    public async Task DeleteDatabase_XConfirmHeader_DropsFiles()
+    {
+        // The 2026-07-20 demo-box incident: callers following the API's
+        // destructive-op convention (X-Confirm: true, as required by the
+        // drop-collection routes) got a silent Detach — file left on disk.
+        var (registry, baseUrl, _) = BootServer();
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "doomed2" });
+        var info = registry.List().First();
+
+        var req = new HttpRequestMessage(HttpMethod.Delete, $"{baseUrl}/databases/doomed2");
+        req.Headers.TryAddWithoutValidation("X-Confirm", "true");
+        var resp = await _http.SendAsync(req);
+        resp.EnsureSuccessStatusCode();
+        var body = await resp.Content.ReadFromJsonAsync<DeleteDatabaseResponse>();
+        Assert.Equal("dropped", body!.Action);
+        Assert.False(File.Exists(info.FilePath), "X-Confirm drop must delete the data file.");
+    }
+
+    [Fact]
+    public async Task DeleteDatabase_ExplicitDeleteFilesFalse_WinsOverXConfirm()
+    {
+        // Studio sends ?deleteFiles=false for its Detach action; an
+        // explicit query param must not be overridden by the header.
+        var (registry, baseUrl, _) = BootServer();
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "kept" });
+        var info = registry.List().First();
+
+        var req = new HttpRequestMessage(HttpMethod.Delete, $"{baseUrl}/databases/kept?deleteFiles=false");
+        req.Headers.TryAddWithoutValidation("X-Confirm", "true");
+        var resp = await _http.SendAsync(req);
+        resp.EnsureSuccessStatusCode();
+        var body = await resp.Content.ReadFromJsonAsync<DeleteDatabaseResponse>();
+        Assert.Equal("detached", body!.Action);
+        Assert.True(File.Exists(info.FilePath));
+    }
+
+    [Fact]
+    public async Task DeleteDatabase_DropThenRecreate_NoResurrectedDocuments()
+    {
+        // Regression for the demo-box incident: drop a DB with documents,
+        // recreate under the same name, and the new DB must be empty —
+        // NOT a re-attach of the old file with every document back.
+        var (registry, baseUrl, _) = BootServer();
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "phoenix" });
+        registry.Get("phoenix").Insert("orders", """{"pnr":"FRIDAY-1"}""");
+
+        var req = new HttpRequestMessage(HttpMethod.Delete, $"{baseUrl}/databases/phoenix");
+        req.Headers.TryAddWithoutValidation("X-Confirm", "true");
+        (await _http.SendAsync(req)).EnsureSuccessStatusCode();
+
+        var recreate = await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "phoenix" });
+        Assert.Equal(HttpStatusCode.Created, recreate.StatusCode);
+
+        var collections = await _http.GetFromJsonAsync<ScopedCollectionsResponse>(
+            $"{baseUrl}/db/phoenix/collections");
+        Assert.Empty(collections!.Collections);
+    }
+
+    [Fact]
     public async Task DeleteDatabase_Unknown_Returns404()
     {
         var (_, baseUrl, _) = BootServer();
@@ -1489,6 +1548,11 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
         public string Name { get; set; } = "";
         public string Action { get; set; } = "";
         public string? DefaultAfter { get; set; }
+    }
+    private sealed class ScopedCollectionsResponse
+    {
+        public string Database { get; set; } = "";
+        public List<string> Collections { get; set; } = new();
     }
     private sealed class ReplicationStatusResponse
     {
