@@ -539,7 +539,8 @@ public static class DatabaseEndpoints
             catch (Exception ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
 
-        // Detach (default) or Drop (delete-files=true). 404 when not
+        // Detach (default) or Drop (deleteFiles=true, or the X-Confirm: true
+        // header every other destructive route uses). 404 when not
         // registered so Studio's idempotent retries get a clear signal.
         app.MapDelete("/databases/{name}", (HttpContext ctx, string name, bool? deleteFiles) =>
         {
@@ -548,7 +549,14 @@ public static class DatabaseEndpoints
                 return Results.BadRequest(new { error = $"Database '{name}' is a system DB and cannot be detached or dropped." });
             try
             {
-                var drop = deleteFiles == true;
+                // An explicit deleteFiles query param wins; otherwise fall
+                // back to the X-Confirm header. Before this fallback, a
+                // caller sending only X-Confirm (the API's destructive-op
+                // convention) got a silent Detach — the .dfdb stayed on
+                // disk and the next create with the same name re-attached
+                // it, resurrecting every old document.
+                var drop = deleteFiles
+                    ?? (ctx.Request.Headers["X-Confirm"].ToString() == "true");
                 var removed = drop ? registry.Drop(name) : registry.Detach(name);
                 if (!removed)
                     return Results.NotFound(new { error = $"Database '{name}' is not attached." });
