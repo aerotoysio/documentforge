@@ -1152,13 +1152,16 @@ public static class DatabaseEndpoints
             if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
             if (!Guid.TryParse(id, out var guid))
                 return Results.BadRequest(new { error = "Expected DocumentForge's internal _id (a GUID)." });
-            var coll = db.GetCollection(collection);
-            if (coll is null) return Results.NotFound();
             var docId = new DocumentId(guid);
-            var doc = coll.FindById(docId);
-            if (doc is null) return Results.NotFound();
-            if (coll.Delete(docId)) db.NotifyDocDeleted(collection, docId, doc);
-            return Results.Ok(new { database = name, success = true, id = docId.ToString(), collection });
+            try
+            {
+                // Issue #151 — engine-level delete: enforces schema refs
+                // (restrict/setNull/cascade) and broadcasts to followers,
+                // which the old direct Collection.Delete never did.
+                if (!db.Delete(collection, docId)) return Results.NotFound();
+                return Results.Ok(new { database = name, success = true, id = docId.ToString(), collection });
+            }
+            catch (ReferentialIntegrityException ex) { return Results.Conflict(new { error = ex.Message }); }
         });
 
         // Scoped drop-collection. Destructive, so it requires the same

@@ -68,10 +68,44 @@ public static class SchemaHandler
             }
         }
 
-        if (required.Count == 0 && types.Count == 0 && checks.Count == 0)
-            throw new SchemaParseException("Schema is empty — supply at least one of required, types, checks.");
+        var refs = new List<RefConstraint>();
+        if (root.TryGetProperty("refs", out var r))
+        {
+            if (r.ValueKind != JsonValueKind.Array)
+                throw new SchemaParseException("'refs' must be an array.");
+            foreach (var el in r.EnumerateArray())
+            {
+                if (!el.TryGetProperty("field", out var f) || f.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(f.GetString()))
+                    throw new SchemaParseException("Each ref needs a non-empty string 'field'.");
+                if (!el.TryGetProperty("collection", out var tc) || tc.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(tc.GetString()))
+                    throw new SchemaParseException("Each ref needs a non-empty string 'collection' (the referenced collection).");
+                var targetField = "_id";
+                if (el.TryGetProperty("targetField", out var tf))
+                {
+                    if (tf.ValueKind != JsonValueKind.String || string.IsNullOrWhiteSpace(tf.GetString()))
+                        throw new SchemaParseException("'targetField' must be a non-empty string when present.");
+                    targetField = tf.GetString()!;
+                }
+                var onDelete = OnDeleteAction.Restrict;
+                if (el.TryGetProperty("onDelete", out var od))
+                {
+                    onDelete = (od.GetString() ?? "").Trim().ToLowerInvariant() switch
+                    {
+                        "restrict" => OnDeleteAction.Restrict,
+                        "setnull" => OnDeleteAction.SetNull,
+                        "cascade" => OnDeleteAction.Cascade,
+                        var bad => throw new SchemaParseException(
+                            $"Unknown onDelete '{bad}'. Use restrict, setNull, cascade."),
+                    };
+                }
+                refs.Add(new RefConstraint(f.GetString()!, tc.GetString()!, targetField, onDelete));
+            }
+        }
 
-        return new CollectionSchema(collection, required, types, checks);
+        if (required.Count == 0 && types.Count == 0 && checks.Count == 0 && refs.Count == 0)
+            throw new SchemaParseException("Schema is empty — supply at least one of required, types, checks, refs.");
+
+        return new CollectionSchema(collection, required, types, checks, refs);
     }
 
     private static FieldTypeConstraint ParseType(string name) => name.Trim().ToLowerInvariant() switch
@@ -110,6 +144,18 @@ public static class SchemaHandler
             field = c.Field,
             op = c.Op.ToString(),
             value = c.Value is null || c.Value.IsNull ? null : c.Value.ToString(),
+        }),
+        refs = s.RefsOrEmpty.Select(r => new
+        {
+            field = r.Field,
+            collection = r.Collection,
+            targetField = r.TargetField,
+            onDelete = r.OnDelete switch
+            {
+                OnDeleteAction.SetNull => "setNull",
+                OnDeleteAction.Cascade => "cascade",
+                _ => "restrict",
+            },
         }),
     };
 }

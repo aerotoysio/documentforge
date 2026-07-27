@@ -641,11 +641,9 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                             if (existing is not null && collection.Delete(rollbackId))
                             {
                                 _indexManager.OnDocumentDeleted(collectionName, rollbackId, existing);
-                                if (_logicalServer is not null)
-                                {
-                                    var bytes = BsonSerializer.Serialize(existing);
-                                    _logicalServer.BroadcastNewOp(LogicalOpType.Delete, collectionName, bytes);
-                                }
+                                // Delete wire payload is the 16-byte id — that's
+                                // what ApplyFollowerOp parses (DocumentId.FromBytes).
+                                _logicalServer?.BroadcastNewOp(LogicalOpType.Delete, collectionName, rollbackId.ToBytes());
                             }
                         }
                         // Seal the reverse-applied pages too: the rollback's
@@ -710,12 +708,12 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                 }
 
                 // Replicate as delete + insert (LogicalOpType.Update is on the roadmap).
+                // Delete wire payload is the 16-byte id — that's what
+                // ApplyFollowerOp parses (DocumentId.FromBytes).
                 if (_logicalServer is not null)
                 {
-                    var oldBytes = BsonSerializer.Serialize(oldDoc);
-                    _logicalServer.BroadcastNewOp(LogicalOpType.Delete, collectionName, oldBytes);
-                    var newBytes = BsonSerializer.Serialize(newDoc);
-                    _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, newBytes);
+                    _logicalServer.BroadcastNewOp(LogicalOpType.Delete, collectionName, id.ToBytes());
+                    _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, BsonSerializer.Serialize(newDoc));
                 }
                 CommitDurableLocked();
                 return true;
@@ -773,10 +771,10 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
 
             if (_logicalServer is not null)
             {
-                var oldBytes = BsonSerializer.Serialize(oldDoc);
-                _logicalServer.BroadcastNewOp(LogicalOpType.Delete, collectionName, oldBytes);
-                var newBytes = BsonSerializer.Serialize(newDoc);
-                _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, newBytes);
+                // Delete wire payload is the 16-byte id — that's what
+                // ApplyFollowerOp parses (DocumentId.FromBytes).
+                _logicalServer.BroadcastNewOp(LogicalOpType.Delete, collectionName, id.ToBytes());
+                _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, BsonSerializer.Serialize(newDoc));
             }
             CommitDurableLocked();
             return newDoc.GetEtag();
@@ -845,7 +843,9 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
 
                 if (_logicalServer is not null)
                 {
-                    _logicalServer.BroadcastNewOp(LogicalOpType.Delete, collectionName, BsonSerializer.Serialize(oldDoc));
+                    // Delete wire payload is the 16-byte id — that's what
+                    // ApplyFollowerOp parses (DocumentId.FromBytes).
+                    _logicalServer.BroadcastNewOp(LogicalOpType.Delete, collectionName, id.ToBytes());
                     _logicalServer.BroadcastNewOp(LogicalOpType.Insert, collectionName, BsonSerializer.Serialize(newDoc));
                 }
                 CommitDurableLocked();
@@ -1031,7 +1031,9 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                         if (coll.Delete(id))
                         {
                             _indexManager.OnDocumentDeleted(cfg.Collection, id, doc);
-                            _logicalServer?.BroadcastNewOp(LogicalOpType.Delete, cfg.Collection, BsonSerializer.Serialize(doc));
+                            // Delete wire payload is the 16-byte id — that's what
+                            // ApplyFollowerOp parses (DocumentId.FromBytes).
+                            _logicalServer?.BroadcastNewOp(LogicalOpType.Delete, cfg.Collection, id.ToBytes());
                             deleted++;
                         }
                     }
@@ -1152,6 +1154,24 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
         if (IsReservedMetaCollection(schema.Collection))
             throw new ArgumentException($"'{schema.Collection}' is a reserved system collection.", nameof(schema));
 
+        // Issue #151 — refs sanity. setNull on a required field is rejected
+        // outright rather than silently behaving like restrict: the operator
+        // asked for two contradictory things and should hear about it now,
+        // not at 3am when a delete starts failing.
+        foreach (var rf in schema.RefsOrEmpty)
+        {
+            if (string.IsNullOrWhiteSpace(rf.Field) || string.IsNullOrWhiteSpace(rf.Collection)
+                || string.IsNullOrWhiteSpace(rf.TargetField))
+                throw new ArgumentException("Each ref needs a field, collection and targetField.", nameof(schema));
+            if (IsReservedMetaCollection(rf.Collection))
+                throw new ArgumentException($"Ref target '{rf.Collection}' is a reserved system collection.", nameof(schema));
+            if (rf.OnDelete == OnDeleteAction.SetNull
+                && schema.Required.Contains(rf.Field, StringComparer.OrdinalIgnoreCase))
+                throw new ArgumentException(
+                    $"Ref on '{rf.Field}': onDelete=setNull contradicts the field being in 'required'. " +
+                    "Use restrict/cascade, or drop the field from required.", nameof(schema));
+        }
+
         PersistSchema(schema);
         lock (_schemaLock) _schemaByCollection[schema.Collection] = schema;
     }
@@ -1209,6 +1229,16 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             if (!EvaluateCondition(doc, chk))
                 throw new SchemaViolationException(collection, $"check failed: {DescribeCondition(chk)}.");
         }
+
+        // Issue #151 — referential integrity: a present, non-null ref field
+        // must point at an existing document. Absence is a 'required' concern.
+        foreach (var rf in schema.RefsOrEmpty)
+        {
+            if (!doc.ContainsKey(rf.Field) || doc[rf.Field].IsNull) continue;
+            if (!RefTargetExists(rf, doc[rf.Field]))
+                throw new SchemaViolationException(collection,
+                    $"ref violation: '{rf.Field}' = {doc[rf.Field]} matches no document in '{rf.Collection}'.{rf.TargetField}.");
+        }
     }
 
     private static bool MatchesType(BsonValue v, FieldTypeConstraint type) => type switch
@@ -1226,6 +1256,188 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
     private static bool IsReservedMetaCollection(string name) =>
         string.Equals(name, TtlMetaCollection, StringComparison.OrdinalIgnoreCase)
         || string.Equals(name, SchemaMetaCollection, StringComparison.OrdinalIgnoreCase);
+
+    // ---- Referential integrity (issue #151) ----
+
+    private static bool IsIdField(string field) =>
+        string.Equals(field, "_id", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Equality for ref matching. A document id crosses the JSON
+    /// boundary as a string, so string ↔ ObjectId equality must hold for
+    /// _id-targeted refs; everything else defers to BsonValue ordering.</summary>
+    private static bool RefValuesEqual(BsonValue a, BsonValue b)
+    {
+        if (a.Type == b.Type) return a.CompareTo(b) == 0;
+        if (a.Type == BsonType.String && b.Type == BsonType.ObjectId && Guid.TryParse(a.AsString, out var ga))
+            return new DocumentId(ga) == b.AsObjectId;
+        if (b.Type == BsonType.String && a.Type == BsonType.ObjectId && Guid.TryParse(b.AsString, out var gb))
+            return new DocumentId(gb) == a.AsObjectId;
+        return a.CompareTo(b) == 0;
+    }
+
+    /// <summary>True when a document exists in the ref's target collection whose
+    /// targetField equals <paramref name="value"/>. _id targets resolve via the
+    /// primary key; other targets scan (put a unique index on them — the scan
+    /// fallback is correct but O(n)). Callers hold at least the read side of
+    /// the write lock.</summary>
+    private bool RefTargetExists(RefConstraint rf, BsonValue value)
+    {
+        var target = _catalog.GetCollection(rf.Collection);
+        if (target is null) return false;
+        if (IsIdField(rf.TargetField))
+        {
+            if (value.Type == BsonType.ObjectId) return target.FindById(value.AsObjectId) is not null;
+            if (value.Type == BsonType.String && Guid.TryParse(value.AsString, out var g))
+                return target.FindById(new DocumentId(g)) is not null;
+            return false; // an _id ref that isn't an id can't match anything
+        }
+        foreach (var d in target.FindAll())
+            if (d.ContainsKey(rf.TargetField) && !d[rf.TargetField].IsNull && RefValuesEqual(value, d[rf.TargetField]))
+                return true;
+        return false;
+    }
+
+    /// <summary>
+    /// Delete a document by id with referential integrity (issue #151).
+    /// Plan-then-apply: the full action graph — restrict checks, setNull
+    /// rewrites (validated against the child's own schema), recursive
+    /// cascades (cycle-safe) — is resolved BEFORE any mutation, so a refusal
+    /// can never leave a partial cascade. Applies under the write lock as one
+    /// WAL commit, broadcasts each op to followers (children first), and
+    /// honours <see cref="MinSyncReplicas"/>. Returns false when the
+    /// collection or document doesn't exist.
+    /// </summary>
+    public bool Delete(string collectionName, DocumentId id)
+    {
+        ThrowIfReadOnly();
+        EnsureHealthy();
+        bool deleted;
+        ulong lastSeq;
+        _transactionManager.AcquireWriteLock();
+        try
+        {
+            (deleted, lastSeq) = TrackHealth(() =>
+            {
+                var coll = _catalog.GetCollection(collectionName);
+                var rootDoc = coll?.FindById(id);
+                if (coll is null || rootDoc is null) return (false, 0UL);
+
+                // PLAN — nothing is written in this phase.
+                var deletes = new List<(string Collection, DocumentId Id, BsonDocument Doc)>();
+                var setNulls = new Dictionary<(string Collection, DocumentId Id), (BsonDocument OldDoc, BsonDocument NewDoc)>();
+                var visited = new HashSet<(string Collection, DocumentId Id)>();
+                PlanRefAwareDelete(collectionName, id, rootDoc, visited, deletes, setNulls);
+
+                // APPLY — deletes leaf-first (recursion order), then rewrites.
+                ulong seq = 0;
+                foreach (var (c, did, d) in deletes)
+                {
+                    var target = _catalog.GetCollection(c);
+                    if (target is null || !target.Delete(did)) continue;
+                    _indexManager.OnDocumentDeleted(c, did, d);
+                    if (_logicalServer is not null)
+                        seq = _logicalServer.BroadcastNewOp(LogicalOpType.Delete, c, did.ToBytes());
+                }
+                foreach (var ((c, did), (oldDoc, newDoc)) in setNulls)
+                {
+                    var target = _catalog.GetCollection(c);
+                    // A doc can be both cascaded away and staged for setNull
+                    // via a second ref path; the delete wins and the rewrite
+                    // becomes a no-op.
+                    if (target is null || target.FindById(did) is null) continue;
+                    _indexManager.OnDocumentUpdated(c, did, oldDoc, newDoc);
+                    if (!target.Update(did, newDoc))
+                    {
+                        try { _indexManager.OnDocumentUpdated(c, did, newDoc, oldDoc); } catch { }
+                        continue;
+                    }
+                    if (_logicalServer is not null)
+                    {
+                        _logicalServer.BroadcastNewOp(LogicalOpType.Delete, c, did.ToBytes());
+                        seq = _logicalServer.BroadcastNewOp(LogicalOpType.Insert, c, BsonSerializer.Serialize(newDoc));
+                    }
+                }
+                CommitDurableLocked();
+                return (true, seq);
+            });
+        }
+        finally { _transactionManager.ReleaseWriteLock(); }
+
+        if (deleted) WaitForSyncReplication(lastSeq);
+        return deleted;
+    }
+
+    /// <summary>
+    /// Recursive plan step for <see cref="Delete"/>: stage every consequence of
+    /// deleting (collection, id). Children are staged before their parent so the
+    /// apply loop runs leaf-first, and the visited set makes reference cycles
+    /// terminate. Mixed cascade/restrict diamonds resolve in traversal order —
+    /// same pragmatic stance SQL Server takes by refusing multiple cascade paths.
+    /// </summary>
+    private void PlanRefAwareDelete(
+        string collectionName, DocumentId id, BsonDocument doc,
+        HashSet<(string Collection, DocumentId Id)> visited,
+        List<(string Collection, DocumentId Id, BsonDocument Doc)> deletes,
+        Dictionary<(string Collection, DocumentId Id), (BsonDocument OldDoc, BsonDocument NewDoc)> setNulls)
+    {
+        if (!visited.Add((collectionName.ToLowerInvariant(), id))) return;
+
+        List<CollectionSchema> schemas;
+        lock (_schemaLock) schemas = _schemaByCollection.Values.ToList();
+
+        foreach (var schema in schemas)
+        {
+            foreach (var rf in schema.RefsOrEmpty)
+            {
+                if (!string.Equals(rf.Collection, collectionName, StringComparison.OrdinalIgnoreCase)) continue;
+                var parentVal = IsIdField(rf.TargetField) ? doc["_id"] : doc[rf.TargetField];
+                if (parentVal.IsNull) continue;
+                var childColl = _catalog.GetCollection(schema.Collection);
+                if (childColl is null) continue;
+
+                foreach (var child in childColl.FindAll())
+                {
+                    if (!child.ContainsKey(rf.Field) || child[rf.Field].IsNull) continue;
+                    if (!RefValuesEqual(child[rf.Field], parentVal)) continue;
+                    var childId = child.GetId();
+                    // Already staged for deletion via another path — moot.
+                    if (visited.Contains((schema.Collection.ToLowerInvariant(), childId))) continue;
+
+                    switch (rf.OnDelete)
+                    {
+                        case OnDeleteAction.Restrict:
+                            throw new ReferentialIntegrityException(collectionName,
+                                $"cannot delete {collectionName}/{id}: referenced by " +
+                                $"{schema.Collection}/{childId} via '{rf.Field}' (onDelete=restrict).");
+
+                        case OnDeleteAction.SetNull:
+                        {
+                            var key = (schema.Collection, childId);
+                            // Merge with an earlier staged rewrite of the same doc
+                            // (two ref fields pointing into the same delete graph).
+                            var newDoc = setNulls.TryGetValue(key, out var staged)
+                                ? staged.NewDoc
+                                : BsonSerializer.Deserialize(BsonSerializer.Serialize(child));
+                            newDoc[rf.Field] = BsonValue.Null;
+                            newDoc.StampFreshEtag();
+                            // The rewrite must still satisfy the child's own schema.
+                            // (setNull on a required field is already rejected at
+                            // ConfigureSchema time; this catches checks/types too.)
+                            ValidateDocument(schema.Collection, newDoc);
+                            setNulls[key] = (child, newDoc);
+                            break;
+                        }
+
+                        case OnDeleteAction.Cascade:
+                            PlanRefAwareDelete(schema.Collection, childId, child, visited, deletes, setNulls);
+                            break;
+                    }
+                }
+            }
+        }
+
+        deletes.Add((collectionName, id, doc));
+    }
 
     private void LoadSchemas()
     {
@@ -1274,6 +1486,9 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
             s.Types.Select(kv => $"{JsonString(kv.Key)}:{JsonString(kv.Value.ToString())}"))).Append('}');
         sb.Append(",\"checks\":[").Append(string.Join(",", s.Checks.Select(c =>
             $"{{\"field\":{JsonString(c.Field)},\"op\":{JsonString(c.Op.ToString())},\"value\":{ValueToJson(c.Value)}}}"))).Append(']');
+        sb.Append(",\"refs\":[").Append(string.Join(",", s.RefsOrEmpty.Select(r =>
+            $"{{\"field\":{JsonString(r.Field)},\"collection\":{JsonString(r.Collection)}," +
+            $"\"targetField\":{JsonString(r.TargetField)},\"onDelete\":{JsonString(r.OnDelete.ToString())}}}"))).Append(']');
         sb.Append('}');
         return sb.ToString();
     }
@@ -1312,7 +1527,22 @@ public sealed class DocumentForgeDb : IDisposable, DocumentForge.Transactions.IT
                 if (Enum.TryParse<ConditionOp>(cd["op"].AsString, ignoreCase: true, out var op))
                     checks.Add(new UpdateCondition(cd["field"].AsString, op, cd.ContainsKey("value") ? cd["value"] : null));
             }
-        return new CollectionSchema(collection, required, types, checks);
+        var refs = new List<RefConstraint>();
+        if (doc.ContainsKey("refs") && doc["refs"].Type == BsonType.Array)
+            foreach (var r in doc["refs"].AsArray.Items)
+            {
+                var rd = r.AsDocument;
+                if (rd["field"].IsNull || rd["collection"].IsNull) continue;
+                var onDelete = rd.ContainsKey("onDelete")
+                        && Enum.TryParse<OnDeleteAction>(rd["onDelete"].AsString, ignoreCase: true, out var od)
+                    ? od : OnDeleteAction.Restrict;
+                refs.Add(new RefConstraint(
+                    rd["field"].AsString,
+                    rd["collection"].AsString,
+                    rd.ContainsKey("targetField") && !rd["targetField"].IsNull ? rd["targetField"].AsString : "_id",
+                    onDelete));
+            }
+        return new CollectionSchema(collection, required, types, checks, refs);
     }
 
     /// <summary>

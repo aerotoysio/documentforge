@@ -685,15 +685,18 @@ public static class ServeCommand
 
         app.MapDelete("/collections/{name}/{id}", (string name, string id) =>
         {
-            var coll = db.GetCollection(name);
-            if (coll is null) return Results.NotFound();
             if (!Guid.TryParse(id, out var guid))
                 return Results.BadRequest(new { error = "This endpoint expects DocumentForge's internal _id. To delete by a business key, use DELETE /collections/{name}/by/{field}/{value}." });
-            var docId = new DocumentId(guid);
-            var doc = coll.FindById(docId);
-            if (doc is null) return Results.NotFound();
-            if (coll.Delete(docId)) db.NotifyDocDeleted(name, docId, doc);
-            return Results.Ok(new { success = true });
+            try
+            {
+                // Issue #151 — engine-level delete: enforces schema refs
+                // (restrict/setNull/cascade) and broadcasts to followers,
+                // which the old direct Collection.Delete never did.
+                return db.Delete(name, new DocumentId(guid))
+                    ? Results.Ok(new { success = true })
+                    : Results.NotFound();
+            }
+            catch (ReferentialIntegrityException ex) { return Results.Conflict(new { error = ex.Message }); }
         });
 
         // Replace a document by internal _id. Body is the full new document
