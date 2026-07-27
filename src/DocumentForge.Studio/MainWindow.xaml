@@ -45,6 +45,7 @@
                 <StackPanel.ContextMenu>
                     <ContextMenu>
                         <MenuItem Header="Dashboard…" Command="{Binding DashboardCommand}"/>
+                        <MenuItem Header="Database Diagram…" Command="{Binding DiagramCommand}"/>
                         <MenuItem Header="New Query" Command="{Binding NewQueryCommand}"/>
                         <MenuItem Header="Refresh" Command="{Binding RefreshCommand}"/>
                         <MenuItem Header="Replication…" Command="{Binding ReplicationCommand}"
@@ -121,6 +122,10 @@
 
         <DataTemplate DataType="{x:Type vm:TopologyDocumentViewModel}">
             <views:TopologyView/>
+        </DataTemplate>
+
+        <DataTemplate DataType="{x:Type vm:DiagramDocumentViewModel}">
+            <views:DiagramView/>
         </DataTemplate>
 
         <DataTemplate DataType="{x:Type vm:SqlReferenceDocumentViewModel}">

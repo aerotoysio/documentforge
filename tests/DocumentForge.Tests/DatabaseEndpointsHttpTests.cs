@@ -432,6 +432,86 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
         Assert.Empty(collections!.Collections);
     }
 
+    // ---- Issue #151/#152: scoped schema routes (Studio's diagram designer) ----
+
+    [Fact]
+    public async Task ScopedSchema_PutGetRoundtrip_PreservesRefsAndTypedCheckValues()
+    {
+        var (_, baseUrl, _) = BootServer();
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "shop" });
+
+        var put = await _http.PutAsJsonAsync($"{baseUrl}/db/shop/collections/orders/schema", new
+        {
+            required = new[] { "customerId" },
+            types = new Dictionary<string, string> { ["seatCount"] = "int" },
+            checks = new[] { new { field = "seatCount", op = ">=", value = 0 } },
+            refs = new[] { new { field = "customerId", collection = "customers", targetField = "_id", onDelete = "restrict" } },
+        });
+        Assert.Equal(HttpStatusCode.OK, put.StatusCode);
+
+        var list = await _http.GetFromJsonAsync<System.Text.Json.JsonElement>($"{baseUrl}/db/shop/schemas");
+        Assert.Equal(1, list.GetProperty("count").GetInt32());
+        var schema = list.GetProperty("schemas")[0];
+        Assert.Equal("orders", schema.GetProperty("collection").GetString());
+
+        // Check value must round-trip as a NUMBER, not a string — Studio
+        // PUTs the whole schema back when editing refs.
+        var check = schema.GetProperty("checks")[0];
+        Assert.Equal(System.Text.Json.JsonValueKind.Number, check.GetProperty("value").ValueKind);
+
+        var rf = schema.GetProperty("refs")[0];
+        Assert.Equal("customerId", rf.GetProperty("field").GetString());
+        Assert.Equal("customers", rf.GetProperty("collection").GetString());
+        Assert.Equal("_id", rf.GetProperty("targetField").GetString());
+        Assert.Equal("restrict", rf.GetProperty("onDelete").GetString());
+
+        // Per-collection GET agrees with the list route.
+        var one = await _http.GetAsync($"{baseUrl}/db/shop/collections/orders/schema");
+        Assert.Equal(HttpStatusCode.OK, one.StatusCode);
+    }
+
+    [Fact]
+    public async Task ScopedDelete_RestrictedByRef_Returns409()
+    {
+        var (registry, baseUrl, _) = BootServer();
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "shop" });
+        (await _http.PutAsJsonAsync($"{baseUrl}/db/shop/collections/orders/schema", new
+        {
+            refs = new[] { new { field = "customerId", collection = "customers", onDelete = "restrict" } },
+        })).EnsureSuccessStatusCode();
+
+        var db = registry.Get("shop");
+        var custId = db.Insert("customers", """{"name":"acme"}""");
+        db.Insert("orders", $$"""{"customerId":"{{custId}}"}""");
+
+        var resp = await _http.DeleteAsync($"{baseUrl}/db/shop/collections/customers/{custId.Value}");
+        Assert.Equal(HttpStatusCode.Conflict, resp.StatusCode);
+        var body = await resp.Content.ReadAsStringAsync();
+        Assert.Contains("restrict", body);
+        Assert.NotNull(db.GetCollection("customers")!.FindById(custId));
+    }
+
+    [Fact]
+    public async Task ScopedSchema_Delete_BackToSchemaless()
+    {
+        var (_, baseUrl, _) = BootServer();
+        await _http.PostAsJsonAsync($"{baseUrl}/databases", new { name = "shop" });
+        (await _http.PutAsJsonAsync($"{baseUrl}/db/shop/collections/orders/schema", new
+        {
+            required = new[] { "pnr" },
+        })).EnsureSuccessStatusCode();
+
+        var del = await _http.DeleteAsync($"{baseUrl}/db/shop/collections/orders/schema");
+        Assert.Equal(HttpStatusCode.OK, del.StatusCode);
+
+        var list = await _http.GetFromJsonAsync<System.Text.Json.JsonElement>($"{baseUrl}/db/shop/schemas");
+        Assert.Equal(0, list.GetProperty("count").GetInt32());
+
+        // Second delete: idempotent 404.
+        var again = await _http.DeleteAsync($"{baseUrl}/db/shop/collections/orders/schema");
+        Assert.Equal(HttpStatusCode.NotFound, again.StatusCode);
+    }
+
     [Fact]
     public async Task DeleteDatabase_Unknown_Returns404()
     {

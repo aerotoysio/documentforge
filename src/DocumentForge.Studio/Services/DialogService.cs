@@ -35,6 +35,13 @@ public sealed class DialogService : IDialogService
         return dialog.ShowDialog() == true ? dialog.Result : null;
     }
 
+    public RelationshipDialogOutcome ShowRelationshipDialog(RelationshipDialogArgs args)
+    {
+        var dialog = new RelationshipDialog(args) { Owner = _owner };
+        dialog.ShowDialog();
+        return dialog.Outcome;
+    }
+
     public string? ShowInsertDocumentDialog(string collection, string template)
     {
         var dialog = new InsertDocumentDialog(collection, template) { Owner = _owner };

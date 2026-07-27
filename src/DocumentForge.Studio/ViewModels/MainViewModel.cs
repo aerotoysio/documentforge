@@ -608,6 +608,19 @@ public sealed partial class MainViewModel : ObservableObject
         StatusText = $"Service settings — {server.Connection.Descriptor.Name}";
     }
 
+    /// <summary>Opens (or re-focuses) the relationship diagram (#152) for a database.</summary>
+    public void OpenDiagram(DatabaseNodeViewModel database)
+    {
+        var contentId = $"diagram:{database.Server.Connection.Descriptor.Id}:{database.Info.Name}";
+        var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
+        if (existing is not null) { ActiveDocument = existing; return; }
+
+        var document = new DiagramDocumentViewModel(database.Server.Connection, database.Info.Name, _workspace, _dialogs);
+        Documents.Add(document);
+        ActiveDocument = document;
+        StatusText = $"Diagram — {database.Info.Name}";
+    }
+
     /// <summary>Opens (or re-focuses) the replication topology graph for a server.</summary>
     public void OpenTopology(ServerNodeViewModel server)
     {

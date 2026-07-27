@@ -13,6 +13,19 @@ public sealed record NewIndexRequest(string Collection, string Name, IReadOnlyLi
 
 public enum DropChoice { Cancel, Detach, Drop }
 
+/// <summary>One relationship (schema ref, #151/#152) as the diagram's dialog
+/// edits it. OnDelete uses the wire spelling: restrict | setNull | cascade.</summary>
+public sealed record RelationshipRequest(
+    string ChildCollection, string ChildField, string ParentCollection, string TargetField, string OnDelete);
+
+/// <summary>Existing is null when adding; non-null pre-fills the dialog and
+/// enables its Remove button.</summary>
+public sealed record RelationshipDialogArgs(IReadOnlyList<string> Collections, RelationshipRequest? Existing);
+
+public enum RelationshipDialogChoice { Cancel, Save, Remove }
+
+public sealed record RelationshipDialogOutcome(RelationshipDialogChoice Choice, RelationshipRequest? Request);
+
 /// <summary>Keeps WPF dialog plumbing out of the view models so they stay
 /// testable and the views stay dumb.</summary>
 public interface IDialogService
@@ -20,6 +33,8 @@ public interface IDialogService
     ConnectRequest? ShowConnectDialog();
     NewDatabaseRequest? ShowNewDatabaseDialog(IReadOnlyList<ServerNodeViewModel> servers, string defaultDataDir);
     NewIndexRequest? ShowNewIndexDialog(string collection);
+    /// <summary>Add/edit a diagram relationship (#152).</summary>
+    RelationshipDialogOutcome ShowRelationshipDialog(RelationshipDialogArgs args);
     /// <summary>Returns the validated JSON to insert, or null if cancelled.</summary>
     string? ShowInsertDocumentDialog(string collection, string template);
     DropChoice ConfirmDropDatabase(string databaseName);

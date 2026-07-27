@@ -143,7 +143,11 @@ public static class SchemaHandler
         {
             field = c.Field,
             op = c.Op.ToString(),
-            value = c.Value is null || c.Value.IsNull ? null : c.Value.ToString(),
+            // Native JSON type, not ToString() — a GET→edit→PUT round-trip
+            // (Studio's diagram designer does exactly this) must not turn a
+            // numeric check value into a string, or the check silently stops
+            // matching numeric fields.
+            value = c.Value is null || c.Value.IsNull ? null : CheckValueToWire(c.Value),
         }),
         refs = s.RefsOrEmpty.Select(r => new
         {
@@ -157,5 +161,15 @@ public static class SchemaHandler
                 _ => "restrict",
             },
         }),
+    };
+
+    private static object CheckValueToWire(BsonValue v) => v.Type switch
+    {
+        BsonType.String => v.AsString,
+        BsonType.Boolean => v.AsBoolean,
+        BsonType.Int32 => v.AsInt32,
+        BsonType.Int64 => v.AsInt64,
+        BsonType.Double => v.AsDouble,
+        _ => v.ToString() ?? "",
     };
 }

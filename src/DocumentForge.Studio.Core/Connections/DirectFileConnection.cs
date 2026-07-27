@@ -161,6 +161,66 @@ public sealed class DirectFileConnection : IDfConnection
     public Task<bool> DropCollectionAsync(string database, string collection, CancellationToken ct = default) =>
         Task.Run(() => EnsureConnected().DropCollection(collection), ct);
 
+    // --- Schemas / referential integrity (#106/#151) — direct engine calls ---
+
+    public Task<IReadOnlyList<CollectionSchemaInfo>> GetSchemasAsync(string database, CancellationToken ct = default) =>
+        Task.Run<IReadOnlyList<CollectionSchemaInfo>>(() =>
+            EnsureConnected().GetSchemas().Select(SchemaToInfo).ToList(), ct);
+
+    public Task PutSchemaAsync(string database, CollectionSchemaInfo schema, CancellationToken ct = default) =>
+        Task.Run(() => EnsureConnected().ConfigureSchema(InfoToSchema(schema)), ct);
+
+    public Task DeleteSchemaAsync(string database, string collection, CancellationToken ct = default) =>
+        Task.Run(() => { EnsureConnected().RemoveSchema(collection); }, ct);
+
+    private static CollectionSchemaInfo SchemaToInfo(CollectionSchema s) => new(
+        s.Collection,
+        s.Required.ToList(),
+        s.Types.ToDictionary(kv => kv.Key, kv => kv.Value.ToString().ToLowerInvariant(), StringComparer.OrdinalIgnoreCase),
+        s.Checks.Select(c => new SchemaCheckInfo(c.Field, c.Op.ToString(), BsonToJsonElement(c.Value))).ToList(),
+        s.RefsOrEmpty.Select(r => new SchemaRefInfo(r.Field, r.Collection, r.TargetField, r.OnDelete switch
+        {
+            OnDeleteAction.SetNull => "setNull",
+            OnDeleteAction.Cascade => "cascade",
+            _ => "restrict",
+        })).ToList());
+
+    private static CollectionSchema InfoToSchema(CollectionSchemaInfo info)
+    {
+        var types = new Dictionary<string, FieldTypeConstraint>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (field, type) in info.Types)
+            if (Enum.TryParse<FieldTypeConstraint>(type, ignoreCase: true, out var ftc))
+                types[field] = ftc;
+
+        var checks = new List<UpdateCondition>();
+        foreach (var c in info.Checks)
+            if (Enum.TryParse<ConditionOp>(c.Op, ignoreCase: true, out var op))
+                checks.Add(new UpdateCondition(c.Field, op,
+                    c.Value is { } v ? DocumentForge.Document.BsonDocument.ValueFromJson(v) : null));
+
+        var refs = info.Refs.Select(r => new RefConstraint(
+            r.Field, r.Collection, r.TargetField,
+            Enum.TryParse<OnDeleteAction>(r.OnDelete, ignoreCase: true, out var od) ? od : OnDeleteAction.Restrict))
+            .ToList();
+
+        return new CollectionSchema(info.Collection, info.Required.ToList(), types, checks, refs);
+    }
+
+    private static System.Text.Json.JsonElement? BsonToJsonElement(DocumentForge.Document.BsonValue? v)
+    {
+        if (v is null || v.IsNull) return null;
+        object primitive = v.Type switch
+        {
+            DocumentForge.Document.BsonType.String => v.AsString,
+            DocumentForge.Document.BsonType.Boolean => v.AsBoolean,
+            DocumentForge.Document.BsonType.Int32 => v.AsInt32,
+            DocumentForge.Document.BsonType.Int64 => v.AsInt64,
+            DocumentForge.Document.BsonType.Double => v.AsDouble,
+            _ => v.ToString() ?? "",
+        };
+        return System.Text.Json.JsonSerializer.SerializeToElement(primitive);
+    }
+
     public Task<CompactionInfo> CompactCollectionAsync(string database, string collection, CancellationToken ct = default) =>
         Task.Run(() =>
         {

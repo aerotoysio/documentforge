@@ -43,6 +43,21 @@ public interface IDfConnection : IAsyncDisposable
     /// <summary>Drops a collection and its indexes. Returns false if it didn't exist.</summary>
     Task<bool> DropCollectionAsync(string database, string collection, CancellationToken ct = default);
 
+    // --- Schemas / referential integrity (#106/#151) ---
+
+    /// <summary>Every configured collection schema on a database — required
+    /// fields, types, checks, and refs. Collections without a schema are
+    /// simply absent.</summary>
+    Task<IReadOnlyList<CollectionSchemaInfo>> GetSchemasAsync(string database, CancellationToken ct = default);
+
+    /// <summary>Creates or replaces a collection's whole schema. The diagram
+    /// designer round-trips the non-ref sections unchanged.</summary>
+    Task PutSchemaAsync(string database, CollectionSchemaInfo schema, CancellationToken ct = default);
+
+    /// <summary>Removes a collection's schema entirely (back to schemaless).
+    /// No-op if none was configured.</summary>
+    Task DeleteSchemaAsync(string database, string collection, CancellationToken ct = default);
+
     /// <summary>Defragments a collection, reclaiming space from deleted documents.</summary>
     Task<CompactionInfo> CompactCollectionAsync(string database, string collection, CancellationToken ct = default);
 
