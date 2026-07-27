@@ -66,6 +66,20 @@ public class CollectionNotFoundException : DocumentForgeException
         : base($"Collection '{collectionName}' not found.") => CollectionName = collectionName;
 }
 
+/// <summary>
+/// Issue #151 — a delete was refused because another document still references
+/// the target (onDelete=restrict), or a setNull rewrite would break the
+/// referencing collection's own schema. Raised during the plan phase, before
+/// any mutation, so the on-disk state is untouched; the HTTP layer maps it
+/// to 409 Conflict.
+/// </summary>
+public class ReferentialIntegrityException : DocumentForgeException
+{
+    public string Collection { get; }
+    public ReferentialIntegrityException(string collection, string message)
+        : base($"Referential integrity violation in '{collection}': {message}") => Collection = collection;
+}
+
 public class QueryParseException : DocumentForgeException
 {
     public int Position { get; }
