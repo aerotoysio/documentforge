@@ -83,6 +83,7 @@ public sealed partial class MainViewModel : ObservableObject
             var node = new ServerNodeViewModel(this, connection);
             Servers.Add(node);
             node.IsExpanded = true;
+            _ = node.LoadVersionAsync();
             StatusText = $"Connected to {descriptor.Name}";
         }
         catch (Exception ex)
@@ -136,6 +137,7 @@ public sealed partial class MainViewModel : ObservableObject
                 var node = new ServerNodeViewModel(this, connection);
                 Servers.Add(node);
                 node.IsExpanded = true;
+                _ = node.LoadVersionAsync();
                 reconnected++;
             }
             catch
@@ -186,6 +188,52 @@ public sealed partial class MainViewModel : ObservableObject
         catch (Exception ex)
         {
             _dialogs.ShowError("Create database failed", ex.Message);
+        }
+    }
+
+    /// <summary>Attaches an existing .dfdb file (with its .wal/.recovery
+    /// sidecars) to a server, under a chosen name.</summary>
+    public async Task AttachDatabaseFileAsync(ServerNodeViewModel server)
+    {
+        var url = server.Connection.Descriptor.Url ?? "";
+        var serverIsLocal = url.Contains("://localhost", StringComparison.OrdinalIgnoreCase)
+                            || url.Contains("://127.0.0.1", StringComparison.OrdinalIgnoreCase);
+        var request = _dialogs.ShowAttachDatabaseDialog(server.Connection.Descriptor.Name, serverIsLocal);
+        if (request is null) return;
+
+        try
+        {
+            var info = await server.Connection.AttachDatabaseAsync(request.Name, request.FilePath);
+            await server.RefreshAsync();
+            StatusText = $"Attached '{info.Name}' from {info.FilePath}";
+        }
+        catch (Exception ex)
+        {
+            _dialogs.ShowError("Attach database failed", ex.Message);
+        }
+    }
+
+    /// <summary>Exports a whole database to a plain JSON file — every
+    /// collection's documents in one self-describing document.</summary>
+    public async Task ExportDatabaseJsonAsync(DatabaseNodeViewModel database)
+    {
+        var name = database.Info.Name;
+        var path = _dialogs.PickSaveFile(
+            "JSON (*.json)|*.json|All files (*.*)|*.*", $"{name}.json");
+        if (path is null) return;
+
+        try
+        {
+            StatusText = $"Exporting '{name}'…";
+            await using (var file = File.Create(path))
+                await database.Server.Connection.ExportDatabaseJsonAsync(name, file);
+            var size = new FileInfo(path).Length;
+            StatusText = $"Exported '{name}' to {path} ({size / 1024.0:N0} KB)";
+        }
+        catch (Exception ex)
+        {
+            StatusText = $"Export of '{name}' failed";
+            _dialogs.ShowError("Export failed", ex.Message);
         }
     }
 
@@ -516,7 +564,22 @@ public sealed partial class MainViewModel : ObservableObject
         var existing = Documents.FirstOrDefault(d => d.ContentId == contentId);
         if (existing is not null) { ActiveDocument = existing; return; }
 
-        var document = new ApiKeysDocumentViewModel(server.Connection, () => SecureServerAsync(server), _dialogs);
+        // Secrets Studio can actually show: the key this connection uses, and —
+        // when the connection targets the installer's bundled local service —
+        // the provisioned key from service-key.txt.
+        var descriptor = server.Connection.Descriptor;
+        var connectionKey = descriptor.ApiKeySecretId is { } keyId ? _workspace.Secrets.TryGet(keyId) : null;
+        string? serviceKeyFile = null, serviceKey = null;
+        var dataDir = InstalledService.DataDir;
+        var installedUrl = $"http://localhost:{InstalledService.Port(dataDir)}";
+        if (string.Equals(descriptor.Url?.TrimEnd('/'), installedUrl, StringComparison.OrdinalIgnoreCase))
+        {
+            serviceKeyFile = InstalledService.KeyFilePath;
+            serviceKey = InstalledService.Key(dataDir);
+        }
+
+        var document = new ApiKeysDocumentViewModel(server.Connection, () => SecureServerAsync(server), _dialogs,
+            new KnownKeys(connectionKey, serviceKeyFile, serviceKey));
         Documents.Add(document);
         ActiveDocument = document;
         StatusText = $"API Keys — {server.Connection.Descriptor.Name}";
@@ -560,6 +623,7 @@ public sealed partial class MainViewModel : ObservableObject
             var node = new ServerNodeViewModel(this, connection);
             Servers.Add(node);
             node.IsExpanded = true;
+            _ = node.LoadVersionAsync();
             StatusText = $"Secured {descriptor.Name} and reconnected with the admin key.";
             _dialogs.ShowInfo("Server secured",
                 "The server now requires an API key. This connection was updated to use the new admin key" +

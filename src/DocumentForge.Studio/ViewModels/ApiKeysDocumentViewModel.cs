@@ -17,22 +17,69 @@ public sealed record ScopeChoice(string Label, string Kind, bool NeedsDb)
     public override string ToString() => Label;
 }
 
+/// <summary>Secrets Studio itself holds and can therefore show — unlike the
+/// server's key list, which stores hashes only. ConnectionKey is what this
+/// connection authenticates with; the service key is the installer-provisioned
+/// one in service-key.txt (only passed when the connection targets that
+/// local service).</summary>
+public sealed record KnownKeys(string? ConnectionKey, string? ServiceKeyFilePath, string? ServiceKey);
+
 /// <summary>Manage a server's scoped API keys (a document tab): list, create
 /// (secret shown once), revoke.</summary>
 public sealed partial class ApiKeysDocumentViewModel : DocumentViewModel
 {
+    private const string Masked = "••••••••••••••••••••";
+
     private readonly IDfConnection _connection;
     private readonly Func<Task> _onSecure;
     private readonly IDialogService _dialogs;
+    private readonly KnownKeys _known;
 
-    public ApiKeysDocumentViewModel(IDfConnection connection, Func<Task> onSecure, IDialogService dialogs)
+    public ApiKeysDocumentViewModel(IDfConnection connection, Func<Task> onSecure, IDialogService dialogs,
+        KnownKeys? knownKeys = null)
     {
         _connection = connection;
         _onSecure = onSecure;
         _dialogs = dialogs;
+        _known = knownKeys ?? new KnownKeys(null, null, null);
         Title = $"API Keys — {connection.Descriptor.Name}";
         ContentId = $"keys:{connection.Descriptor.Id}";
         _selectedScope = ScopeChoices[0];
+    }
+
+    // --- Keys Studio knows on this machine (reveal/copy) ---
+
+    public bool HasConnectionKey => !string.IsNullOrEmpty(_known.ConnectionKey);
+    public bool HasServiceKey => !string.IsNullOrEmpty(_known.ServiceKey);
+    public bool HasAnyKnownKey => HasConnectionKey || HasServiceKey;
+    public string? ServiceKeyFilePath => _known.ServiceKeyFilePath;
+
+    [ObservableProperty] private bool _showConnectionKey;
+    [ObservableProperty] private bool _showServiceKey;
+
+    public string ConnectionKeyDisplay =>
+        !HasConnectionKey ? "" : ShowConnectionKey ? _known.ConnectionKey! : Masked;
+
+    public string ServiceKeyDisplay =>
+        !HasServiceKey ? "" : ShowServiceKey ? _known.ServiceKey! : Masked;
+
+    partial void OnShowConnectionKeyChanged(bool value) => OnPropertyChanged(nameof(ConnectionKeyDisplay));
+    partial void OnShowServiceKeyChanged(bool value) => OnPropertyChanged(nameof(ServiceKeyDisplay));
+
+    [RelayCommand] private void ToggleConnectionKey() => ShowConnectionKey = !ShowConnectionKey;
+    [RelayCommand] private void ToggleServiceKey() => ShowServiceKey = !ShowServiceKey;
+
+    [RelayCommand]
+    private void CopyConnectionKey() => CopyToClipboard(_known.ConnectionKey, "Connection key");
+
+    [RelayCommand]
+    private void CopyServiceKey() => CopyToClipboard(_known.ServiceKey, "Service key");
+
+    private void CopyToClipboard(string? secret, string what)
+    {
+        if (string.IsNullOrEmpty(secret)) return;
+        try { Clipboard.SetText(secret); StatusMessage = $"{what} copied to clipboard."; }
+        catch { /* clipboard busy */ }
     }
 
     /// <summary>True when this connection has no API key — i.e. the server is

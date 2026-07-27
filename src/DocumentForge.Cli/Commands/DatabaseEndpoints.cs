@@ -1242,6 +1242,52 @@ public static class DatabaseEndpoints
                 : Results.NotFound();
         });
 
+        // "Explode" a database to plain JSON: every collection's documents in
+        // one self-describing document, streamed straight to the response so
+        // a multi-GB database never materialises in server memory. Studio's
+        // "Export to JSON…" calls this; curl piping to a file works too.
+        // Shape: { database, exportedAtUtc, collections: { <name>: [docs…] } }
+        // Requires read scope on the database (it IS the whole database).
+        app.MapGet("/db/{name}/export", (HttpContext ctx, string name) =>
+        {
+            if (ScopeCheck.RequireDbRead(ctx, name) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null)
+                return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            db.Flush();
+            var exportedAtUtc = DateTime.UtcNow.ToString("O");
+            return Results.Stream(async stream =>
+            {
+                // Async flushes only — Kestrel rejects synchronous writes to
+                // the response stream (AllowSynchronousIO is off by default).
+                var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = true });
+                await using (writer.ConfigureAwait(false))
+                {
+                    writer.WriteStartObject();
+                    writer.WriteString("database", name);
+                    writer.WriteString("exportedAtUtc", exportedAtUtc);
+                    writer.WriteStartObject("collections");
+                    foreach (var collectionName in db.GetCollectionNames())
+                    {
+                        writer.WriteStartArray(collectionName);
+                        var coll = db.GetCollection(collectionName);
+                        if (coll is not null)
+                            foreach (var doc in coll.FindAll())
+                            {
+                                using var parsed = JsonDocument.Parse(doc.ToJson());
+                                parsed.RootElement.WriteTo(writer);
+                            }
+                        writer.WriteEndArray();
+                        // Bound the writer's buffer to roughly one collection.
+                        await writer.FlushAsync();
+                    }
+                    writer.WriteEndObject();
+                    writer.WriteEndObject();
+                    await writer.FlushAsync();
+                }
+            }, "application/json");
+        });
+
         // Scoped compaction — defragment a collection and reclaim space from
         // deleted documents. Mirrors the flat /admin/compact/{collection}.
         app.MapPost("/db/{name}/admin/compact/{collection}", (HttpContext ctx, string name, string collection) =>

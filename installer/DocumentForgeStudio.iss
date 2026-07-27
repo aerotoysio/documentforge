@@ -6,7 +6,7 @@
 
 #define AppName "DocumentForge Studio"
 #ifndef AppVersion
-  #define AppVersion "0.11.0"
+  #define AppVersion "0.12.0"
 #endif
 #define Publisher "DocumentForge"
 #define ExeName "DocumentForgeStudio.exe"
@@ -92,6 +92,71 @@ var
   PortPage: TInputQueryWizardPage;
   DataDirPage: TInputDirWizardPage;
   ApiKeyValue: String;
+  ServiceWasRunning: Boolean;
+
+// The Windows service `dfdb service install` registers (ServiceCommand.cs).
+const
+  ServiceName = 'DocumentForge';
+
+// sc query exits 0 when the service exists (any state), 1060 when it doesn't.
+function ServiceExists(): Boolean;
+var
+  RC: Integer;
+begin
+  Result := Exec(ExpandConstant('{sys}\sc.exe'), 'query "' + ServiceName + '"', '',
+                 SW_HIDE, ewWaitUntilTerminated, RC) and (RC = 0);
+end;
+
+// Piping through findstr gives us the state without parsing output ourselves:
+// exit 0 = the STATE line says RUNNING (or a pending transition to/from it).
+function ServiceRunning(): Boolean;
+var
+  RC: Integer;
+begin
+  Result := Exec(ExpandConstant('{cmd}'),
+                 '/c sc query "' + ServiceName + '" | findstr /i /c:"RUNNING"', '',
+                 SW_HIDE, ewWaitUntilTerminated, RC) and (RC = 0);
+end;
+
+// Upgrades used to fail mid-copy because dfdb.exe (the running service or a
+// Start-Menu instance) and Studio itself held locks on files in {app}. Stop
+// everything BEFORE the file copy; the service is restarted post-install if
+// it was running.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  RC, Tries: Integer;
+begin
+  Result := '';
+  ServiceWasRunning := False;
+
+  // A running Studio locks the client files. Same-user process, no elevation
+  // needed; ignore failures (it may simply not be running).
+  Exec(ExpandConstant('{cmd}'), '/c taskkill /f /im DocumentForgeStudio.exe', '',
+       SW_HIDE, ewWaitUntilTerminated, RC);
+
+  if ServiceExists() and ServiceRunning() then
+  begin
+    ServiceWasRunning := True;
+    // The installer is per-user; stopping a service needs admin, so elevate
+    // just this one command (one UAC prompt).
+    ShellExec('runas', ExpandConstant('{sys}\sc.exe'), 'stop "' + ServiceName + '"', '',
+              SW_HIDE, ewWaitUntilTerminated, RC);
+    // Wait for the SCM to actually finish stopping (up to ~15 s) so the
+    // file copy doesn't race the shutdown.
+    Tries := 0;
+    while ServiceRunning() and (Tries < 30) do
+    begin
+      Sleep(500);
+      Tries := Tries + 1;
+    end;
+  end;
+
+  // Any manually-started dfdb (Start-Menu shortcut) also locks {app}\service.
+  // Won't touch the service's own process (different user, access denied) —
+  // that one was handled above.
+  Exec(ExpandConstant('{cmd}'), '/c taskkill /f /im dfdb.exe', '',
+       SW_HIDE, ewWaitUntilTerminated, RC);
+end;
 
 procedure InitializeWizard;
 begin
@@ -209,6 +274,20 @@ begin
     else
       // Marker so uninstall knows to remove the service.
       SaveStringToFile(ExpandConstant('{app}\service-installed.txt'), 'DocumentForge', False);
+  end;
+
+  // If PrepareToInstall stopped a running service for the upgrade, bring it
+  // back with the freshly-installed binaries. Skipped when the wizard just
+  // (re)ran `dfdb service install` above — that already starts it.
+  if ServiceWasRunning
+     and not (WizardIsComponentSelected('service') and WizardIsTaskSelected('startupservice')) then
+  begin
+    if not ShellExec('runas', ExpandConstant('{sys}\sc.exe'), 'start "' + ServiceName + '"', '',
+                     SW_HIDE, ewWaitUntilTerminated, ResultCode)
+       or (ResultCode <> 0) then
+      MsgBox('The DocumentForge service was stopped for the upgrade but could not be restarted ' +
+             '(you may have declined the admin prompt). Start it from services.msc or an elevated ' +
+             'prompt with:  sc start ' + ServiceName, mbInformation, MB_OK);
   end;
 end;
 

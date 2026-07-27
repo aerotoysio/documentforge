@@ -47,10 +47,10 @@ public partial class App : Application
     // folder the installer configured.
     private static void SeedFirstRunConnection(StudioWorkspace workspace)
     {
-        var dataDir = ReadInstalledDataDir();
-        var port = ReadInstalledPort(dataDir);
+        var dataDir = Services.InstalledService.DataDir;
+        var port = Services.InstalledService.Port(dataDir);
         var url = $"http://localhost:{port}";
-        var apiKey = ReadInstalledServiceKey(dataDir);
+        var apiKey = Services.InstalledService.Key(dataDir);
 
         // Upgrade path: an earlier install seeded this connection without a
         // key and the installer has since provisioned one — attach it rather
@@ -77,44 +77,4 @@ public partial class App : Application
         }, apiKey);
     }
 
-    /// <summary>The data folder the installer configured, read from datadir.txt
-    /// next to the exe. Defaults to the DocumentForge standard.</summary>
-    private static string ReadInstalledDataDir()
-    {
-        var dir = ReadInstalledFile(Path.Combine(AppContext.BaseDirectory, "datadir.txt"));
-        return dir ?? @"C:\data\documentforge";
-    }
-
-    /// <summary>The API key the installer provisioned for the bundled service:
-    /// service-key.txt in the data folder (pre-0.10.1: next to the exe). Null
-    /// when absent — older installs, or the service component wasn't selected.</summary>
-    private static string? ReadInstalledServiceKey(string dataDir) =>
-        ReadInstalledFile(Path.Combine(dataDir, "service-key.txt"))
-        ?? ReadInstalledFile(Path.Combine(AppContext.BaseDirectory, "service-key.txt"));
-
-    /// <summary>The port the installer configured for the local service:
-    /// port.txt in the data folder (pre-0.10.1: next to the exe). Defaults to
-    /// 4300 (DocumentForge standard).</summary>
-    private static int ReadInstalledPort(string dataDir)
-    {
-        var text = ReadInstalledFile(Path.Combine(dataDir, "port.txt"))
-                   ?? ReadInstalledFile(Path.Combine(AppContext.BaseDirectory, "port.txt"));
-        return int.TryParse(text, out var p) && p is > 0 and <= 65535 ? p : 4300;
-    }
-
-    /// <summary>Trimmed content of an installer-written file, or null when the
-    /// file is missing, empty, or unreadable.</summary>
-    private static string? ReadInstalledFile(string path)
-    {
-        try
-        {
-            if (File.Exists(path))
-            {
-                var text = File.ReadAllText(path).Trim();
-                if (text.Length > 0) return text;
-            }
-        }
-        catch { /* treat as absent */ }
-        return null;
-    }
 }

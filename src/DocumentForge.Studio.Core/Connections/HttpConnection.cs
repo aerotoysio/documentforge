@@ -774,6 +774,34 @@ public sealed class HttpConnection : IDfConnection
         return new DatabaseInfo(dto.Name, dto.FilePath, dto.IsDefault);
     }
 
+    public async Task<DatabaseInfo> AttachDatabaseAsync(string name, string filePath, CancellationToken ct = default)
+    {
+        // createIfMissing=false → Attach (existing file only); a typo'd path
+        // errors instead of silently creating an empty database.
+        using var response = await _http.PostAsJsonAsync(
+            "databases", new { name, path = filePath, createIfMissing = false }, Json, ct).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        var dto = JsonSerializer.Deserialize<DatabaseDto>(body, Json)!;
+        return new DatabaseInfo(dto.Name, dto.FilePath, dto.IsDefault);
+    }
+
+    public async Task ExportDatabaseJsonAsync(string database, Stream destination, CancellationToken ct = default)
+    {
+        // Stream straight to the destination — the export can be far larger
+        // than anything else Studio pulls, so never buffer it as a string.
+        using var response = await _http.GetAsync(
+            $"db/{Uri.EscapeDataString(database)}/export",
+            HttpCompletionOption.ResponseHeadersRead, ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        }
+        await response.Content.CopyToAsync(destination, ct).ConfigureAwait(false);
+    }
+
     public async Task DropDatabaseAsync(string name, bool deleteFiles, CancellationToken ct = default)
     {
         using var response = await _http.DeleteAsync(

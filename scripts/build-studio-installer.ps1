@@ -10,13 +10,13 @@
      dist\installer\DocumentForgeStudio-<version>-setup.exe.
 
 .PARAMETER Version
-  Version stamped into the installer filename/metadata. Defaults to 0.11.0.
+  Version stamped into the installer filename/metadata. Defaults to 0.12.0.
 
 .EXAMPLE
   pwsh scripts\build-studio-installer.ps1
 #>
 param(
-    [string]$Version = "0.11.0",
+    [string]$Version = "0.12.0",
     [string]$Runtime = "win-x64"
 )
 

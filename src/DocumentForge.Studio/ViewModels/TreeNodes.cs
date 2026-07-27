@@ -114,6 +114,22 @@ public sealed partial class ServerNodeViewModel : TreeNodeViewModel
 
     public bool CanManageServer => Connection.Capabilities.HasFlag(ConnectionCapabilities.ServerAdmin);
 
+    public bool CanAttachDatabase => Connection.Capabilities.HasFlag(ConnectionCapabilities.CreateDatabase);
+
+    /// <summary>Appends the service's engine version (from /health) to the node
+    /// label so the running service version is always visible. Best-effort —
+    /// direct-file connections report no version and keep the plain label.</summary>
+    public async Task LoadVersionAsync()
+    {
+        try
+        {
+            var health = await Connection.GetHealthAsync();
+            if (!string.IsNullOrWhiteSpace(health.Version))
+                Name = $"{Connection.Descriptor.Name}  ({Connection.Descriptor.Target})  ·  v{health.Version}";
+        }
+        catch { /* label stays without a version */ }
+    }
+
     protected override async Task<IReadOnlyList<TreeNodeViewModel>> LoadChildrenAsync()
     {
         var databases = await Connection.GetDatabasesAsync();
@@ -122,6 +138,9 @@ public sealed partial class ServerNodeViewModel : TreeNodeViewModel
 
     [RelayCommand]
     private Task DisconnectAsync() => _main.DisconnectAsync(this);
+
+    [RelayCommand]
+    private Task AttachDatabase() => _main.AttachDatabaseFileAsync(this);
 
     [RelayCommand]
     private Task NewQuery() => _main.OpenQueryOnServerAsync(this);
@@ -190,6 +209,9 @@ public sealed partial class DatabaseNodeViewModel : TreeNodeViewModel
 
     [RelayCommand]
     private Task PropertiesAsync() => _main.ShowDatabasePropertiesAsync(this);
+
+    [RelayCommand]
+    private Task ExportJsonAsync() => _main.ExportDatabaseJsonAsync(this);
 
     [RelayCommand]
     private Task DropAsync() => _main.DropDatabaseAsync(this);

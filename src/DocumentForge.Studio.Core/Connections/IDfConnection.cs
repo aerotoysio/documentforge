@@ -144,6 +144,17 @@ public interface IDfConnection : IAsyncDisposable
     /// <summary>Requires <see cref="ConnectionCapabilities.CreateDatabase"/>.</summary>
     Task<DatabaseInfo> CreateDatabaseAsync(string name, CancellationToken ct = default);
 
+    /// <summary>Attaches an EXISTING .dfdb file to the server under the given
+    /// name (its .wal/.recovery sidecars are replayed automatically by the
+    /// engine on open). The path must be visible from the server's machine.
+    /// Requires <see cref="ConnectionCapabilities.CreateDatabase"/>.</summary>
+    Task<DatabaseInfo> AttachDatabaseAsync(string name, string filePath, CancellationToken ct = default);
+
+    /// <summary>Writes the whole database as one plain-JSON document
+    /// (<c>{ database, exportedAtUtc, collections: { name: [docs…] } }</c>)
+    /// to <paramref name="destination"/> — the "explode to JSON" export.</summary>
+    Task ExportDatabaseJsonAsync(string database, Stream destination, CancellationToken ct = default);
+
     /// <summary>Requires <see cref="ConnectionCapabilities.DropDatabase"/>.
     /// With deleteFiles=false the database is only detached from the server.</summary>
     Task DropDatabaseAsync(string name, bool deleteFiles, CancellationToken ct = default);

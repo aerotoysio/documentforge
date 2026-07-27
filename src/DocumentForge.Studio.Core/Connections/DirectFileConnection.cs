@@ -270,6 +270,38 @@ public sealed class DirectFileConnection : IDfConnection
     public Task<DatabaseInfo> CreateDatabaseAsync(string name, CancellationToken ct = default) =>
         throw new NotSupportedException("A direct-file connection is a single database. Use File > New Database to create a new file.");
 
+    public Task<DatabaseInfo> AttachDatabaseAsync(string name, string filePath, CancellationToken ct = default) =>
+        throw new NotSupportedException("A direct-file connection is a single database. Attach files through a DocumentForge service connection.");
+
+    public Task ExportDatabaseJsonAsync(string database, Stream destination, CancellationToken ct = default) =>
+        Task.Run(() =>
+        {
+            var db = EnsureConnected();
+            db.Flush();
+            // Same wire shape as the service's GET /db/{name}/export so a file
+            // exported either way is interchangeable.
+            using var writer = new System.Text.Json.Utf8JsonWriter(destination,
+                new System.Text.Json.JsonWriterOptions { Indented = true });
+            writer.WriteStartObject();
+            writer.WriteString("database", _databaseName);
+            writer.WriteString("exportedAtUtc", DateTime.UtcNow.ToString("O"));
+            writer.WriteStartObject("collections");
+            foreach (var collectionName in db.GetCollectionNames())
+            {
+                writer.WriteStartArray(collectionName);
+                var coll = db.GetCollection(collectionName);
+                if (coll is not null)
+                    foreach (var doc in coll.FindAll())
+                    {
+                        using var parsed = System.Text.Json.JsonDocument.Parse(doc.ToJson());
+                        parsed.RootElement.WriteTo(writer);
+                    }
+                writer.WriteEndArray();
+            }
+            writer.WriteEndObject();
+            writer.WriteEndObject();
+        }, ct);
+
     public Task DropDatabaseAsync(string name, bool deleteFiles, CancellationToken ct = default) =>
         throw new NotSupportedException("A direct-file connection cannot drop databases. Disconnect and delete the file instead.");
 

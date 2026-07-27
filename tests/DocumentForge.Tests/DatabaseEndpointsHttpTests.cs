@@ -512,6 +512,77 @@ public sealed class DatabaseEndpointsHttpTests : IDisposable
         Assert.Equal(HttpStatusCode.NotFound, again.StatusCode);
     }
 
+    // ---- Export: "explode" a database to plain JSON ----
+
+    [Fact]
+    public async Task Export_WholeDatabase_AllCollectionsAndDocumentsPresent()
+    {
+        var (registry, baseUrl, dataDir) = BootServer();
+        registry.AttachOrCreate("shop", Path.Combine(dataDir, "shop.dfdb"));
+        var db = registry.Get("shop");
+        db.Insert("orders", """{"pnr":"E1"}""");
+        db.Insert("orders", """{"pnr":"E2"}""");
+        db.Insert("customers", """{"name":"acme"}""");
+
+        var resp = await _http.GetAsync($"{baseUrl}/db/shop/export");
+        resp.EnsureSuccessStatusCode();
+        Assert.Equal("application/json", resp.Content.Headers.ContentType!.MediaType);
+
+        var root = await resp.Content.ReadFromJsonAsync<System.Text.Json.JsonElement>();
+        Assert.Equal("shop", root.GetProperty("database").GetString());
+        Assert.NotNull(root.GetProperty("exportedAtUtc").GetString());
+        var collections = root.GetProperty("collections");
+        Assert.Equal(2, collections.GetProperty("orders").GetArrayLength());
+        Assert.Equal(1, collections.GetProperty("customers").GetArrayLength());
+        // Documents come out as plain JSON including their engine _id, so an
+        // export → re-import round-trip can preserve identity.
+        var order = collections.GetProperty("orders")[0];
+        Assert.True(order.TryGetProperty("_id", out _));
+        Assert.StartsWith("E", order.GetProperty("pnr").GetString());
+    }
+
+    [Fact]
+    public async Task Export_UnknownDatabase_Returns404()
+    {
+        var (_, baseUrl, _) = BootServer();
+        var resp = await _http.GetAsync($"{baseUrl}/db/ghost/export");
+        Assert.Equal(HttpStatusCode.NotFound, resp.StatusCode);
+    }
+
+    // ---- Attach an existing file (Studio "Attach Database File…") ----
+
+    [Fact]
+    public async Task PostDatabases_AttachExistingFile_CreateIfMissingFalse_DataVisible()
+    {
+        var (_, baseUrl, dataDir) = BootServer();
+        var path = Path.Combine(dataDir, "wandering.dfdb");
+        using (var seed = DocumentForgeDb.Create(path))
+            seed.Insert("things", """{"x":1}""");
+
+        var resp = await _http.PostAsJsonAsync($"{baseUrl}/databases",
+            new { name = "wandering", path, createIfMissing = false });
+        Assert.Equal(HttpStatusCode.Created, resp.StatusCode);
+
+        var q = await _http.PostAsJsonAsync($"{baseUrl}/db/wandering/query",
+            new { sql = "SELECT * FROM things" });
+        q.EnsureSuccessStatusCode();
+        Assert.Contains("\"x\"", await q.Content.ReadAsStringAsync());
+    }
+
+    [Fact]
+    public async Task PostDatabases_AttachMissingFile_CreateIfMissingFalse_FailsWithoutCreating()
+    {
+        // createIfMissing=false is the Studio attach path — a typo'd path
+        // must error, never silently create an empty database.
+        var (_, baseUrl, dataDir) = BootServer();
+        var path = Path.Combine(dataDir, "no-such-file.dfdb");
+
+        var resp = await _http.PostAsJsonAsync($"{baseUrl}/databases",
+            new { name = "ghost", path, createIfMissing = false });
+        Assert.False(resp.IsSuccessStatusCode);
+        Assert.False(File.Exists(path));
+    }
+
     [Fact]
     public async Task DeleteDatabase_Unknown_Returns404()
     {

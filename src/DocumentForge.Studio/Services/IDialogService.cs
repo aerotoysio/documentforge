@@ -9,6 +9,10 @@ public sealed record ConnectRequest(ConnectionDescriptor Descriptor, string? Api
 /// the default data directory.</summary>
 public sealed record NewDatabaseRequest(string Name, ServerNodeViewModel? Server);
 
+/// <summary>Attach an existing .dfdb (with its sidecars) to a server.
+/// FilePath is as the SERVER resolves it.</summary>
+public sealed record AttachDatabaseRequest(string Name, string FilePath);
+
 public sealed record NewIndexRequest(string Collection, string Name, IReadOnlyList<string> Paths, bool Unique);
 
 public enum DropChoice { Cancel, Detach, Drop }
@@ -32,6 +36,8 @@ public interface IDialogService
 {
     ConnectRequest? ShowConnectDialog();
     NewDatabaseRequest? ShowNewDatabaseDialog(IReadOnlyList<ServerNodeViewModel> servers, string defaultDataDir);
+    /// <summary>Pick an existing .dfdb file + name to attach it to a server as.</summary>
+    AttachDatabaseRequest? ShowAttachDatabaseDialog(string serverName, bool serverIsLocal);
     NewIndexRequest? ShowNewIndexDialog(string collection);
     /// <summary>Add/edit a diagram relationship (#152).</summary>
     RelationshipDialogOutcome ShowRelationshipDialog(RelationshipDialogArgs args);

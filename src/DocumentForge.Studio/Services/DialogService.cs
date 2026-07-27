@@ -29,6 +29,12 @@ public sealed class DialogService : IDialogService
         return dialog.ShowDialog() == true ? dialog.Result : null;
     }
 
+    public AttachDatabaseRequest? ShowAttachDatabaseDialog(string serverName, bool serverIsLocal)
+    {
+        var dialog = new AttachDatabaseDialog(serverName, serverIsLocal) { Owner = _owner };
+        return dialog.ShowDialog() == true ? dialog.Result : null;
+    }
+
     public NewIndexRequest? ShowNewIndexDialog(string collection)
     {
         var dialog = new NewIndexDialog(collection) { Owner = _owner };
