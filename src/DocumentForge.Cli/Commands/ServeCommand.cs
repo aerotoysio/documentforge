@@ -1132,6 +1132,14 @@ public static class ServeCommand
                 : Results.Ok(SchemaHandler.ToWire(schema));
         });
 
+        // Every schema on the default DB in one call — Studio's diagram
+        // designer loads the full relationship picture with this (#152).
+        app.MapGet("/schemas", () =>
+        {
+            var schemas = db.GetSchemas();
+            return Results.Ok(new { count = schemas.Count, schemas = schemas.Select(SchemaHandler.ToWire) });
+        });
+
         // Atomic multi-document transaction. Body is a JSON array of ops:
         //   { "op": "insert",        "collection": "users", "doc": {...} }
         //   { "op": "replace",       "collection": "users", "id": "<guid>", "doc": {...} }

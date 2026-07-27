@@ -1164,6 +1164,70 @@ public static class DatabaseEndpoints
             catch (ReferentialIntegrityException ex) { return Results.Conflict(new { error = ex.Message }); }
         });
 
+        // ----------------------------------------------------------------
+        // Issue #151/#152 — scoped schema routes. The flat /collections/
+        // {name}/schema trio only reaches the default DB; Studio's diagram
+        // designer needs schemas on ANY attached database. Same wire shape
+        // (SchemaHandler grammar) as the flat routes.
+        // ----------------------------------------------------------------
+
+        // Every schema on one database — the diagram designer's initial load.
+        app.MapGet("/db/{name}/schemas", (HttpContext ctx, string name) =>
+        {
+            if (ScopeCheck.RequireDbRead(ctx, name) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            var schemas = db.GetSchemas();
+            return Results.Ok(new
+            {
+                database = name,
+                count = schemas.Count,
+                schemas = schemas.Select(SchemaHandler.ToWire),
+            });
+        });
+
+        app.MapGet("/db/{name}/collections/{collection}/schema", (HttpContext ctx, string name, string collection) =>
+        {
+            if (ScopeCheck.RequireDbRead(ctx, name) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            var schema = db.GetSchema(collection);
+            return schema is null
+                ? Results.NotFound(new { error = $"No schema configured on '{collection}'." })
+                : Results.Ok(SchemaHandler.ToWire(schema));
+        });
+
+        app.MapPut("/db/{name}/collections/{collection}/schema", async (HttpContext ctx, string name, string collection, HttpRequest request) =>
+        {
+            if (ScopeCheck.RequireDbWrite(ctx, name) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            try
+            {
+                using var reader = new StreamReader(request.Body);
+                var body = await reader.ReadToEndAsync();
+                if (string.IsNullOrWhiteSpace(body))
+                    return Results.BadRequest(new { error = "Empty body — schema JSON required." });
+                using var json = JsonDocument.Parse(body);
+                var schema = SchemaHandler.Parse(collection, json.RootElement);
+                db.ConfigureSchema(schema);
+                return Results.Ok(new { database = name, success = true, schema = SchemaHandler.ToWire(schema) });
+            }
+            catch (SchemaHandler.SchemaParseException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            catch (ArgumentException ex) { return Results.BadRequest(new { error = ex.Message }); }
+            catch (JsonException ex) { return Results.BadRequest(new { error = $"Invalid JSON: {ex.Message}" }); }
+        });
+
+        app.MapDelete("/db/{name}/collections/{collection}/schema", (HttpContext ctx, string name, string collection) =>
+        {
+            if (ScopeCheck.RequireDbWrite(ctx, name) is { } deny) return deny;
+            var db = registry.TryGet(name);
+            if (db is null) return Results.NotFound(new { error = $"Database '{name}' is not attached." });
+            return db.RemoveSchema(collection)
+                ? Results.Ok(new { database = name, success = true, removed = collection })
+                : Results.NotFound(new { error = $"No schema configured on '{collection}'." });
+        });
+
         // Scoped drop-collection. Destructive, so it requires the same
         // X-Confirm: true header guard as the flat route.
         app.MapDelete("/db/{name}/collections/{collection}", (HttpContext ctx, string name, string collection, HttpRequest request) =>

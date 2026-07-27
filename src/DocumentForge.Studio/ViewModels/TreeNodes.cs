@@ -183,6 +183,9 @@ public sealed partial class DatabaseNodeViewModel : TreeNodeViewModel
     private void Dashboard() => _main.OpenDashboard(this);
 
     [RelayCommand]
+    private void Diagram() => _main.OpenDiagram(this);
+
+    [RelayCommand]
     private void Replication() => _main.OpenReplication(this);
 
     [RelayCommand]

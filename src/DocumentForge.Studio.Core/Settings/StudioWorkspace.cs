@@ -4,6 +4,10 @@ using DocumentForge.Studio.Core.Connections;
 
 namespace DocumentForge.Studio.Core.Settings;
 
+/// <summary>A saved diagram box position (#152). Plain record so it JSON
+/// round-trips through diagrams.json.</summary>
+public sealed record DiagramNodePosition(double X, double Y);
+
 /// <summary>Everything a settings export contains, in plain text — including
 /// decrypted secrets, so the file is portable across machines/profiles.
 /// The UI must warn before writing one of these to disk.</summary>
@@ -37,7 +41,9 @@ public sealed class StudioWorkspace
     private readonly string _settingsPath;
     private readonly string _connectionsPath;
     private readonly string _historyPath;
+    private readonly string _diagramsPath;
     private readonly Dictionary<string, List<string>> _history;
+    private readonly Dictionary<string, Dictionary<string, DiagramNodePosition>> _diagramLayouts;
 
     public StudioWorkspace(string? rootDirectory = null)
     {
@@ -49,11 +55,13 @@ public sealed class StudioWorkspace
         _settingsPath = Path.Combine(RootDirectory, "settings.json");
         _connectionsPath = Path.Combine(RootDirectory, "connections.json");
         _historyPath = Path.Combine(RootDirectory, "queryhistory.json");
+        _diagramsPath = Path.Combine(RootDirectory, "diagrams.json");
 
         Settings = Load<StudioSettings>(_settingsPath) ?? new StudioSettings();
         Connections = Load<List<ConnectionDescriptor>>(_connectionsPath) ?? new List<ConnectionDescriptor>();
         Secrets = new SecretStore(RootDirectory);
         _history = Load<Dictionary<string, List<string>>>(_historyPath) ?? new();
+        _diagramLayouts = Load<Dictionary<string, Dictionary<string, DiagramNodePosition>>>(_diagramsPath) ?? new();
     }
 
     public string RootDirectory { get; }
@@ -106,6 +114,21 @@ public sealed class StudioWorkspace
         if (list.Count > MaxHistoryPerConnection)
             list.RemoveRange(MaxHistoryPerConnection, list.Count - MaxHistoryPerConnection);
         AtomicFile.Write(_historyPath, JsonSerializer.Serialize(_history, Json));
+    }
+
+    /// <summary>Saved box positions for one relationship diagram (#152),
+    /// keyed by collection name. Empty when the diagram was never arranged.</summary>
+    public IReadOnlyDictionary<string, DiagramNodePosition> GetDiagramLayout(string diagramKey) =>
+        _diagramLayouts.TryGetValue(diagramKey, out var layout)
+            ? layout
+            : new Dictionary<string, DiagramNodePosition>();
+
+    /// <summary>Persists a diagram's box positions so the layout survives
+    /// restarts. The key is connection-id + database.</summary>
+    public void SaveDiagramLayout(string diagramKey, IReadOnlyDictionary<string, DiagramNodePosition> positions)
+    {
+        _diagramLayouts[diagramKey] = positions.ToDictionary(kv => kv.Key, kv => kv.Value);
+        AtomicFile.Write(_diagramsPath, JsonSerializer.Serialize(_diagramLayouts, Json));
     }
 
     /// <summary>Builds a live (not yet opened) connection for a descriptor,

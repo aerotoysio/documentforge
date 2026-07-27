@@ -219,6 +219,46 @@ public sealed class HttpConnection : IDfConnection
         return true;
     }
 
+    public async Task<IReadOnlyList<CollectionSchemaInfo>> GetSchemasAsync(string database, CancellationToken ct = default)
+    {
+        using var response = await _http.GetAsync(
+            $"db/{Uri.EscapeDataString(database)}/schemas", ct).ConfigureAwait(false);
+        var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        using var doc = JsonDocument.Parse(body);
+        var list = new List<CollectionSchemaInfo>();
+        if (doc.RootElement.TryGetProperty("schemas", out var schemas) && schemas.ValueKind == JsonValueKind.Array)
+            foreach (var el in schemas.EnumerateArray())
+                list.Add(CollectionSchemaInfo.FromWire(el));
+        return list;
+    }
+
+    public async Task PutSchemaAsync(string database, CollectionSchemaInfo schema, CancellationToken ct = default)
+    {
+        using var response = await _http.PutAsync(
+            $"db/{Uri.EscapeDataString(database)}/collections/{Uri.EscapeDataString(schema.Collection)}/schema",
+            new StringContent(schema.ToSchemaJson(), Encoding.UTF8, "application/json"), ct).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        }
+    }
+
+    public async Task DeleteSchemaAsync(string database, string collection, CancellationToken ct = default)
+    {
+        using var response = await _http.DeleteAsync(
+            $"db/{Uri.EscapeDataString(database)}/collections/{Uri.EscapeDataString(collection)}/schema", ct)
+            .ConfigureAwait(false);
+        if (response.StatusCode == HttpStatusCode.NotFound) return; // already schemaless — idempotent
+        if (!response.IsSuccessStatusCode)
+        {
+            var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            throw new DfHttpException(response.StatusCode, ExtractError(body, response.StatusCode));
+        }
+    }
+
     public async Task<CompactionInfo> CompactCollectionAsync(string database, string collection, CancellationToken ct = default)
     {
         using var response = await _http.PostAsync(
